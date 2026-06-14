@@ -797,11 +797,83 @@ fn software_check(root: &Path, recipe: &[Software]) {
             }
         }
     }
+    // Worktree-absence coherence (call/0005): a host-tracked symlink that resolves
+    // into a worktree path dangles in any context that has not materialized the
+    // software (a fresh clone, CI). Flag it regardless of materialisation here.
+    let wts = worktree_paths(recipe);
+    for (link, target) in worktree_symlink_hazards(root, &wts) {
+        println!("HAZARD   {link} -> {target} (tracked symlink into a worktree; dangles unmaterialized)");
+        bad += 1;
+    }
     if bad > 0 {
-        eprintln!("-- {bad} component(s) need attention");
+        eprintln!("-- {bad} item(s) need attention");
         process::exit(1);
     }
-    println!("-- all components at their pinned SHA");
+    println!("-- all components at their pinned SHA; no worktree-symlink hazards");
+}
+
+/// Worktree paths a recipe will materialise: `<name>`, `<name>.git`, and each
+/// declared parallel worktree.
+fn worktree_paths(recipe: &[Software]) -> Vec<String> {
+    let mut p = Vec::new();
+    for s in recipe {
+        p.push(s.name.clone());
+        p.push(format!("{}.git", s.name));
+        p.extend(s.worktrees.iter().cloned());
+    }
+    p
+}
+
+/// Host-tracked symlinks whose target resolves into a worktree path — they dangle
+/// wherever the software is not materialised (`call/0005`). `(link, resolved)` pairs.
+fn worktree_symlink_hazards(root: &Path, worktrees: &[String]) -> Vec<(String, String)> {
+    let out = match process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-s"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    let mut hazards = Vec::new();
+    for line in String::from_utf8_lossy(&out).lines() {
+        // "<mode> <hash> <stage>\t<path>"; mode 120000 marks a symlink.
+        let Some((meta, link)) = line.split_once('\t') else {
+            continue;
+        };
+        if !meta.starts_with("120000") {
+            continue;
+        }
+        let Ok(target) = fs::read_link(root.join(link)) else {
+            continue;
+        };
+        let target = target.to_string_lossy().replace('\\', "/");
+        let parent = link.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let resolved = normalize_join(parent, &target);
+        if worktrees
+            .iter()
+            .any(|w| resolved == *w || resolved.starts_with(&format!("{w}/")))
+        {
+            hazards.push((link.to_string(), resolved));
+        }
+    }
+    hazards
+}
+
+/// Join a base dir and a relative target, resolving `.`/`..` lexically.
+fn normalize_join(base: &str, rel: &str) -> String {
+    let mut comps: Vec<&str> = Vec::new();
+    for part in base.split('/').chain(rel.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                comps.pop();
+            }
+            p => comps.push(p),
+        }
+    }
+    comps.join("/")
 }
 
 /// `git -C <cwd> <args>` for side effects; true on success, output suppressed.
@@ -987,6 +1059,53 @@ mod software_tests {
         assert_eq!(git_out(&host.join("demo"), &["rev-parse", "HEAD"]).unwrap(), pin);
         // check passes (returns without process::exit on a matching pin)
         software_check(&host, &recipe);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn normalize_join_resolves_dotdot() {
+        assert_eq!(normalize_join(".claude/skills", "../../host-lint"), "host-lint");
+        assert_eq!(normalize_join("a/b", "../c"), "a/c");
+        assert_eq!(normalize_join("", "host-lint/SKILL.md"), "host-lint/SKILL.md");
+        assert_eq!(normalize_join(".claude/skills", "../../host-lint/SKILL.md"), "host-lint/SKILL.md");
+    }
+
+    #[test]
+    fn worktree_paths_covers_canonical_bare_and_parallels() {
+        let r = vec![Software {
+            name: "demo".to_string(),
+            url: "u".to_string(),
+            pin: "p".to_string(),
+            worktrees: vec!["demo.review".to_string()],
+        }];
+        let p = worktree_paths(&r);
+        assert!(p.contains(&"demo".to_string()));
+        assert!(p.contains(&"demo.git".to_string()));
+        assert!(p.contains(&"demo.review".to_string()));
+    }
+
+    // A tracked symlink resolving into a worktree path is a coherence hazard; one
+    // pointing elsewhere is not.
+    #[cfg(unix)]
+    #[test]
+    fn flags_only_tracked_symlinks_into_a_worktree() {
+        let base = std::env::temp_dir().join(format!("hl-hazard-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".claude/skills")).unwrap();
+        fs::create_dir_all(base.join("docs")).unwrap();
+        let g = |args: &[&str]| assert!(git_ok(&base, args), "git {args:?}");
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::os::unix::fs::symlink("../../demo", base.join(".claude/skills/demo")).unwrap();
+        std::os::unix::fs::symlink("../README.md", base.join("docs/readme")).unwrap();
+        g(&["add", "-A"]);
+
+        let haz = worktree_symlink_hazards(&base, &["demo".to_string()]);
+        assert_eq!(haz.len(), 1, "only the into-worktree symlink is a hazard");
+        assert_eq!(haz[0].0, ".claude/skills/demo");
+        assert_eq!(haz[0].1, "demo");
 
         let _ = fs::remove_dir_all(&base);
     }
