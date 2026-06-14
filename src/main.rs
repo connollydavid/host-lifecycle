@@ -13,7 +13,7 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use host_grammar::{format_number, is_valid_name};
-use host_lint::{is_ci_file, is_scannable, scan_text_with_allow, Match, Severity};
+use host_lint::{is_ci_file, is_scannable, path_ignored, scan_text_with_allow, Match, Severity};
 
 /// The canonical template a project adopts from; recorded in the stamp.
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/template-agentic-host";
@@ -241,6 +241,9 @@ const REMAP: &str = ".host-remap";
 /// The sanctioned-vocabulary file `host-lint` reads; we honour it so a token that
 /// is allow-listed there is not reported as undispositioned.
 const ALLOW: &str = ".host-lint-allow";
+/// The path-ignore file `host-lint --all` reads; we honour it so paths excluded
+/// from the audit (the append-only record) are also out of scope for the remap.
+const IGNORE: &str = ".host-lintignore";
 
 /// One sanctioned substitution: match `old` (case-insensitive, word-bounded),
 /// replace with `new` verbatim. The human supplies `new`; the tool never coins it.
@@ -287,9 +290,10 @@ fn remap(args: &[String]) {
         process::exit(2);
     }
     let allow = load_allow(root);
+    let ignore = load_ignore(root);
     match mode {
-        "check" => remap_check(root, &rules, &allow),
-        "apply" => remap_apply(root, &rules, &allow, dry),
+        "check" => remap_check(root, &rules, &allow, &ignore),
+        "apply" => remap_apply(root, &rules, &ignore, dry),
         _ => unreachable!(),
     }
 }
@@ -340,6 +344,20 @@ fn load_allow(root: &Path) -> Vec<String> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| l.to_ascii_lowercase())
         .collect()
+}
+
+/// The repo's `.host-lintignore` patterns (paths excluded from the audit), so the
+/// remap leaves the same paths alone. Absent file → empty.
+fn load_ignore(root: &Path) -> Vec<String> {
+    match fs::read_to_string(root.join(IGNORE)) {
+        Ok(t) => t
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Replace every word-bounded, case-insensitive occurrence of `old_lc` in `s`
@@ -463,7 +481,7 @@ fn is_target(p: &Path) -> bool {
 /// (honouring `.host-lint-allow`) and report every tell that remains — these are
 /// undispositioned and need a dictionary or allow entry. Exit 1 on a remaining
 /// flag, 3 on a remaining warning, 0 when clean.
-fn remap_check(root: &Path, rules: &[Rule], allow: &[String]) {
+fn remap_check(root: &Path, rules: &[Rule], allow: &[String], ignore: &[String]) {
     let subs = submodule_paths(root);
     let mut files = Vec::new();
     collect_files(root, root, &subs, &mut files);
@@ -475,6 +493,10 @@ fn remap_check(root: &Path, rules: &[Rule], allow: &[String]) {
         if !is_target(f) {
             continue;
         }
+        let src = f.strip_prefix(root).unwrap_or(f).to_string_lossy().replace('\\', "/");
+        if path_ignored(&src, ignore) {
+            continue;
+        }
         let Ok(content) = fs::read_to_string(f) else {
             continue;
         };
@@ -482,7 +504,6 @@ fn remap_check(root: &Path, rules: &[Rule], allow: &[String]) {
         if applied != content {
             changed += 1;
         }
-        let src = f.strip_prefix(root).unwrap_or(f).to_string_lossy().to_string();
         scan_text_with_allow(&applied, &src, allow, &mut remaining);
     }
     for m in &remaining {
@@ -504,7 +525,7 @@ fn remap_check(root: &Path, rules: &[Rule], allow: &[String]) {
 /// `--apply`: write the substitutions. Refuses unless the git tree is clean, so
 /// the prior commit archives the originals verbatim (`CLAUDE.md` §6). `--dry-run`
 /// previews without the guard and without writing.
-fn remap_apply(root: &Path, rules: &[Rule], _allow: &[String], dry: bool) {
+fn remap_apply(root: &Path, rules: &[Rule], ignore: &[String], dry: bool) {
     if !dry {
         require_clean_git(root);
     }
@@ -518,6 +539,10 @@ fn remap_apply(root: &Path, rules: &[Rule], _allow: &[String], dry: bool) {
         if !is_target(f) {
             continue;
         }
+        let rel = f.strip_prefix(root).unwrap_or(f).to_string_lossy().replace('\\', "/");
+        if path_ignored(&rel, ignore) {
+            continue;
+        }
         let Ok(content) = fs::read_to_string(f) else {
             continue;
         };
@@ -525,7 +550,6 @@ fn remap_apply(root: &Path, rules: &[Rule], _allow: &[String], dry: bool) {
         if applied == content {
             continue;
         }
-        let rel = f.strip_prefix(root).unwrap_or(f).display();
         if dry {
             println!("would remap {rel}");
         } else if let Err(e) = fs::write(f, &applied) {
