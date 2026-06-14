@@ -95,4 +95,26 @@ component (`#` comments, blanks ignored):
   `HAZARD` (`call/0005`). Exit 1 on a missing/drifted component or a hazard, 0 when
   all are at their pin and no tracked symlink reaches into a worktree.
 
+## Upgrade — version to version
+
+Adopting the methodology is one event; the template then moves on, and an adopted
+repo must **upgrade** across the revision span — re-applying spine changes *and*
+the structural migrations a span introduced (e.g. re-embedding the software as a
+bare store). A doc diff shows the prose; it does not say "convert the submodule"
+or "bump a tool." The template carries an `UPGRADING.md` **ledger** that does, one
+`[upgrade "<revision>"]` stanza per action, keyed by the revision it landed at:
+
+    [upgrade "8c28e33"]
+        title    = Software is a bare store with worktrees (call/0004)
+        action   = Convert the embedded submodule — MIGRATION.md "Converting an existing submodule".
+        requires = host-lifecycle v0.3.0
+
+    host-lifecycle upgrade <dir>   # actions newer than the repo's .host stamp
+
+`upgrade` reads the stamp's revision and prints every ledger entry **strictly
+newer** than it — decided by git ancestry against the template, so same-day
+revisions order correctly (a date cannot). Fetch the template to the target
+revision first; an entry the local template cannot resolve is treated as pending
+(the repo is behind it). The list is the to-do for `stamped → current`.
+
 Released into the public domain (Unlicense).
