@@ -32,8 +32,9 @@ fn main() {
         Some("classify") => classify(args.get(2)),
         Some("remap") => remap(&args[2..]),
         Some("software") => software(&args[2..]),
+        Some("upgrade") => upgrade(args.get(2)),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -43,6 +44,7 @@ fn main() {
             eprintln!("  remap --apply <dir> [--dry-run] — apply the dictionary (archive-first via a clean git tree)");
             eprintln!("  software --materialize <dir>  — clone the bare store(s) + worktrees from .host-software");
             eprintln!("  software --check <dir>        — verify each canonical worktree is at its recorded pin");
+            eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             process::exit(2);
         }
     }
@@ -907,6 +909,123 @@ fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }
 
+/// One entry in the template's `UPGRADING.md`: an action that became required at a
+/// given template revision, to be applied when upgrading a repo stamped older.
+struct Upgrade {
+    revision: String,
+    title: String,
+    action: String,
+    requires: String,
+}
+
+/// `upgrade <dir>` — list the template `UPGRADING.md` actions newer than the repo's
+/// `.agentic-host` stamp. The mechanical half of a case-(c) version upgrade: it
+/// answers "since the revision I adopted, what must I do?" by git ancestry, so a
+/// doc diff is no longer the only signal for the structural migrations a revision
+/// span introduced.
+fn upgrade(dir: Option<&String>) {
+    let dir = dir.map(String::as_str).unwrap_or(".");
+    let root = match fs::canonicalize(Path::new(dir)) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("host-lifecycle: not a directory: {dir}");
+            process::exit(2);
+        }
+    };
+    let Some(rev) = fs::read_to_string(root.join(STAMP)).ok().and_then(|s| parse_revision(&s)) else {
+        eprintln!("host-lifecycle: no {STAMP} revision — not an adopted repo");
+        process::exit(2);
+    };
+    let Some(template) = find_template_dir(&root) else {
+        eprintln!("host-lifecycle: cannot find the template submodule (none carries UPGRADING.md)");
+        process::exit(2);
+    };
+    let text = match fs::read_to_string(template.join("UPGRADING.md")) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("host-lifecycle: cannot read UPGRADING.md: {e}");
+            process::exit(2);
+        }
+    };
+    let pending: Vec<Upgrade> = parse_upgrading(&text)
+        .into_iter()
+        .filter(|e| upgrade_applies(&template, &rev, &e.revision))
+        .collect();
+    if pending.is_empty() {
+        println!("up to date — no UPGRADING.md actions newer than {}", short(&rev));
+        return;
+    }
+    println!("from {} — {} action(s) to apply:", short(&rev), pending.len());
+    for e in &pending {
+        println!("\n[{}] {}", short(&e.revision), e.title);
+        println!("  action:   {}", e.action);
+        if !e.requires.is_empty() {
+            println!("  requires: {}", e.requires);
+        }
+    }
+}
+
+/// Parse `UPGRADING.md`: `[upgrade "<revision>"]` stanzas with `title`, `action`,
+/// and `requires` keys (git-config-style; `#` comments and blanks ignored).
+fn parse_upgrading(text: &str) -> Vec<Upgrade> {
+    let mut out: Vec<Upgrade> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some(rev) = t.strip_prefix("[upgrade \"").and_then(|r| r.strip_suffix("\"]")) {
+            out.push(Upgrade {
+                revision: rev.to_string(),
+                title: String::new(),
+                action: String::new(),
+                requires: String::new(),
+            });
+            continue;
+        }
+        let Some((key, val)) = t.split_once('=') else {
+            continue;
+        };
+        let (key, val) = (key.trim(), val.trim());
+        let Some(cur) = out.last_mut() else {
+            continue;
+        };
+        match key {
+            "title" => cur.title = val.to_string(),
+            "action" => cur.action = val.to_string(),
+            "requires" => cur.requires = val.to_string(),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The submodule path that carries `UPGRADING.md` (the template).
+fn find_template_dir(root: &Path) -> Option<PathBuf> {
+    for p in submodule_paths(root) {
+        let cand = root.join(&p);
+        if cand.join("UPGRADING.md").is_file() {
+            return Some(cand);
+        }
+    }
+    let conv = root.join("template-agentic-host");
+    conv.join("UPGRADING.md").is_file().then_some(conv)
+}
+
+/// Does an action that landed at template revision `landed` apply to a repo stamped
+/// at `have`? Yes when `have` is strictly older (an ancestor, and not equal). If the
+/// local template cannot resolve `landed` (not fetched to the target yet) the repo
+/// is behind it, so the action applies.
+fn upgrade_applies(template: &Path, have: &str, landed: &str) -> bool {
+    let Some(landed_sha) = git_out(template, &["rev-parse", "--verify", &format!("{landed}^{{commit}}")]) else {
+        return true;
+    };
+    let Some(have_sha) = git_out(template, &["rev-parse", "--verify", &format!("{have}^{{commit}}")]) else {
+        return true;
+    };
+    have_sha != landed_sha && git_ok(template, &["merge-base", "--is-ancestor", have, landed])
+}
+
 #[cfg(test)]
 mod remap_tests {
     use super::*;
@@ -1106,6 +1225,61 @@ mod software_tests {
         assert_eq!(haz.len(), 1, "only the into-worktree symlink is a hazard");
         assert_eq!(haz[0].0, ".claude/skills/demo");
         assert_eq!(haz[0].1, "demo");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn parses_upgrading_ledger() {
+        let text = "\
+# the ledger
+[upgrade \"8c28e33\"]
+    title    = Bare store with worktrees
+    action   = Convert the embedded submodule.
+    requires = host-lifecycle v0.3.0
+
+[upgrade \"abc1234\"]
+    title    = Worktree-absence coherence
+    action   = Untrack worktree symlinks.
+";
+        let e = parse_upgrading(text);
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0].revision, "8c28e33");
+        assert_eq!(e[0].title, "Bare store with worktrees");
+        assert_eq!(e[0].requires, "host-lifecycle v0.3.0");
+        assert_eq!(e[1].revision, "abc1234");
+        assert!(e[1].requires.is_empty());
+    }
+
+    // An action applies only to a repo stamped strictly older than where it landed.
+    #[cfg(unix)]
+    #[test]
+    fn applies_by_strict_ancestry() {
+        let base = std::env::temp_dir().join(format!("hl-upgrade-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let g = |args: &[&str]| assert!(git_ok(&base, args), "git {args:?}");
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        fs::write(base.join("a"), "1").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "one"]);
+        let r1 = git_out(&base, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(base.join("b"), "2").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "two"]);
+        let r2 = git_out(&base, &["rev-parse", "HEAD"]).unwrap();
+
+        assert!(upgrade_applies(&base, &r1, &r2), "older repo gets a newer action");
+        assert!(!upgrade_applies(&base, &r2, &r1), "newer repo skips an older action");
+        assert!(!upgrade_applies(&base, &r2, &r2), "same revision is not pending");
+        assert!(upgrade_applies(&base, &r1, "deadbeefdeadbeef"), "unknown landed → behind it");
 
         let _ = fs::remove_dir_all(&base);
     }
