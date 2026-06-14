@@ -88,8 +88,11 @@ component (`#` comments, blanks ignored):
   present is skipped — and the trees are gitignored, materialised locally from the
   recipe.
 - **`--check`** verifies each component's bare store and canonical worktree exist
-  and the worktree sits at the recorded `pin`. Exit 1 on a missing or drifted
-  component, 0 when all are at their pin — the audit that replaces a submodule
-  gitlink's `git submodule status`.
+  and the worktree sits at the recorded `pin` — the audit that replaces a submodule
+  gitlink's `git submodule status`. It also flags **worktree-absence hazards**: a
+  host-tracked symlink whose target resolves into a worktree path dangles wherever
+  the software is not materialized (a fresh clone, CI), so it is reported as a
+  `HAZARD` (`call/0005`). Exit 1 on a missing/drifted component or a hazard, 0 when
+  all are at their pin and no tracked symlink reaches into a worktree.
 
 Released into the public domain (Unlicense).
