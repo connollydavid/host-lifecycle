@@ -60,4 +60,36 @@ rewrites `Phase 1` but not `Phase 12`), longest match first (`Phase 5.0` before
 `host-lint` stays a pure detector that faults on tells and never reads the
 dictionary; all rename policy lives here, applied once, token-free.
 
+## Software — the bare store with worktrees
+
+The *Where* room (the software under test) embeds as a **bare object store plus
+named worktrees**, not a gitlink submodule (the template's `call/0010`):
+`<name>.git/` is the shared store, `<name>/` is the canonical worktree at the
+pinned SHA, and `<name>.<line>/` are parallel worktrees — one per agent or live
+release branch. `software` realises and audits that layout from a `.host-software`
+recipe.
+
+    host-lifecycle software --materialize <dir>  # clone the bare store(s) + worktrees
+    host-lifecycle software --check <dir>         # each canonical worktree at its pin?
+
+The recipe is a root `.host-software` file, one git-config-style stanza per
+component (`#` comments, blanks ignored):
+
+    # .host-software
+    [software "host-lint"]
+        url       = https://github.com/connollydavid/host-lint.git
+        pin       = 2ef53995855e4ec363ba5b587b176d49b9aad7a5
+        worktrees = host-lint.review
+
+- **`--materialize`** clones each `<name>.git` (setting the remote-tracking
+  refspec `git clone --bare` omits), adds the canonical worktree `<name>/` at
+  `pin`, initialises nested submodules per worktree, and adds each listed parallel
+  worktree on a branch named by its `<line>` suffix. Idempotent — anything already
+  present is skipped — and the trees are gitignored, materialised locally from the
+  recipe.
+- **`--check`** verifies each component's bare store and canonical worktree exist
+  and the worktree sits at the recorded `pin`. Exit 1 on a missing or drifted
+  component, 0 when all are at their pin — the audit that replaces a submodule
+  gitlink's `git submodule status`.
+
 Released into the public domain (Unlicense).

@@ -31,8 +31,9 @@ fn main() {
         Some("version") => version(args.get(2)),
         Some("classify") => classify(args.get(2)),
         Some("remap") => remap(&args[2..]),
+        Some("software") => software(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -40,6 +41,8 @@ fn main() {
             eprintln!("  classify <dir>                — print the migration case (a|b|c)");
             eprintln!("  remap --check <dir>           — tells left after the .host-remap dictionary applies");
             eprintln!("  remap --apply <dir> [--dry-run] — apply the dictionary (archive-first via a clean git tree)");
+            eprintln!("  software --materialize <dir>  — clone the bare store(s) + worktrees from .host-software");
+            eprintln!("  software --check <dir>        — verify each canonical worktree is at its recorded pin");
             process::exit(2);
         }
     }
@@ -244,6 +247,9 @@ const ALLOW: &str = ".host-lint-allow";
 /// The path-ignore file `host-lint --all` reads; we honour it so paths excluded
 /// from the audit (the append-only record) are also out of scope for the remap.
 const IGNORE: &str = ".host-lintignore";
+/// The software-under-test recipe (`call/0010`): one `[software "<name>"]` stanza
+/// per component — a bare store plus its canonical worktree at `pin`.
+const SOFTWARE: &str = ".host-software";
 
 /// One sanctioned substitution: match `old` (case-insensitive, word-bounded),
 /// replace with `new` verbatim. The human supplies `new`; the tool never coins it.
@@ -595,6 +601,240 @@ fn require_clean_git(root: &Path) {
     }
 }
 
+/// One software component from `.host-software`: a bare object store plus its
+/// canonical worktree at `pin` and any parallel worktrees (`call/0010`).
+struct Software {
+    name: String,
+    url: String,
+    pin: String,
+    worktrees: Vec<String>,
+}
+
+/// `software --materialize|--check <dir>` — realise the `.host-software` recipe.
+/// `--materialize` clones each `<name>.git` bare store and adds the canonical
+/// worktree `<name>/` at its `pin` (plus any parallel worktrees), idempotently —
+/// it skips what already exists. `--check` verifies each canonical worktree is at
+/// its recorded pin: the audit that replaces a submodule gitlink's `git submodule
+/// status`.
+fn software(args: &[String]) {
+    let mut mode: Option<&str> = None;
+    let mut pos: Vec<&String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--materialize" => mode = Some("materialize"),
+            "--check" => mode = Some("check"),
+            _ => pos.push(a),
+        }
+    }
+    let Some(dir) = pos.first() else {
+        eprintln!("host-lifecycle software <--materialize|--check> <dir>");
+        process::exit(2);
+    };
+    let Some(mode) = mode else {
+        eprintln!("host-lifecycle software needs --materialize or --check");
+        process::exit(2);
+    };
+    let root = match fs::canonicalize(Path::new(dir.as_str())) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("host-lifecycle: not a directory: {dir}");
+            process::exit(2);
+        }
+    };
+    let recipe = load_software(&root);
+    if recipe.is_empty() {
+        eprintln!("host-lifecycle: no [software \"<name>\"] stanzas in {SOFTWARE}");
+        process::exit(2);
+    }
+    match mode {
+        "materialize" => software_materialize(&root, &recipe),
+        "check" => software_check(&root, &recipe),
+        _ => unreachable!(),
+    }
+}
+
+/// Read `.host-software` from the repo root, exiting if it is absent.
+fn load_software(root: &Path) -> Vec<Software> {
+    match fs::read_to_string(root.join(SOFTWARE)) {
+        Ok(t) => parse_software(&t),
+        Err(e) => {
+            eprintln!("host-lifecycle: cannot read {SOFTWARE}: {e}");
+            process::exit(2);
+        }
+    }
+}
+
+/// Parse the git-config-style recipe: a `[software "<name>"]` header opens a
+/// stanza; `url`, `pin`, and a space-separated `worktrees` list follow. Unknown
+/// keys are ignored; a stanza missing `url` or `pin` is fatal (not materialisable).
+fn parse_software(text: &str) -> Vec<Software> {
+    let mut out: Vec<Software> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = t.strip_prefix("[software \"").and_then(|r| r.strip_suffix("\"]")) {
+            out.push(Software {
+                name: name.to_string(),
+                url: String::new(),
+                pin: String::new(),
+                worktrees: Vec::new(),
+            });
+            continue;
+        }
+        let Some((key, val)) = t.split_once('=') else {
+            continue;
+        };
+        let (key, val) = (key.trim(), val.trim());
+        let Some(cur) = out.last_mut() else {
+            eprintln!("host-lifecycle: {SOFTWARE}:{}: `{key}` before any [software \"...\"] stanza", i + 1);
+            process::exit(2);
+        };
+        match key {
+            "url" => cur.url = val.to_string(),
+            "pin" => cur.pin = val.to_string(),
+            "worktrees" => cur.worktrees = val.split_whitespace().map(String::from).collect(),
+            _ => {}
+        }
+    }
+    for s in &out {
+        if s.url.is_empty() || s.pin.is_empty() {
+            eprintln!("host-lifecycle: {SOFTWARE}: [software \"{}\"] needs both url and pin", s.name);
+            process::exit(2);
+        }
+    }
+    out
+}
+
+/// `--materialize`: clone the bare store and add the worktrees, skipping any that
+/// already exist. The bare clone needs its remote-tracking refspec set by hand —
+/// `git clone --bare` does not write one — before a `fetch`/`worktree` resolves a
+/// remote branch.
+fn software_materialize(root: &Path, recipe: &[Software]) {
+    let mut made = 0usize;
+    for s in recipe {
+        let bare_name = format!("{}.git", s.name);
+        let bare = root.join(&bare_name);
+        let canon = root.join(&s.name);
+        if bare.exists() {
+            println!("skip     {bare_name} (exists)");
+        } else {
+            if !git_ok(root, &["clone", "--bare", &s.url, &bare_name]) {
+                eprintln!("host-lifecycle: git clone --bare failed for {}", s.name);
+                process::exit(2);
+            }
+            git_ok(&bare, &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+            git_ok(&bare, &["fetch", "origin"]);
+            println!("clone    {bare_name}");
+            made += 1;
+        }
+        if canon.exists() {
+            println!("skip     {}/ (exists)", s.name);
+        } else {
+            let canon_s = canon.to_string_lossy();
+            if !git_ok(&bare, &["worktree", "add", &canon_s, &s.pin]) {
+                eprintln!("host-lifecycle: worktree add {}/ @ {} failed", s.name, short(&s.pin));
+                process::exit(2);
+            }
+            git_ok(&canon, &["submodule", "update", "--init", "--recursive"]);
+            println!("worktree {}/ @ {}", s.name, short(&s.pin));
+            made += 1;
+        }
+        for wt in &s.worktrees {
+            let wtp = root.join(wt);
+            if wtp.exists() {
+                println!("skip     {wt}/ (exists)");
+                continue;
+            }
+            let branch = wt.strip_prefix(&format!("{}.", s.name)).unwrap_or(wt);
+            let wtp_s = wtp.to_string_lossy();
+            let ok = if git_ok(&bare, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]) {
+                git_ok(&bare, &["worktree", "add", &wtp_s, branch])
+            } else {
+                git_ok(&bare, &["worktree", "add", "-b", branch, &wtp_s, &s.pin])
+            };
+            if !ok {
+                eprintln!("host-lifecycle: worktree add {wt}/ failed");
+                process::exit(2);
+            }
+            git_ok(&wtp, &["submodule", "update", "--init", "--recursive"]);
+            println!("worktree {wt}/ ({branch})");
+            made += 1;
+        }
+    }
+    println!("-- {made} item(s) materialized");
+}
+
+/// `--check`: each component's bare store and canonical worktree must exist, and
+/// the worktree must sit at the recorded `pin`. Exit 1 if any is missing or drifted.
+fn software_check(root: &Path, recipe: &[Software]) {
+    let mut bad = 0usize;
+    for s in recipe {
+        let bare = root.join(format!("{}.git", s.name));
+        let canon = root.join(&s.name);
+        if !bare.is_dir() {
+            println!("MISSING  {}.git (run --materialize)", s.name);
+            bad += 1;
+            continue;
+        }
+        if !canon.is_dir() {
+            println!("MISSING  {}/ (run --materialize)", s.name);
+            bad += 1;
+            continue;
+        }
+        let want = git_out(&bare, &["rev-parse", &s.pin]);
+        let have = git_out(&canon, &["rev-parse", "HEAD"]);
+        match (want, have) {
+            (Some(w), Some(h)) if w == h => println!("ok       {}/ @ {}", s.name, short(&s.pin)),
+            (Some(w), Some(h)) => {
+                println!("DRIFT    {}/ at {} but pinned to {}", s.name, short(&h), short(&w));
+                bad += 1;
+            }
+            _ => {
+                println!("ERROR    {}/ — cannot resolve HEAD or pin", s.name);
+                bad += 1;
+            }
+        }
+    }
+    if bad > 0 {
+        eprintln!("-- {bad} component(s) need attention");
+        process::exit(1);
+    }
+    println!("-- all components at their pinned SHA");
+}
+
+/// `git -C <cwd> <args>` for side effects; true on success, output suppressed.
+fn git_ok(cwd: &Path, args: &[&str]) -> bool {
+    process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `git -C <cwd> <args>` capturing trimmed stdout, or `None` on failure.
+fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
+    let o = process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// First 12 chars of a SHA for display (ASCII hex, so byte-slicing is safe).
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
 #[cfg(test)]
 mod remap_tests {
     use super::*;
@@ -674,5 +914,80 @@ mod tests {
         assert_eq!(civil_from_days(365), (1971, 1, 1)); // 1970 not a leap year
         assert_eq!(civil_from_days(20_617), (2026, 6, 13));
         assert_eq!(civil_from_days(20_618), (2026, 6, 14));
+    }
+}
+
+#[cfg(test)]
+mod software_tests {
+    use super::*;
+
+    #[test]
+    fn parses_multi_component_recipe() {
+        let text = "\
+# a comment
+[software \"alpha\"]
+\turl       = https://example.test/alpha.git
+\tpin       = aaaa1111
+\tworktrees = alpha.oauth alpha.fix
+
+[software \"beta\"]
+\turl  = https://example.test/beta.git
+\tpin  = bbbb2222
+\tworktrees =
+";
+        let s = parse_software(text);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].name, "alpha");
+        assert_eq!(s[0].url, "https://example.test/alpha.git");
+        assert_eq!(s[0].pin, "aaaa1111");
+        assert_eq!(s[0].worktrees, vec!["alpha.oauth", "alpha.fix"]);
+        assert_eq!(s[1].name, "beta");
+        assert!(s[1].worktrees.is_empty());
+    }
+
+    #[test]
+    fn unknown_keys_ignored() {
+        let s = parse_software("[software \"x\"]\nurl = u\npin = p\nbogus = ignored\n");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].url, "u");
+        assert_eq!(s[0].pin, "p");
+    }
+
+    // Materialise from a local source repo, then check the pin round-trips.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_then_check_roundtrip() {
+        let base = std::env::temp_dir().join(format!("hl-software-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let host = base.join("host");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        let g = |cwd: &Path, args: &[&str]| {
+            assert!(git_ok(cwd, args), "git {args:?} failed in {}", cwd.display());
+        };
+        g(&src, &["init", "-q", "-b", "main"]);
+        g(&src, &["config", "user.email", "t@t"]);
+        g(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("readme.txt"), "seed").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "seed"]);
+        let pin = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+
+        let recipe = vec![Software {
+            name: "demo".to_string(),
+            url: src.to_string_lossy().to_string(),
+            pin: pin.clone(),
+            worktrees: Vec::new(),
+        }];
+        software_materialize(&host, &recipe);
+
+        assert!(host.join("demo.git").is_dir(), "bare store created");
+        assert!(host.join("demo").is_dir(), "canonical worktree created");
+        assert_eq!(git_out(&host.join("demo"), &["rev-parse", "HEAD"]).unwrap(), pin);
+        // check passes (returns without process::exit on a matching pin)
+        software_check(&host, &recipe);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
