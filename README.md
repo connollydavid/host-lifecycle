@@ -90,9 +90,12 @@ component (`#` comments, blanks ignored):
 - **`--check`** verifies each component's bare store and canonical worktree exist
   and the worktree sits at the recorded `pin` — the audit that replaces a submodule
   gitlink's `git submodule status`. It also flags **worktree-absence hazards**: a
-  host-tracked symlink whose target resolves into a worktree path dangles wherever
-  the software is not materialized (a fresh clone, CI), so it is reported as a
-  `HAZARD` (`call/0005`). Exit 1 on a missing/drifted component or a hazard, 0 when
+  tracked symlink whose target is **not itself tracked here** points into a
+  separately-materialized path (a software worktree, or a sub-path of a tool
+  submodule) and dangles wherever that path is not materialized (a fresh clone, CI,
+  a partial submodule init), so it is reported as a `HAZARD` (`call/0005`). A
+  symlink to a submodule *root* (a tracked gitlink) is fine — it resolves to the
+  empty dir git leaves on checkout. Exit 1 on a missing/drifted component or a hazard, 0 when
   all are at their pin and no tracked symlink reaches into a worktree.
 
 ## Upgrade — version to version
