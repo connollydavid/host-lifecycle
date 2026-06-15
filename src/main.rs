@@ -799,12 +799,12 @@ fn software_check(root: &Path, recipe: &[Software]) {
             }
         }
     }
-    // Worktree-absence coherence (call/0005): a host-tracked symlink that resolves
-    // into a worktree path dangles in any context that has not materialized the
-    // software (a fresh clone, CI). Flag it regardless of materialisation here.
-    let wts = worktree_paths(recipe);
-    for (link, target) in worktree_symlink_hazards(root, &wts) {
-        println!("HAZARD   {link} -> {target} (tracked symlink into a worktree; dangles unmaterialized)");
+    // Worktree-absence coherence (call/0005): a tracked symlink whose target is not
+    // itself tracked here points into a separately-materialized path — a software
+    // worktree or a tool submodule — so it dangles wherever that path is not
+    // materialized (a fresh clone, CI, a partial submodule init).
+    for (link, target) in dangling_symlink_hazards(root) {
+        println!("HAZARD   {link} -> {target} (symlink into an un-materialized path; not tracked here)");
         bad += 1;
     }
     if bad > 0 {
@@ -814,21 +814,12 @@ fn software_check(root: &Path, recipe: &[Software]) {
     println!("-- all components at their pinned SHA; no worktree-symlink hazards");
 }
 
-/// Worktree paths a recipe will materialise: `<name>`, `<name>.git`, and each
-/// declared parallel worktree.
-fn worktree_paths(recipe: &[Software]) -> Vec<String> {
-    let mut p = Vec::new();
-    for s in recipe {
-        p.push(s.name.clone());
-        p.push(format!("{}.git", s.name));
-        p.extend(s.worktrees.iter().cloned());
-    }
-    p
-}
-
-/// Host-tracked symlinks whose target resolves into a worktree path — they dangle
-/// wherever the software is not materialised (`call/0005`). `(link, resolved)` pairs.
-fn worktree_symlink_hazards(root: &Path, worktrees: &[String]) -> Vec<(String, String)> {
+/// Tracked symlinks whose resolved target is **not itself tracked here** — they
+/// point into a separately-materialized path (a software worktree, or a sub-path of
+/// a tool submodule) and dangle wherever it is not materialized (`call/0005`).
+/// `(link, resolved)` pairs. A symlink to the submodule root (a tracked gitlink) is
+/// not flagged: it resolves to the empty dir git leaves on checkout.
+fn dangling_symlink_hazards(root: &Path) -> Vec<(String, String)> {
     let out = match process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -838,25 +829,29 @@ fn worktree_symlink_hazards(root: &Path, worktrees: &[String]) -> Vec<(String, S
         Ok(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
     };
-    let mut hazards = Vec::new();
-    for line in String::from_utf8_lossy(&out).lines() {
+    let text = String::from_utf8_lossy(&out);
+    // One pass: every tracked path (blobs + gitlinks), and which are symlinks.
+    let mut tracked: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut links: Vec<&str> = Vec::new();
+    for line in text.lines() {
         // "<mode> <hash> <stage>\t<path>"; mode 120000 marks a symlink.
-        let Some((meta, link)) = line.split_once('\t') else {
+        let Some((meta, path)) = line.split_once('\t') else {
             continue;
         };
-        if !meta.starts_with("120000") {
-            continue;
+        tracked.insert(path);
+        if meta.starts_with("120000") {
+            links.push(path);
         }
+    }
+    let mut hazards = Vec::new();
+    for link in links {
         let Ok(target) = fs::read_link(root.join(link)) else {
             continue;
         };
         let target = target.to_string_lossy().replace('\\', "/");
         let parent = link.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         let resolved = normalize_join(parent, &target);
-        if worktrees
-            .iter()
-            .any(|w| resolved == *w || resolved.starts_with(&format!("{w}/")))
-        {
+        if !tracked.contains(resolved.as_str()) {
             hazards.push((link.to_string(), resolved));
         }
     }
@@ -1190,25 +1185,11 @@ mod software_tests {
         assert_eq!(normalize_join(".claude/skills", "../../host-lint/SKILL.md"), "host-lint/SKILL.md");
     }
 
-    #[test]
-    fn worktree_paths_covers_canonical_bare_and_parallels() {
-        let r = vec![Software {
-            name: "demo".to_string(),
-            url: "u".to_string(),
-            pin: "p".to_string(),
-            worktrees: vec!["demo.review".to_string()],
-        }];
-        let p = worktree_paths(&r);
-        assert!(p.contains(&"demo".to_string()));
-        assert!(p.contains(&"demo.git".to_string()));
-        assert!(p.contains(&"demo.review".to_string()));
-    }
-
-    // A tracked symlink resolving into a worktree path is a coherence hazard; one
-    // pointing elsewhere is not.
+    // A tracked symlink whose target isn't tracked here (a worktree/submodule
+    // sub-path) is a hazard; one pointing at a tracked file is not.
     #[cfg(unix)]
     #[test]
-    fn flags_only_tracked_symlinks_into_a_worktree() {
+    fn flags_symlinks_into_untracked_paths_only() {
         let base = std::env::temp_dir().join(format!("hl-hazard-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join(".claude/skills")).unwrap();
@@ -1217,14 +1198,17 @@ mod software_tests {
         g(&["init", "-q"]);
         g(&["config", "user.email", "t@t"]);
         g(&["config", "user.name", "t"]);
-        std::os::unix::fs::symlink("../../demo", base.join(".claude/skills/demo")).unwrap();
+        fs::write(base.join("README.md"), "doc").unwrap();
+        // into an un-materialized path (a worktree/submodule sub-path) → hazard
+        std::os::unix::fs::symlink("../../demo/skill", base.join(".claude/skills/demo")).unwrap();
+        // into a tracked file → fine
         std::os::unix::fs::symlink("../README.md", base.join("docs/readme")).unwrap();
         g(&["add", "-A"]);
 
-        let haz = worktree_symlink_hazards(&base, &["demo".to_string()]);
-        assert_eq!(haz.len(), 1, "only the into-worktree symlink is a hazard");
+        let haz = dangling_symlink_hazards(&base);
+        assert_eq!(haz.len(), 1, "only the symlink into an untracked path is a hazard");
         assert_eq!(haz[0].0, ".claude/skills/demo");
-        assert_eq!(haz[0].1, "demo");
+        assert_eq!(haz[0].1, "demo/skill");
 
         let _ = fs::remove_dir_all(&base);
     }
