@@ -1,4 +1,4 @@
-//! host-lifecycle — the token-free lifecycle tool for an agentic host.
+//! host-lifecycle — the token-free lifecycle tool for an agentic project.
 //!
 //! Mechanical, rule-bound work — allocating zero-padded register numbers,
 //! validating that names are well-formed, and scaffolding/stamping a repo when

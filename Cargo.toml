@@ -2,7 +2,7 @@
 name = "host-lifecycle"
 version = "0.4.1"
 edition = "2021"
-description = "Token-free lifecycle tool for an agentic host — scaffolds milestones, decisions, and personas, and validates the tree."
+description = "Token-free lifecycle tool for an agentic project — scaffolds milestones, decisions, and personas, and validates the tree."
 license = "Unlicense"
 
 [dependencies]

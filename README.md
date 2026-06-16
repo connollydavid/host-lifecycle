@@ -1,6 +1,6 @@
 # host-lifecycle
 
-The token-free lifecycle tool for an agentic host. It does the mechanical,
+The token-free lifecycle tool for an agentic project (e.g. `agentic-acme`). It does the mechanical,
 rule-bound work — allocating zero-padded register numbers, scaffolding
 milestones / decisions / personas, and validating that the tree matches its
 index — so the agent does not spend tokens on it.
