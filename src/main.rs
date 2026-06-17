@@ -89,18 +89,53 @@ fn validate(dir: Option<&String>) {
         eprintln!("host-lifecycle validate <dir>");
         process::exit(2);
     };
+    let path = Path::new(dir);
     let mut bad = 0;
-    for name in numbered_entries(Path::new(dir)) {
+    for name in numbered_entries(path) {
         if !is_valid_name(&name) {
             println!("invalid: {name}");
             bad += 1;
         }
     }
+    // The Why room is also scope-gated (anti-ouroboros); other rooms are name-only.
+    if path.file_name().and_then(|s| s.to_str()) == Some("call") {
+        bad += validate_call_scope(path);
+    }
     if bad > 0 {
-        eprintln!("{bad} invalid name(s)");
+        eprintln!("{bad} problem(s)");
         process::exit(1);
     }
     println!("ok");
+}
+
+/// Scope-gate every numbered decision in a `call/` dir; returns the offender count.
+fn validate_call_scope(dir: &Path) -> usize {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    let mut files: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension().and_then(|s| s.to_str()) == Some("md")
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .collect();
+    files.sort();
+    let mut bad = 0;
+    for p in files {
+        let text = fs::read_to_string(&p).unwrap_or_default();
+        if let Some(problem) = decision_scope_problem(&text) {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            println!("{name}: {problem}");
+            bad += 1;
+        }
+    }
+    bad
 }
 
 fn next(dir: Option<&String>) {
@@ -245,6 +280,39 @@ fn stamp_field(text: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Read a MADR header field (`- Status: accepted`, `Scope: x`) from a decision body.
+fn decision_field(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let l = line.trim_start();
+        let l = l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).unwrap_or(l);
+        if let Some(rest) = l.strip_prefix(key) {
+            if let Some(v) = rest.strip_prefix(':') {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Anti-ouroboros gate: a live (accepted) decision needs a `Scope:` and must not be
+/// methodology. Retired decisions (superseded/deprecated/rejected/proposed) pass.
+fn decision_scope_problem(text: &str) -> Option<&'static str> {
+    let status = decision_field(text, "Status").unwrap_or_default();
+    if !status.to_ascii_lowercase().starts_with("accepted") {
+        return None;
+    }
+    match decision_field(text, "Scope") {
+        None => Some("accepted decision is missing a `Scope:` header"),
+        Some(s) if s.eq_ignore_ascii_case("methodology") => {
+            Some("accepted decision is `Scope: methodology` — methodology belongs in the template spine; supersede it there")
+        }
+        Some(_) => None,
+    }
 }
 
 /// Migration case from what governance a repo already carries.
@@ -1763,6 +1831,26 @@ mod tests {
         assert_eq!(civil_from_days(365), (1971, 1, 1)); // 1970 not a leap year
         assert_eq!(civil_from_days(20_617), (2026, 6, 13));
         assert_eq!(civil_from_days(20_618), (2026, 6, 14));
+    }
+
+    #[test]
+    fn decision_field_reads_madr_headers() {
+        let t = "# T\n\n- Status: accepted\n- Scope: host-lint\n";
+        assert_eq!(decision_field(t, "Status").as_deref(), Some("accepted"));
+        assert_eq!(decision_field(t, "Scope").as_deref(), Some("host-lint"));
+        assert_eq!(decision_field(t, "Date"), None);
+    }
+
+    #[test]
+    fn scope_gate_passes_and_fails() {
+        // accepted + software scope: ok
+        assert!(decision_scope_problem("- Status: accepted\n- Scope: host-lint\n").is_none());
+        // accepted + methodology: fails (ouroboros)
+        assert!(decision_scope_problem("- Status: accepted\n- Scope: methodology\n").is_some());
+        // accepted, no scope: fails
+        assert!(decision_scope_problem("- Status: accepted\n").is_some());
+        // superseded: not in force, passes regardless of scope
+        assert!(decision_scope_problem("- Status: superseded by the spine\n").is_none());
     }
 }
 

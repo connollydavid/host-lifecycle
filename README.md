@@ -13,6 +13,13 @@ against, so what this generates is exactly what the checker accepts
     host-lifecycle validate <dir>          # every NNNN-slug entry is well-formed
     host-lifecycle next <dir>              # print the next zero-padded number
 
+Validating a `call/` dir also runs the **scope gate** (anti-ouroboros): a live
+(`accepted`) decision must carry a `Scope:` header and must not be
+`Scope: methodology`. The methodology is owned by the template spine, not
+re-litigated as a project decision; once settled upstream, a methodology decision
+is retired the MADR way — `Status: superseded by the spine`, in place — and so is
+no longer `accepted` and passes the gate.
+
 It also drives the mechanical half of *migration* — bringing an existing repo
 under the methodology (see the template's `MIGRATION.md`):
 
