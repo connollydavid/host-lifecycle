@@ -82,8 +82,9 @@ pinned SHA, and `<name>.<line>/` are parallel worktrees — one per agent or liv
 release branch. `software` realises and audits that layout from a `.host-software`
 recipe.
 
-    host-lifecycle software --materialize <dir>  # clone the bare store(s) + worktrees
-    host-lifecycle software --check <dir>         # each canonical worktree at its pin?
+    host-lifecycle software --materialize <dir>    # clone the bare store(s) + worktrees
+    host-lifecycle software --check <dir>          # each canonical worktree at its pin?
+    host-lifecycle software --verify-build <dir>   # rebuild from the pin; artifact reproduces?
 
 The recipe is a root `.host-software` file, one git-config-style stanza per
 component (`#` comments, blanks ignored):
@@ -121,6 +122,38 @@ canonical pin.
   empty dir git leaves on checkout. Each explicit `worktree` line is audited at its
   own branch and pin too. Exit 1 on a missing/drifted component or a hazard, 0 when
   all are at their pin and no tracked symlink reaches into a worktree.
+
+### Reproducible builds — the production anchor
+
+Software *initiated* under the methodology must have **reproducible builds**: its
+deployed artifact is byte-reproducible from the pinned source plus a recorded build
+recipe. That is what makes the pin a true production anchor (a clean rebuild from the
+pin equals what is deployed) rather than just a source pin. A component records the
+provenance in its stanza:
+
+    [software "host-lint"]
+        url          = https://github.com/connollydavid/host-lint.git
+        pin          = 2ef5399...
+        build        = cargo build --release --locked
+        toolchain    = rust-1.84.0
+        deploy       = host-lint                 # which line ships (canonical or a worktree dir)
+        artifact     = target/release/host-lint <sha256>   # worktree-relative path + expected hash
+        repro-exempt = call/0007                 # escape clause — see below
+
+- **`--check`** also audits provenance (cheap, no build): the `deploy` line must be a
+  recorded worktree, a `repro-exempt` must cite an existing decision, and where the
+  `artifact` is present in the canonical worktree its hash must match the record.
+- **`--verify-build`** is the proof (the heavy lane, for a CI job): it materialises a
+  throwaway worktree at the `pin`, runs `build`, hashes `artifact`, and fails unless it
+  reproduces the recorded sha.
+
+**Escape clause.** Pre-existing/migrated software (not initiated under the methodology)
+may not be reproducible yet. It may carry `repro-exempt = call/NNNN` citing a recorded
+**case decision** (a software-scoped `call/` decision documenting why and the interim
+provenance); `--verify-build` then reports it (warn) and skips the rebuild comparison,
+while `--check` still requires the citation to resolve. The exemption is meant to be
+retired as the component converges on reproducibility — it is never available to
+greenfield software.
 
 ## Upgrade — version to version
 

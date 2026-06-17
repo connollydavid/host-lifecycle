@@ -56,6 +56,7 @@ fn main() {
             eprintln!("  remap --apply <dir> [--dry-run] — apply the dictionary (archive-first via a clean git tree)");
             eprintln!("  software --materialize <dir>  — clone the bare store(s) + worktrees from .host-software");
             eprintln!("  software --check <dir>        — verify each canonical worktree is at its recorded pin");
+            eprintln!("  software --verify-build <dir> — rebuild from the pin and prove the artifact reproduces");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
             eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
@@ -744,6 +745,16 @@ struct Software {
     /// branch at its own pin, faithfully reproducible by `--materialize` (the bare
     /// form silently put a parallel line at the canonical pin — issue #6).
     lines: Vec<Worktree>,
+    /// Reproducible-build provenance (issue #10), all optional:
+    /// `build`/`toolchain` — the recorded deterministic recipe (run by `--verify-build`);
+    /// `deploy` — which line (canonical name or a `worktree` dir) is the deployed line;
+    /// `artifact` — `<path> <sha256>` the deployed artifact must hash to (attestation);
+    /// `repro_exempt` — `call/NNNN` authorizing a not-yet-reproducible migrated build.
+    build: Option<String>,
+    toolchain: Option<String>,
+    deploy: Option<String>,
+    artifact: Option<(String, String)>,
+    repro_exempt: Option<String>,
 }
 
 /// An explicit parallel worktree: a directory checked out on `branch` at `pin`.
@@ -766,15 +777,16 @@ fn software(args: &[String]) {
         match a.as_str() {
             "--materialize" => mode = Some("materialize"),
             "--check" => mode = Some("check"),
+            "--verify-build" => mode = Some("verify-build"),
             _ => pos.push(a),
         }
     }
     let Some(dir) = pos.first() else {
-        eprintln!("host-lifecycle software <--materialize|--check> <dir>");
+        eprintln!("host-lifecycle software <--materialize|--check|--verify-build> <dir>");
         process::exit(2);
     };
     let Some(mode) = mode else {
-        eprintln!("host-lifecycle software needs --materialize or --check");
+        eprintln!("host-lifecycle software needs --materialize, --check, or --verify-build");
         process::exit(2);
     };
     let root = match fs::canonicalize(Path::new(dir.as_str())) {
@@ -792,8 +804,82 @@ fn software(args: &[String]) {
     match mode {
         "materialize" => software_materialize(&root, &recipe),
         "check" => software_check(&root, &recipe),
+        "verify-build" => software_verify_build(&root, &recipe),
         _ => unreachable!(),
     }
+}
+
+/// `--verify-build`: prove reproducibility (the heavy lane). For each component with a
+/// `build` recipe, materialize a clean throwaway worktree at the pin, run the recorded
+/// build, hash the `artifact`, and compare to the recorded sha. A `repro-exempt`
+/// component citing a real decision is reported (warn) and its rebuild skipped — the
+/// escape clause for not-yet-reproducible migrated software (issue #10).
+fn software_verify_build(root: &Path, recipe: &[Software]) {
+    let mut bad = 0usize;
+    for s in recipe {
+        let Some((path, sha)) = &s.artifact else {
+            println!("skip     {} (no artifact recorded)", s.name);
+            continue;
+        };
+        if let Some(cite) = &s.repro_exempt {
+            if cited_decision_exists(root, cite) {
+                println!("warn     {} repro-exempt ({}) — rebuild comparison skipped", s.name, cite);
+            } else {
+                println!("DRIFT    {} repro-exempt cites missing decision {}", s.name, cite);
+                bad += 1;
+            }
+            continue;
+        }
+        let Some(build) = &s.build else {
+            println!("DRIFT    {} has an artifact but no `build` recipe to reproduce it", s.name);
+            bad += 1;
+            continue;
+        };
+        let bare = root.join(format!("{}.git", s.name));
+        if !bare.is_dir() {
+            println!("MISSING  {}.git (run --materialize)", s.name);
+            bad += 1;
+            continue;
+        }
+        let work = root.join(format!(".host-verify-{}", s.name));
+        let _ = fs::remove_dir_all(&work);
+        let work_s = work.to_string_lossy().to_string();
+        if !git_ok(&bare, &["worktree", "add", "--detach", &work_s, &s.pin]) {
+            println!("ERROR    {} — cannot create a verify worktree at {}", s.name, short(&s.pin));
+            bad += 1;
+            continue;
+        }
+        let built = process::Command::new("sh")
+            .arg("-c")
+            .arg(build)
+            .current_dir(&work)
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false);
+        if !built {
+            println!("ERROR    {} — build failed: `{}`", s.name, build);
+            bad += 1;
+        } else {
+            match sha256_file(&work.join(path)) {
+                Some(h) if &h == sha => println!("ok       {} rebuild reproduces {} @ {}", s.name, path, short(sha)),
+                Some(h) => {
+                    println!("DRIFT    {} rebuild is {} but recorded {} — NOT reproducible", s.name, short(&h), short(sha));
+                    bad += 1;
+                }
+                None => {
+                    println!("ERROR    {} — built artifact {} not found", s.name, path);
+                    bad += 1;
+                }
+            }
+        }
+        let _ = git_ok(&bare, &["worktree", "remove", "--force", &work_s]);
+        let _ = fs::remove_dir_all(&work);
+    }
+    if bad > 0 {
+        eprintln!("-- {bad} component(s) failed reproducibility verification");
+        process::exit(1);
+    }
+    println!("-- every non-exempt component reproduces its recorded artifact");
 }
 
 /// Read `.host-software` from the repo root, exiting if it is absent.
@@ -824,6 +910,11 @@ fn parse_software(text: &str) -> Vec<Software> {
                 pin: String::new(),
                 worktrees: Vec::new(),
                 lines: Vec::new(),
+                build: None,
+                toolchain: None,
+                deploy: None,
+                artifact: None,
+                repro_exempt: None,
             });
             continue;
         }
@@ -855,6 +946,19 @@ fn parse_software(text: &str) -> Vec<Software> {
                     pin: pin.to_string(),
                 });
             }
+            "build" => cur.build = Some(val.to_string()),
+            "toolchain" => cur.toolchain = Some(val.to_string()),
+            "deploy" => cur.deploy = Some(val.to_string()),
+            "artifact" => {
+                // `artifact = <path> <sha256>` — the deployed artifact's expected hash.
+                let f: Vec<&str> = val.split_whitespace().collect();
+                let [path, sha] = f[..] else {
+                    eprintln!("host-lifecycle: {SOFTWARE}:{}: `artifact` needs `<path> <sha256>`", i + 1);
+                    process::exit(2);
+                };
+                cur.artifact = Some((path.to_string(), sha.to_string()));
+            }
+            "repro-exempt" => cur.repro_exempt = Some(val.to_string()),
             _ => {}
         }
     }
@@ -1005,6 +1109,9 @@ fn software_check(root: &Path, recipe: &[Software]) {
                 }
             }
         }
+        // Reproducible-build provenance: deploy line recorded, exemption cited,
+        // deployed artifact attested (issue #10).
+        bad += provenance_problems(root, s);
     }
     // Worktree-absence coherence (call/0005): a tracked symlink whose target is not
     // itself tracked here points into a separately-materialized path — a software
@@ -1109,6 +1216,74 @@ fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
 /// First 12 chars of a SHA for display (ASCII hex, so byte-slicing is safe).
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
+}
+
+/// sha256 of a file via `sha256sum`, or None if it can't be computed.
+fn sha256_file(path: &Path) -> Option<String> {
+    let o = process::Command::new("sha256sum").arg(path).output().ok()?;
+    o.status.success().then(|| {
+        String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_string()
+    })
+}
+
+/// Does the `call/NNNN[-slug]` decision a `repro-exempt` citation names exist?
+fn cited_decision_exists(root: &Path, cite: &str) -> bool {
+    let num = cite.trim_start_matches("call/").split('-').next().unwrap_or("");
+    if num.is_empty() {
+        return false;
+    }
+    let pfx = format!("{num}-");
+    fs::read_dir(root.join("call")).ok().is_some_and(|rd| {
+        rd.filter_map(|e| e.ok()).any(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with(&pfx) && n.ends_with(".md")
+        })
+    })
+}
+
+/// Attestation + exemption checks for a component's build provenance (the cheap pass;
+/// the rebuild *proof* is `--verify-build`). Returns the count of failures.
+fn provenance_problems(root: &Path, s: &Software) -> usize {
+    let mut bad = 0;
+    // The deployed line must be a recorded worktree (canonical or an explicit line).
+    if let Some(dep) = &s.deploy {
+        if dep == &s.name || s.lines.iter().any(|w| &w.dir == dep) {
+            println!("ok       {} deploy line `{}` is recorded", s.name, dep);
+        } else {
+            println!("DRIFT    {} deploy line `{}` is not a recorded worktree", s.name, dep);
+            bad += 1;
+        }
+    }
+    // An exemption must cite a real decision.
+    if let Some(cite) = &s.repro_exempt {
+        if cited_decision_exists(root, cite) {
+            println!("warn     {} build is repro-exempt ({}) — reproducibility not proven", s.name, cite);
+        } else {
+            println!("DRIFT    {} repro-exempt cites missing decision {}", s.name, cite);
+            bad += 1;
+        }
+    }
+    // Attestation: when the artifact is present in the canonical worktree, it must
+    // hash to the record (a deploy/build host has it; a bare checkout does not).
+    if let Some((path, sha)) = &s.artifact {
+        let p = root.join(&s.name).join(path);
+        if !p.exists() {
+            println!("skip     {} artifact {} not present (not a deploy/build host)", s.name, path);
+        } else {
+            match sha256_file(&p) {
+                Some(h) if &h == sha => println!("ok       {} artifact {} @ {}", s.name, path, short(sha)),
+                Some(h) => {
+                    println!("DRIFT    {} artifact {} is {} but recorded {}", s.name, path, short(&h), short(sha));
+                    bad += 1;
+                }
+                None => {
+                    println!("ERROR    {} artifact {} — cannot hash", s.name, path);
+                    bad += 1;
+                }
+            }
+        }
+    }
+    bad
 }
 
 /// One entry in the template's `UPGRADING.md`: an action that became required at a
@@ -1975,6 +2150,57 @@ mod software_tests {
         assert!(s[0].lines.is_empty());
     }
 
+    // Reproducible-build provenance fields parse (issue #10).
+    #[test]
+    fn parses_build_provenance() {
+        let text = "\
+[software \"ik\"]
+\turl          = https://x.test/ik.git
+\tpin          = abc123
+\tbuild        = cmake -B build && cmake --build build
+\ttoolchain    = gcc-13
+\tdeploy       = ik
+\tartifact     = build/bin/srv deadbeefcafe
+\trepro-exempt = call/0009
+";
+        let s = parse_software(text);
+        assert_eq!(s[0].build.as_deref(), Some("cmake -B build && cmake --build build"));
+        assert_eq!(s[0].toolchain.as_deref(), Some("gcc-13"));
+        assert_eq!(s[0].deploy.as_deref(), Some("ik"));
+        assert_eq!(s[0].artifact, Some(("build/bin/srv".to_string(), "deadbeefcafe".to_string())));
+        assert_eq!(s[0].repro_exempt.as_deref(), Some("call/0009"));
+    }
+
+    // The fast attestation/exemption pass: deploy-line recorded, artifact hash matches,
+    // exemption cites a real decision (issue #10).
+    #[test]
+    fn provenance_attestation_and_exemption() {
+        let base = std::env::temp_dir().join(format!("hl-prov-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("ik/build/bin")).unwrap();
+        fs::create_dir_all(base.join("call")).unwrap();
+        fs::write(base.join("ik/build/bin/srv"), "BINARY").unwrap();
+        fs::write(base.join("call/0009-exempt.md"), "# x\n- Status: accepted\n- Scope: ik\n").unwrap();
+        let sha = sha256_file(&base.join("ik/build/bin/srv")).unwrap();
+
+        let mk = |deploy: &str, art_sha: &str, exempt: Option<&str>| Software {
+            name: "ik".into(), url: "u".into(), pin: "p".into(),
+            worktrees: vec![], lines: vec![],
+            build: None, toolchain: None,
+            deploy: Some(deploy.into()),
+            artifact: Some(("build/bin/srv".into(), art_sha.into())),
+            repro_exempt: exempt.map(String::from),
+        };
+        // recorded deploy line + matching artifact hash + valid exemption → clean
+        assert_eq!(provenance_problems(&base, &mk("ik", &sha, Some("call/0009"))), 0);
+        // wrong artifact hash → 1 failure
+        assert_eq!(provenance_problems(&base, &mk("ik", "0000", None)), 1);
+        // unrecorded deploy line → 1; exemption citing a missing decision → 1 (so 2)
+        assert_eq!(provenance_problems(&base, &mk("ghost", &sha, Some("call/9999"))), 2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // The explicit `worktree = <dir> <branch> <pin>` form parses into a fully-pinned
     // parallel line, alongside the bare dir-list form (issue #6).
     #[test]
@@ -2031,6 +2257,7 @@ mod software_tests {
                 branch: "feature".to_string(),
                 pin: line_pin.clone(),
             }],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None,
         }];
         software_materialize(&host, &recipe);
 
@@ -2072,6 +2299,7 @@ mod software_tests {
             pin: pin.clone(),
             worktrees: Vec::new(),
             lines: Vec::new(),
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None,
         }];
         software_materialize(&host, &recipe);
 
@@ -2272,6 +2500,7 @@ mod book_tests {
                 branch: "perf/256k".to_string(),
                 pin: "a0506f2deadbeef".to_string(),
             }],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None,
         }];
         let s = where_stub(&recipe);
         assert!(s.contains("## ik"));
