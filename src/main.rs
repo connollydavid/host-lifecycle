@@ -1506,10 +1506,13 @@ fn stamp_title(root: &Path) -> String {
 /// `home.md` (if present and non-blank) is used verbatim; otherwise a generated
 /// overview links each room's landing.
 fn home_page(root: &Path, name: &str, sections: &[Section]) -> Page {
+    // Labelled "Home", not the project name: mdBook renders `<title>{label} - {book
+    // title}`, and the book title is already the project name, so a `name` label
+    // would double it ("agentic-host - agentic-host").
     for cand in ["README.md", "home.md"] {
         let p = root.join(cand);
         if fs::read_to_string(&p).map(|t| !t.trim().is_empty()).unwrap_or(false) {
-            return Page { dest: "index.md".to_string(), label: name.to_string(), depth: 0, body: PageBody::Copy(p) };
+            return Page { dest: "index.md".to_string(), label: "Home".to_string(), depth: 0, body: PageBody::Copy(p) };
         }
     }
     let mut s = format!("# {name}\n\nProject documentation, organized by the methodology's rooms.\n\n");
@@ -1518,7 +1521,7 @@ fn home_page(root: &Path, name: &str, sections: &[Section]) -> Page {
             s.push_str(&format!("- [{}]({})\n", sec.title, p.dest));
         }
     }
-    Page { dest: "index.md".to_string(), label: name.to_string(), depth: 0, body: PageBody::Inline(s) }
+    Page { dest: "index.md".to_string(), label: "Home".to_string(), depth: 0, body: PageBody::Inline(s) }
 }
 
 /// Render `docs/SUMMARY.md`: the home page as a prefix chapter (mdBook's landing),
@@ -2154,7 +2157,9 @@ mod book_tests {
         let home = home_page(&base, "proj", &sections);
         assert_eq!(home.dest, "index.md");
         let summary = summary_text(&home, &sections);
-        let home_at = summary.find("[proj](index.md)").expect("home prefix chapter");
+        // labelled "Home" (not the project name) so mdBook does not double the title
+        let home_at = summary.find("[Home](index.md)").expect("home prefix chapter");
+        assert_eq!(home.label, "Home");
         let cast_at = summary.find("# Cast — who").unwrap();
         let call_at = summary.find("# Call — why").unwrap();
         let where_at = summary.find("# Software — where").unwrap();
