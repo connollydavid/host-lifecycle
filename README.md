@@ -155,6 +155,10 @@ carries none:
     revision = "<sha>"
     name     = "agentic-host"
 
+The landing page is a dedicated **home** (a prefix chapter), so no room becomes the
+site's front page: a repo `README.md`/`home.md` is used verbatim if present, else a
+generated overview linking each room.
+
 `book` writes a `book.toml` with **`src = "docs"`** (never `src = "."`, which would
 walk the un-materialized worktrees — `call/0005`) and regenerates `docs/` from
 scratch: a `docs/SUMMARY.md` in **lifecycle order** — Cast (Who) → Plan + specs

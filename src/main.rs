@@ -1162,7 +1162,7 @@ fn upgrade_applies(template: &Path, have: &str, landed: &str) -> bool {
 
 /// Root-level `.md` files the book places in a specific room (so the catch-all
 /// Reference section does not list them twice).
-const PLACED_ROOT_MD: [&str; 5] = ["SUMMARY.md", "README.md", "MEMORY.md", "CLAUDE.md", "PLAN.md"];
+const PLACED_ROOT_MD: [&str; 7] = ["SUMMARY.md", "README.md", "MEMORY.md", "CLAUDE.md", "PLAN.md", "home.md", "index.md"];
 
 /// A published section of the book — one per room, emitted in lifecycle order
 /// (Who → What/When → Where → Why → How → Memory). A section with no content page
@@ -1231,7 +1231,8 @@ fn book(args: &[String]) {
     if check {
         book_check(&sections);
     } else {
-        write_book(&root, &sections, dry);
+        let home = home_page(&root, &stamp_title(&root), &sections);
+        write_book(&root, &home, &sections, dry);
     }
 }
 
@@ -1431,15 +1432,14 @@ fn page_has_content(p: &Page) -> bool {
 
 /// Generate `book.toml` and `docs/` from the plan. `docs/` is rebuilt from scratch
 /// (it is generated output, gitignored), so a removed source never lingers.
-fn write_book(root: &Path, sections: &[Section], dry: bool) {
+fn write_book(root: &Path, home: &Page, sections: &[Section], dry: bool) {
     let docs = root.join("docs");
+    let all = std::iter::once(home).chain(sections.iter().flat_map(|s| s.pages.iter()));
     if dry {
         println!("write  book.toml (dry-run)");
         println!("write  docs/SUMMARY.md (dry-run)");
-        for s in sections {
-            for p in &s.pages {
-                println!("write  docs/{} (dry-run)", p.dest);
-            }
+        for p in all {
+            println!("write  docs/{} (dry-run)", p.dest);
         }
         return;
     }
@@ -1453,24 +1453,22 @@ fn write_book(root: &Path, sections: &[Section], dry: bool) {
         process::exit(2);
     }
     let mut count = 0usize;
-    for s in sections {
-        for p in &s.pages {
-            let dest = docs.join(&p.dest);
-            if let Some(parent) = dest.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let res = match &p.body {
-                PageBody::Copy(src) => fs::copy(src, &dest).map(|_| ()),
-                PageBody::Inline(text) => fs::write(&dest, text),
-            };
-            if let Err(e) = res {
-                eprintln!("host-lifecycle: cannot write {}: {e}", dest.display());
-                process::exit(2);
-            }
-            count += 1;
+    for p in all {
+        let dest = docs.join(&p.dest);
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent);
         }
+        let res = match &p.body {
+            PageBody::Copy(src) => fs::copy(src, &dest).map(|_| ()),
+            PageBody::Inline(text) => fs::write(&dest, text),
+        };
+        if let Err(e) = res {
+            eprintln!("host-lifecycle: cannot write {}: {e}", dest.display());
+            process::exit(2);
+        }
+        count += 1;
     }
-    if let Err(e) = fs::write(docs.join("SUMMARY.md"), summary_text(sections)) {
+    if let Err(e) = fs::write(docs.join("SUMMARY.md"), summary_text(home, sections)) {
         eprintln!("host-lifecycle: cannot write docs/SUMMARY.md: {e}");
         process::exit(2);
     }
@@ -1483,11 +1481,7 @@ fn write_book(root: &Path, sections: &[Section], dry: bool) {
 /// is deterministic regardless of the checkout directory), falling back to the
 /// directory name when the stamp carries none.
 fn book_toml(root: &Path) -> String {
-    let stamp_name = fs::read_to_string(root.join(STAMP)).ok().and_then(|t| stamp_field(&t, "name"));
-    let title = stamp_name
-        .as_deref()
-        .or_else(|| root.file_name().and_then(|n| n.to_str()))
-        .unwrap_or("docs");
+    let title = stamp_title(root);
     let mut s = format!(
         "[book]\nlanguage = \"en\"\nsrc = \"docs\"\ntitle = \"{title}\"\n\n[output.html]\ndefault-theme = \"light\"\npreferred-dark-theme = \"navy\"\n"
     );
@@ -1497,10 +1491,42 @@ fn book_toml(root: &Path) -> String {
     s
 }
 
-/// Render `docs/SUMMARY.md`: a `# <part>` header per section, then its pages as
-/// indented list items in lifecycle order.
-fn summary_text(sections: &[Section]) -> String {
+/// The project name for the book title: the `.host` stamp's `name`, falling back to
+/// the checkout directory name. Used for both `book.toml` and the home page.
+fn stamp_title(root: &Path) -> String {
+    fs::read_to_string(root.join(STAMP))
+        .ok()
+        .and_then(|t| stamp_field(&t, "name"))
+        .or_else(|| root.file_name().and_then(|n| n.to_str()).map(String::from))
+        .unwrap_or_else(|| "docs".to_string())
+}
+
+/// The home/index page — mdBook's landing, listed as a prefix chapter before the
+/// first room, so no room becomes the site's front page. A repo `README.md` or
+/// `home.md` (if present and non-blank) is used verbatim; otherwise a generated
+/// overview links each room's landing.
+fn home_page(root: &Path, name: &str, sections: &[Section]) -> Page {
+    for cand in ["README.md", "home.md"] {
+        let p = root.join(cand);
+        if fs::read_to_string(&p).map(|t| !t.trim().is_empty()).unwrap_or(false) {
+            return Page { dest: "index.md".to_string(), label: name.to_string(), depth: 0, body: PageBody::Copy(p) };
+        }
+    }
+    let mut s = format!("# {name}\n\nProject documentation, organized by the methodology's rooms.\n\n");
+    for sec in sections {
+        if let Some(p) = sec.pages.first() {
+            s.push_str(&format!("- [{}]({})\n", sec.title, p.dest));
+        }
+    }
+    Page { dest: "index.md".to_string(), label: name.to_string(), depth: 0, body: PageBody::Inline(s) }
+}
+
+/// Render `docs/SUMMARY.md`: the home page as a prefix chapter (mdBook's landing),
+/// then a `# <part>` header per section with its pages as indented list items in
+/// lifecycle order.
+fn summary_text(home: &Page, sections: &[Section]) -> String {
     let mut s = String::from("# Summary\n\n");
+    s.push_str(&format!("[{}]({})\n\n", home.label, home.dest));
     for sec in sections {
         s.push_str(&format!("# {}\n\n", sec.title));
         for p in &sec.pages {
@@ -2023,6 +2049,32 @@ mod book_tests {
     }
 
     #[test]
+    fn home_page_prefers_readme_else_generates_overview() {
+        let base = std::env::temp_dir().join(format!("hl-home-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("cast")).unwrap();
+        fs::write(base.join("cast/README.md"), "# Cast\n").unwrap();
+        let sections = plan_book(&base);
+        // no README/home.md → generated overview linking the rooms, titled by name
+        let gen = home_page(&base, "proj", &sections);
+        assert_eq!(gen.dest, "index.md");
+        match &gen.body {
+            PageBody::Inline(t) => {
+                assert!(t.starts_with("# proj\n"));
+                assert!(t.contains("](cast/README.md)"), "links the Cast landing");
+            }
+            _ => panic!("expected a generated home page"),
+        }
+        // a real README.md is used verbatim instead
+        fs::write(base.join("README.md"), "# Welcome\n").unwrap();
+        match home_page(&base, "proj", &sections).body {
+            PageBody::Copy(p) => assert_eq!(p, base.join("README.md")),
+            _ => panic!("expected README.md to be used as home"),
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn stamp_field_reads_quoted_values() {
         let t = "template = \"u\"\nrevision = \"r1\"\nname = \"proj\"\n";
         assert_eq!(stamp_field(t, "name").as_deref(), Some("proj"));
@@ -2097,11 +2149,16 @@ mod book_tests {
         assert!(refr.pages.iter().any(|p| p.dest == "CLAUDE.md" && p.depth == 0));
         assert!(refr.pages.iter().any(|p| p.dest == "BOOTSTRAP.md"));
 
-        // SUMMARY is valid-shaped and in order: Cast part appears before Call part
-        let summary = summary_text(&sections);
+        // SUMMARY: the home page is a prefix chapter ahead of every room (no room is
+        // the landing), then the parts in lifecycle order.
+        let home = home_page(&base, "proj", &sections);
+        assert_eq!(home.dest, "index.md");
+        let summary = summary_text(&home, &sections);
+        let home_at = summary.find("[proj](index.md)").expect("home prefix chapter");
         let cast_at = summary.find("# Cast — who").unwrap();
         let call_at = summary.find("# Call — why").unwrap();
         let where_at = summary.find("# Software — where").unwrap();
+        assert!(home_at < cast_at, "home leads, not Cast");
         assert!(cast_at < where_at && where_at < call_at, "lifecycle order in SUMMARY");
 
         // every room here has source, so each is required and must render content
