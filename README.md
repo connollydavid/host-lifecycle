@@ -57,6 +57,12 @@ rewrites `Phase 1` but not `Phase 12`), longest match first (`Phase 5.0` before
   so a second stage removes it once the remap is verified (its durable copy lives in
   the migration decision record).
 
+Both `--check` and `--apply` also cover spec files (`.allium`/`.tla`/`.cfg`), which
+`host-lint`'s scannable set omits — so a migration's declared substitutions reach
+spec-internal cross-references too, and the summary line reports how many spec files
+were included. (The rewrite stays map-only, so running it over plain-text spec
+bodies is safe.)
+
 `host-lint` stays a pure detector that faults on tells and never reads the
 dictionary; all rename policy lives here, applied once, token-free.
 
@@ -80,13 +86,23 @@ component (`#` comments, blanks ignored):
         url       = https://github.com/connollydavid/host-lint.git
         pin       = 2ef53995855e4ec363ba5b587b176d49b9aad7a5
         worktrees = host-lint.review
+        worktree  = host-lint.256k perf/256k-single-context a0506f2
+
+A component carries two worktree forms. The bare **`worktrees`** list names
+parallel dirs whose branch is derived from the `<line>` suffix and whose tree is
+created at the component `pin`. The explicit **`worktree = <dir> <branch> <pin>`**
+form (repeatable) pins a parallel line to its *own* branch and *own* commit — use
+it whenever a parallel line is not simply the canonical pin on a renamed branch,
+so `--materialize` reproduces it faithfully instead of silently landing it at the
+canonical pin.
 
 - **`--materialize`** clones each `<name>.git` (setting the remote-tracking
   refspec `git clone --bare` omits), adds the canonical worktree `<name>/` at
-  `pin`, initialises nested submodules per worktree, and adds each listed parallel
-  worktree on a branch named by its `<line>` suffix. Idempotent — anything already
-  present is skipped — and the trees are gitignored, materialised locally from the
-  recipe.
+  `pin`, initialises nested submodules per worktree, adds each listed `worktrees`
+  parallel worktree on a branch named by its `<line>` suffix, and creates each
+  explicit `worktree` line on its own branch at its own pin (`-B`). Idempotent —
+  anything already present is skipped — and the trees are gitignored, materialised
+  locally from the recipe.
 - **`--check`** verifies each component's bare store and canonical worktree exist
   and the worktree sits at the recorded `pin` — the audit that replaces a submodule
   gitlink's `git submodule status`. It also flags **worktree-absence hazards**: a
@@ -95,7 +111,8 @@ component (`#` comments, blanks ignored):
   submodule) and dangles wherever that path is not materialized (a fresh clone, CI,
   a partial submodule init), so it is reported as a `HAZARD` (`call/0005`). A
   symlink to a submodule *root* (a tracked gitlink) is fine — it resolves to the
-  empty dir git leaves on checkout. Exit 1 on a missing/drifted component or a hazard, 0 when
+  empty dir git leaves on checkout. Each explicit `worktree` line is audited at its
+  own branch and pin too. Exit 1 on a missing/drifted component or a hazard, 0 when
   all are at their pin and no tracked symlink reaches into a worktree.
 
 ## Upgrade — version to version
@@ -119,5 +136,35 @@ newer** than it — decided by git ancestry against the template, so same-day
 revisions order correctly (a date cannot). Fetch the template to the target
 revision first; an entry the local template cannot resolve is treated as pending
 (the repo is behind it). The list is the to-do for `stamped → current`.
+
+## Book — publish the rooms
+
+The methodology defines five rooms and two spec formats; `book` is the one
+canonical way to **publish** them, so an adopter does not hand-roll an mdBook
+generator that drops a room or re-derives the `call/0005` src-scoping wrong.
+
+    host-lifecycle book <dir> [--dry-run]   # generate book.toml + docs/ + SUMMARY.md
+    host-lifecycle book --check <dir>        # fail unless every room renders a page
+
+`book` writes a `book.toml` with **`src = "docs"`** (never `src = "."`, which would
+walk the un-materialized worktrees — `call/0005`) and regenerates `docs/` from
+scratch: a `docs/SUMMARY.md` in **lifecycle order** — Cast (Who) → Plan + specs
+(What/When) → Software (Where) → Call (Why) → Reference/CLAUDE (How) → Memory — with
+every spec rendered as a fenced code page and a **Where stub** parsed from
+`.host-software` (component, url, pin, worktrees, materialize command — read from the
+committed recipe, so no worktree need be on disk). Run it in CI before `mdbook
+build`; `book.toml` and `docs/` are generated output, gitignored.
+
+`--check` is the stub-coverage gate: it fails (exit 1) naming any room that renders
+no page with content, so a half-room site cannot ship green.
+
+## Pinning a released version
+
+A release tag is **annotated**, so `git ls-remote <repo> v0.6.0` resolves to the
+tag *object*, not the commit — recording that as a submodule gitlink is silently
+wrong. Pin the dereferenced commit:
+
+    git ls-remote https://github.com/connollydavid/host-lifecycle 'v0.6.0^{}'   # the commit
+    git rev-list -n1 v0.6.0                                                      # same, locally
 
 Released into the public domain (Unlicense).

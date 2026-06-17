@@ -22,6 +22,17 @@ const STAMP: &str = ".host";
 /// The rooms `adopt` scaffolds (Where = the software submodule, added by hand).
 const ROOMS: [&str; 3] = ["cast", "plan", "call"];
 
+/// The verification-lane tools an adopter wires after `adopt` (the host pair plus
+/// the requirements/timing lanes). `adopt` only scaffolds rooms and the stamp, so
+/// it prints these as the remaining manual step — `(name, url)`, added under
+/// `tools/<name>` and pinned to the commit the template references at this revision.
+const TOOL_SUBMODULES: [(&str, &str); 4] = [
+    ("host-lint", "https://github.com/connollydavid/host-lint"),
+    ("host-lifecycle", "https://github.com/connollydavid/host-lifecycle"),
+    ("allium", "https://github.com/juxt/allium"),
+    ("specula", "https://github.com/specula-org/Specula"),
+];
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -33,8 +44,9 @@ fn main() {
         Some("remap") => remap(&args[2..]),
         Some("software") => software(&args[2..]),
         Some("upgrade") => upgrade(args.get(2)),
+        Some("book") => book(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -45,6 +57,8 @@ fn main() {
             eprintln!("  software --materialize <dir>  — clone the bare store(s) + worktrees from .host-software");
             eprintln!("  software --check <dir>        — verify each canonical worktree is at its recorded pin");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
+            eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
+            eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
             process::exit(2);
         }
     }
@@ -152,6 +166,27 @@ fn adopt(args: &[String]) {
     } else {
         println!("write  {STAMP} (revision {revision})");
     }
+
+    print_adopt_checklist();
+}
+
+/// Print the post-`adopt` checklist. `adopt` scaffolds rooms and the stamp only;
+/// wiring the verification tools and installing the hooks is manual work with no
+/// other prompt, so spell it out (`(name, url)` per tool, pinned at this revision).
+fn print_adopt_checklist() {
+    println!("\nnext steps (adopt scaffolds rooms + the stamp only):");
+    println!("  1. wire the verification tools as submodules, each pinned to the commit");
+    println!("     the template references at this revision:");
+    for (name, url) in TOOL_SUBMODULES {
+        println!("       git submodule add {url} tools/{name}");
+    }
+    println!("  2. install the host-lint git hooks so new commits are gated (one");
+    println!("     script dispatches on its installed name):");
+    println!("       cp tools/host-lint/pre-commit .git/hooks/pre-commit");
+    println!("       cp tools/host-lint/pre-commit .git/hooks/commit-msg");
+    println!("       chmod +x .git/hooks/pre-commit .git/hooks/commit-msg");
+    println!("  3. embed the software in the Where slot (.host-software) and run:");
+    println!("       host-lifecycle software --materialize .");
 }
 
 /// `version <dir>` — print the template revision recorded in the stamp.
@@ -252,6 +287,11 @@ const IGNORE: &str = ".host-lintignore";
 /// The software-under-test recipe (`call/0010`): one `[software "<name>"]` stanza
 /// per component — a bare store plus its canonical worktree at `pin`.
 const SOFTWARE: &str = ".host-software";
+/// Spec file extensions (behaviour `.allium`, timing `.tla`/`.cfg`). `host-lint`'s
+/// scannable set omits these, so the remap skipped spec-internal cross-references
+/// silently (issue #7); remap treats them as targets too — the rewrite is map-only,
+/// so plain-text spec bodies are safe to run the declared substitutions over.
+const SPEC_EXTS: [&str; 3] = ["allium", "tla", "cfg"];
 
 /// One sanctioned substitution: match `old` (case-insensitive, word-bounded),
 /// replace with `new` verbatim. The human supplies `new`; the tool never coins it.
@@ -470,8 +510,9 @@ fn collect_files(dir: &Path, root: &Path, subs: &[String], out: &mut Vec<PathBuf
     }
 }
 
-/// A file the remap should touch: scannable by `host-lint`, not a CI file, and not
-/// one of our own control files (the dictionary, the allow file, the stamp).
+/// A file the remap should touch: scannable by `host-lint` or a spec file, not a CI
+/// file, and not one of our own control files (the dictionary, the allow file, the
+/// stamp).
 fn is_target(p: &Path) -> bool {
     let s = p.to_string_lossy();
     if is_ci_file(&s) {
@@ -482,7 +523,12 @@ fn is_target(p: &Path) -> bool {
         return false;
     }
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-    is_scannable(ext)
+    is_scannable(ext) || is_spec_ext(ext)
+}
+
+/// A spec extension the remap rewrites even though `host-lint` does not scan it.
+fn is_spec_ext(ext: &str) -> bool {
+    SPEC_EXTS.contains(&ext)
 }
 
 /// `--check`: apply the dictionary in memory, then run `host-lint` over the result
@@ -496,6 +542,7 @@ fn remap_check(root: &Path, rules: &[Rule], allow: &[String], ignore: &[String])
     files.sort();
 
     let mut changed = 0usize;
+    let mut specs = 0usize;
     let mut remaining: Vec<Match> = Vec::new();
     for f in &files {
         if !is_target(f) {
@@ -508,6 +555,9 @@ fn remap_check(root: &Path, rules: &[Rule], allow: &[String], ignore: &[String])
         let Ok(content) = fs::read_to_string(f) else {
             continue;
         };
+        if is_spec_ext(f.extension().and_then(|e| e.to_str()).unwrap_or("")) {
+            specs += 1;
+        }
         let applied = apply_text(&content, rules);
         if applied != content {
             changed += 1;
@@ -519,7 +569,7 @@ fn remap_check(root: &Path, rules: &[Rule], allow: &[String], ignore: &[String])
         println!("{}:{}: {kind}: {} ({})", m.file, m.line, m.text, m.term);
     }
     println!(
-        "-- {changed} file(s) would change; {} undispositioned tell(s) remain",
+        "-- {changed} file(s) would change ({specs} spec file(s) scanned); {} undispositioned tell(s) remain",
         remaining.len()
     );
     if remaining.iter().any(|m| m.severity == Severity::Flag) {
@@ -543,6 +593,7 @@ fn remap_apply(root: &Path, rules: &[Rule], ignore: &[String], dry: bool) {
     files.sort();
 
     let mut changed = 0usize;
+    let mut specs = 0usize;
     for f in &files {
         if !is_target(f) {
             continue;
@@ -558,6 +609,9 @@ fn remap_apply(root: &Path, rules: &[Rule], ignore: &[String], dry: bool) {
         if applied == content {
             continue;
         }
+        if is_spec_ext(f.extension().and_then(|e| e.to_str()).unwrap_or("")) {
+            specs += 1;
+        }
         if dry {
             println!("would remap {rel}");
         } else if let Err(e) = fs::write(f, &applied) {
@@ -569,7 +623,7 @@ fn remap_apply(root: &Path, rules: &[Rule], ignore: &[String], dry: bool) {
         changed += 1;
     }
     println!(
-        "-- {changed} file(s) {}",
+        "-- {changed} file(s) {} ({specs} spec file(s) included)",
         if dry { "would change (dry-run)" } else { "remapped" }
     );
     if !dry {
@@ -609,7 +663,20 @@ struct Software {
     name: String,
     url: String,
     pin: String,
+    /// Bare `worktrees = <dir> ...` form: branch derived from the dir suffix, tree
+    /// created at the component `pin`. Kept for back-compat.
     worktrees: Vec<String>,
+    /// Explicit `worktree = <dir> <branch> <pin>` form: a parallel line on its own
+    /// branch at its own pin, faithfully reproducible by `--materialize` (the bare
+    /// form silently put a parallel line at the canonical pin — issue #6).
+    lines: Vec<Worktree>,
+}
+
+/// An explicit parallel worktree: a directory checked out on `branch` at `pin`.
+struct Worktree {
+    dir: String,
+    branch: String,
+    pin: String,
 }
 
 /// `software --materialize|--check <dir>` — realise the `.host-software` recipe.
@@ -682,6 +749,7 @@ fn parse_software(text: &str) -> Vec<Software> {
                 url: String::new(),
                 pin: String::new(),
                 worktrees: Vec::new(),
+                lines: Vec::new(),
             });
             continue;
         }
@@ -697,6 +765,22 @@ fn parse_software(text: &str) -> Vec<Software> {
             "url" => cur.url = val.to_string(),
             "pin" => cur.pin = val.to_string(),
             "worktrees" => cur.worktrees = val.split_whitespace().map(String::from).collect(),
+            "worktree" => {
+                // `worktree = <dir> <branch> <pin>` — a parallel line, fully pinned.
+                let f: Vec<&str> = val.split_whitespace().collect();
+                let [dir, branch, pin] = f[..] else {
+                    eprintln!(
+                        "host-lifecycle: {SOFTWARE}:{}: `worktree` needs `<dir> <branch> <pin>`",
+                        i + 1
+                    );
+                    process::exit(2);
+                };
+                cur.lines.push(Worktree {
+                    dir: dir.to_string(),
+                    branch: branch.to_string(),
+                    pin: pin.to_string(),
+                });
+            }
             _ => {}
         }
     }
@@ -764,6 +848,23 @@ fn software_materialize(root: &Path, recipe: &[Software]) {
             println!("worktree {wt}/ ({branch})");
             made += 1;
         }
+        for w in &s.lines {
+            let wtp = root.join(&w.dir);
+            if wtp.exists() {
+                println!("skip     {}/ (exists)", w.dir);
+                continue;
+            }
+            let wtp_s = wtp.to_string_lossy();
+            // `-B` creates or resets `branch` to the recorded `pin`, so a parallel
+            // line lands on its own branch at its own commit — not the canonical pin.
+            if !git_ok(&bare, &["worktree", "add", "-B", &w.branch, &wtp_s, &w.pin]) {
+                eprintln!("host-lifecycle: worktree add {}/ @ {} failed", w.dir, short(&w.pin));
+                process::exit(2);
+            }
+            git_ok(&wtp, &["submodule", "update", "--init", "--recursive"]);
+            println!("worktree {}/ ({} @ {})", w.dir, w.branch, short(&w.pin));
+            made += 1;
+        }
     }
     println!("-- {made} item(s) materialized");
 }
@@ -796,6 +897,38 @@ fn software_check(root: &Path, recipe: &[Software]) {
             _ => {
                 println!("ERROR    {}/ — cannot resolve HEAD or pin", s.name);
                 bad += 1;
+            }
+        }
+        // Explicit parallel worktrees: each at its own branch and pin (issue #6).
+        for w in &s.lines {
+            let wt = root.join(&w.dir);
+            if !wt.is_dir() {
+                println!("MISSING  {}/ (run --materialize)", w.dir);
+                bad += 1;
+                continue;
+            }
+            let want = git_out(&bare, &["rev-parse", &w.pin]);
+            let have = git_out(&wt, &["rev-parse", "HEAD"]);
+            let br = git_out(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+            match (want, have) {
+                (Some(want), Some(have)) if want == have => match br {
+                    Some(br) if br == w.branch => println!("ok       {}/ ({} @ {})", w.dir, w.branch, short(&w.pin)),
+                    Some(br) => {
+                        println!("DRIFT    {}/ at {} but on branch {} not {}", w.dir, short(&w.pin), br, w.branch);
+                        bad += 1;
+                    }
+                    None => {
+                        println!("ok       {}/ @ {}", w.dir, short(&w.pin));
+                    }
+                },
+                (Some(want), Some(have)) => {
+                    println!("DRIFT    {}/ at {} but pinned to {}", w.dir, short(&have), short(&want));
+                    bad += 1;
+                }
+                _ => {
+                    println!("ERROR    {}/ — cannot resolve HEAD or pin", w.dir);
+                    bad += 1;
+                }
             }
         }
     }
@@ -1021,6 +1154,486 @@ fn upgrade_applies(template: &Path, have: &str, landed: &str) -> bool {
     have_sha != landed_sha && git_ok(template, &["merge-base", "--is-ancestor", have, landed])
 }
 
+/// Root-level `.md` files the book places in a specific room (so the catch-all
+/// Reference section does not list them twice).
+const PLACED_ROOT_MD: [&str; 5] = ["SUMMARY.md", "README.md", "MEMORY.md", "CLAUDE.md", "PLAN.md"];
+
+/// A published section of the book — one per room, emitted in lifecycle order
+/// (Who → What/When → Where → Why → How → Memory). A section with no content page
+/// fails `book --check` (the stub-coverage gate).
+struct Section {
+    /// The SUMMARY part-title, e.g. "Cast — who".
+    title: String,
+    /// The room this covers, named in a coverage failure.
+    room: &'static str,
+    pages: Vec<Page>,
+}
+
+/// One rendered page: where it lands under `docs/`, its sidebar label and indent,
+/// and how to produce it.
+struct Page {
+    /// Path under `docs/`, e.g. `cast/mara.md`.
+    dest: String,
+    /// Sidebar label.
+    label: String,
+    /// SUMMARY indent depth: 0 top-level, 1 nested, …
+    depth: usize,
+    body: PageBody,
+}
+
+/// How a page's body is produced: copy a source file verbatim, or write generated
+/// markdown (the Where stub, a spec page, a spec index).
+enum PageBody {
+    Copy(PathBuf),
+    Inline(String),
+}
+
+/// `book <dir> [--dry-run]` — generate `book.toml` + `docs/` (SUMMARY in lifecycle
+/// order, specs rendered, a Where stub from `.host-software`). `book --check <dir>`
+/// fails unless every room renders at least one page with content. The methodology
+/// mandates five rooms and two spec formats but shipped no canonical way to publish
+/// them; this is that one maintained publisher, so adopters do not hand-roll a
+/// generator that drops rooms or re-derives the `call/0005` src-scoping wrong.
+fn book(args: &[String]) {
+    let mut check = false;
+    let mut dry = false;
+    let mut pos: Vec<&String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--check" => check = true,
+            "--dry-run" => dry = true,
+            _ => pos.push(a),
+        }
+    }
+    let Some(dir) = pos.first() else {
+        eprintln!("host-lifecycle book <dir> [--check] [--dry-run]");
+        process::exit(2);
+    };
+    let root = match fs::canonicalize(Path::new(dir.as_str())) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("host-lifecycle: not a directory: {dir}");
+            process::exit(2);
+        }
+    };
+    let sections = plan_book(&root);
+    if check {
+        book_check(&sections);
+    } else {
+        write_book(&root, &sections, dry);
+    }
+}
+
+/// Build the six sections in lifecycle order. Pure: reads the repo, writes nothing,
+/// so `--check` and generation see the same plan.
+fn plan_book(root: &Path) -> Vec<Section> {
+    vec![
+        flat_room(root, "cast", "Cast — who", "cast"),
+        plan_plan(root),
+        plan_software(root),
+        flat_room(root, "call", "Call — why", "call"),
+        plan_reference(root),
+        plan_memory(root),
+    ]
+}
+
+/// A room that is a flat directory of `.md` files (cast, call): the first file is
+/// the landing page (depth 0), the rest nest under it. README floats to the front.
+fn flat_room(root: &Path, dir_name: &str, title: &str, room: &'static str) -> Section {
+    let files = list_md(&root.join(dir_name));
+    let mut pages = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let fname = file_name_str(f);
+        let stem = f.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        pages.push(Page {
+            dest: format!("{dir_name}/{fname}"),
+            label: label_for(f, &stem),
+            depth: usize::from(i > 0),
+            body: PageBody::Copy(f.clone()),
+        });
+    }
+    Section { title: title.to_string(), room, pages }
+}
+
+/// The Plan room (What/When): a landing page (root `PLAN.md` if present, else a
+/// generated index), then each milestone, then its specs rendered as code pages.
+fn plan_plan(root: &Path) -> Section {
+    let mut pages = Vec::new();
+    let plan_md = root.join("PLAN.md");
+    if plan_md.is_file() {
+        pages.push(Page {
+            dest: "PLAN.md".to_string(),
+            label: label_for(&plan_md, "Plan"),
+            depth: 0,
+            body: PageBody::Copy(plan_md),
+        });
+    } else {
+        pages.push(Page {
+            dest: "plan-index.md".to_string(),
+            label: "Plan".to_string(),
+            depth: 0,
+            body: PageBody::Inline("# Plan — what & when\n\nMilestones in this project.\n".to_string()),
+        });
+    }
+    for m in milestone_dirs(&root.join("plan")) {
+        let dname = file_name_str(&m);
+        let readme = m.join("README.md");
+        let label = if readme.is_file() { label_for(&readme, &dname) } else { humanize(&dname) };
+        let dest = format!("plan/{dname}/README.md");
+        let body = if readme.is_file() {
+            PageBody::Copy(readme)
+        } else {
+            PageBody::Inline(format!("# {}\n", humanize(&dname)))
+        };
+        pages.push(Page { dest, label, depth: 1, body });
+
+        let specs = spec_files(&m.join("spec"));
+        if !specs.is_empty() {
+            let mut idx = String::from("# Specs\n\n");
+            for sp in &specs {
+                let sname = file_name_str(sp);
+                idx.push_str(&format!("- [{sname}](spec/{sname}.md)\n"));
+            }
+            pages.push(Page {
+                dest: format!("plan/{dname}/spec-index.md"),
+                label: "specs".to_string(),
+                depth: 2,
+                body: PageBody::Inline(idx),
+            });
+            for sp in &specs {
+                let sname = file_name_str(sp);
+                let ext = sp.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let src = fs::read_to_string(sp).unwrap_or_default();
+                pages.push(Page {
+                    dest: format!("plan/{dname}/spec/{sname}.md"),
+                    label: sname.clone(),
+                    depth: 3,
+                    body: PageBody::Inline(spec_page(&sname, &src, ext)),
+                });
+            }
+        }
+    }
+    Section { title: "Plan — what & when".to_string(), room: "plan", pages }
+}
+
+/// The Where room: a stub generated from `.host-software` — component name, url,
+/// pin, worktrees, and the materialize command. Reads only the committed recipe, so
+/// it is safe in an un-materialized checkout (the worktrees themselves are never
+/// walked — `call/0005`). Absent recipe → no page → `--check` reports the gap.
+fn plan_software(root: &Path) -> Section {
+    let mut pages = Vec::new();
+    if let Ok(text) = fs::read_to_string(root.join(SOFTWARE)) {
+        let recipe = parse_software(&text);
+        if !recipe.is_empty() {
+            pages.push(Page {
+                dest: "where.md".to_string(),
+                label: "Software".to_string(),
+                depth: 0,
+                body: PageBody::Inline(where_stub(&recipe)),
+            });
+        }
+    }
+    Section { title: "Software — where".to_string(), room: "software", pages }
+}
+
+/// The How room: `CLAUDE.md` (the operating manual), then a `reference/` dir if
+/// present, then any loose root `.md` not already placed in another room — so no
+/// existing top-level doc is silently dropped from the published record.
+fn plan_reference(root: &Path) -> Section {
+    let mut pages = Vec::new();
+    let claude = root.join("CLAUDE.md");
+    if claude.is_file() {
+        pages.push(Page {
+            dest: "CLAUDE.md".to_string(),
+            label: label_for(&claude, "CLAUDE"),
+            depth: 0,
+            body: PageBody::Copy(claude),
+        });
+    }
+    for f in list_md(&root.join("reference")) {
+        let fname = file_name_str(&f);
+        let stem = f.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        pages.push(Page {
+            dest: format!("reference/{fname}"),
+            label: label_for(&f, &stem),
+            depth: 1,
+            body: PageBody::Copy(f),
+        });
+    }
+    for f in loose_root_md(root) {
+        let fname = file_name_str(&f);
+        let stem = f.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        pages.push(Page {
+            dest: fname,
+            label: label_for(&f, &stem),
+            depth: 1,
+            body: PageBody::Copy(f),
+        });
+    }
+    Section { title: "Reference — how".to_string(), room: "reference", pages }
+}
+
+/// The Memory room: the append-only `MEMORY.md` scratchpad.
+fn plan_memory(root: &Path) -> Section {
+    let mut pages = Vec::new();
+    let mem = root.join("MEMORY.md");
+    if mem.is_file() {
+        pages.push(Page {
+            dest: "MEMORY.md".to_string(),
+            label: "Memory".to_string(),
+            depth: 0,
+            body: PageBody::Copy(mem),
+        });
+    }
+    Section { title: "Memory".to_string(), room: "memory", pages }
+}
+
+/// `--check`: every room must render at least one page with content. Exit 1 naming
+/// each empty room; the gate a hand-rolled generator never had (issue #6, S5).
+fn book_check(sections: &[Section]) {
+    let mut missing = 0usize;
+    for s in sections {
+        if s.pages.iter().any(page_has_content) {
+            println!("ok       {} ({} page(s))", s.room, s.pages.len());
+        } else {
+            println!("MISSING  {} renders no page with content", s.room);
+            missing += 1;
+        }
+    }
+    if missing > 0 {
+        eprintln!("-- {missing} room(s) unrendered");
+        process::exit(1);
+    }
+    println!("-- every room renders at least one page");
+}
+
+/// Does a page carry real content? Inline bodies are checked directly; a copied
+/// source must exist and be non-blank.
+fn page_has_content(p: &Page) -> bool {
+    match &p.body {
+        PageBody::Inline(t) => !t.trim().is_empty(),
+        PageBody::Copy(src) => fs::read_to_string(src).map(|t| !t.trim().is_empty()).unwrap_or(false),
+    }
+}
+
+/// Generate `book.toml` and `docs/` from the plan. `docs/` is rebuilt from scratch
+/// (it is generated output, gitignored), so a removed source never lingers.
+fn write_book(root: &Path, sections: &[Section], dry: bool) {
+    let docs = root.join("docs");
+    if dry {
+        println!("write  book.toml (dry-run)");
+        println!("write  docs/SUMMARY.md (dry-run)");
+        for s in sections {
+            for p in &s.pages {
+                println!("write  docs/{} (dry-run)", p.dest);
+            }
+        }
+        return;
+    }
+    let _ = fs::remove_dir_all(&docs);
+    if let Err(e) = fs::create_dir_all(&docs) {
+        eprintln!("host-lifecycle: cannot create {}: {e}", docs.display());
+        process::exit(2);
+    }
+    if let Err(e) = fs::write(root.join("book.toml"), book_toml(root)) {
+        eprintln!("host-lifecycle: cannot write book.toml: {e}");
+        process::exit(2);
+    }
+    let mut count = 0usize;
+    for s in sections {
+        for p in &s.pages {
+            let dest = docs.join(&p.dest);
+            if let Some(parent) = dest.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let res = match &p.body {
+                PageBody::Copy(src) => fs::copy(src, &dest).map(|_| ()),
+                PageBody::Inline(text) => fs::write(&dest, text),
+            };
+            if let Err(e) = res {
+                eprintln!("host-lifecycle: cannot write {}: {e}", dest.display());
+                process::exit(2);
+            }
+            count += 1;
+        }
+    }
+    if let Err(e) = fs::write(docs.join("SUMMARY.md"), summary_text(sections)) {
+        eprintln!("host-lifecycle: cannot write docs/SUMMARY.md: {e}");
+        process::exit(2);
+    }
+    println!("-- wrote book.toml + {count} page(s) + docs/SUMMARY.md");
+}
+
+/// The mdBook config: `src = "docs"` (never `"."`, which would walk the
+/// un-materialized worktrees — `call/0005`), the house light/navy theme, and
+/// `custom.css` only if the repo ships one.
+fn book_toml(root: &Path) -> String {
+    let title = root.file_name().and_then(|n| n.to_str()).unwrap_or("docs");
+    let mut s = format!(
+        "[book]\nlanguage = \"en\"\nsrc = \"docs\"\ntitle = \"{title}\"\n\n[output.html]\ndefault-theme = \"light\"\npreferred-dark-theme = \"navy\"\n"
+    );
+    if root.join("custom.css").is_file() {
+        s.push_str("additional-css = [\"custom.css\"]\n");
+    }
+    s
+}
+
+/// Render `docs/SUMMARY.md`: a `# <part>` header per section, then its pages as
+/// indented list items in lifecycle order.
+fn summary_text(sections: &[Section]) -> String {
+    let mut s = String::from("# Summary\n\n");
+    for sec in sections {
+        s.push_str(&format!("# {}\n\n", sec.title));
+        for p in &sec.pages {
+            let indent = "  ".repeat(p.depth);
+            s.push_str(&format!("{indent}- [{}]({})\n", p.label, p.dest));
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// The Where stub markdown for a parsed `.host-software` recipe.
+fn where_stub(recipe: &[Software]) -> String {
+    let mut s = String::from(
+        "# Software — where\n\nThe action this project produces. Each component is a bare object store \
+with worktrees — not committed into this repo; the recipe below is the reproducibility \
+anchor. Materialize the worktrees locally with:\n\n```\nhost-lifecycle software --materialize .\n```\n\n",
+    );
+    for c in recipe {
+        s.push_str(&format!("## {}\n\n- url: {}\n- pin: `{}`\n", c.name, c.url, c.pin));
+        let mut wts: Vec<String> = c.worktrees.clone();
+        for w in &c.lines {
+            wts.push(format!("{} ({} @ {})", w.dir, w.branch, short(&w.pin)));
+        }
+        if wts.is_empty() {
+            s.push_str("- worktrees: — (single canonical line)\n\n");
+        } else {
+            s.push_str(&format!("- worktrees: {}\n\n", wts.join(", ")));
+        }
+    }
+    s
+}
+
+/// Render a spec file as a fenced code page (mdBook shows `.allium`/`.tla` as
+/// preformatted text). The fence grows past any backtick run in the body so a spec
+/// that itself contains a fence still renders.
+fn spec_page(name: &str, body: &str, ext: &str) -> String {
+    let mut longest = 0usize;
+    let mut cur = 0usize;
+    for ch in body.chars() {
+        if ch == '`' {
+            cur += 1;
+            longest = longest.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    let fence = "`".repeat(longest.max(2) + 1);
+    let body = body.trim_end_matches('\n');
+    format!("# {name}\n\n{fence}{ext}\n{body}\n{fence}\n")
+}
+
+/// `.md` files in a directory, sorted, with `README.md` floated to the front.
+fn list_md(dir: &Path) -> Vec<PathBuf> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut v: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .collect();
+    v.sort();
+    v.sort_by_key(|p| p.file_name().and_then(|n| n.to_str()) != Some("README.md"));
+    v
+}
+
+/// Numbered milestone directories under `plan/`, sorted.
+fn milestone_dirs(plan: &Path) -> Vec<PathBuf> {
+    let rd = match fs::read_dir(plan) {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut v: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(|c: char| c.is_ascii_digit()))
+                    .unwrap_or(false)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Spec files (`.allium`/`.tla`/`.cfg`) in a milestone's `spec/` dir, sorted.
+fn spec_files(dir: &Path) -> Vec<PathBuf> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut v: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_spec_ext(p.extension().and_then(|e| e.to_str()).unwrap_or("")))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Root-level `.md` files not already placed in a specific room.
+fn loose_root_md(root: &Path) -> Vec<PathBuf> {
+    let rd = match fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut v: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .filter(|p| !PLACED_ROOT_MD.contains(&p.file_name().and_then(|n| n.to_str()).unwrap_or("")))
+        .collect();
+    v.sort();
+    v
+}
+
+/// A path's file name as an owned string (empty if it has none).
+fn file_name_str(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// A page label: the file's first `# ` heading, else the humanized fallback.
+fn label_for(path: &Path, fallback: &str) -> String {
+    fs::read_to_string(path)
+        .ok()
+        .as_deref()
+        .and_then(first_heading)
+        .unwrap_or_else(|| humanize(fallback))
+}
+
+/// The first `# ` heading text in a markdown document.
+fn first_heading(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("# ") {
+            let h = rest.trim();
+            if !h.is_empty() {
+                return Some(h.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Turn a slug into a readable label: separators become spaces.
+fn humanize(s: &str) -> String {
+    s.replace(['-', '_'], " ")
+}
+
 #[cfg(test)]
 mod remap_tests {
     use super::*;
@@ -1137,6 +1750,77 @@ mod software_tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].url, "u");
         assert_eq!(s[0].pin, "p");
+        assert!(s[0].lines.is_empty());
+    }
+
+    // The explicit `worktree = <dir> <branch> <pin>` form parses into a fully-pinned
+    // parallel line, alongside the bare dir-list form (issue #6).
+    #[test]
+    fn parses_explicit_worktree_lines() {
+        let text = "\
+[software \"ik\"]
+\turl       = https://example.test/ik.git
+\tpin       = b217881
+\tworktree  = ik.256k perf/256k-single-context a0506f2
+";
+        let s = parse_software(text);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].worktrees.is_empty());
+        assert_eq!(s[0].lines.len(), 1);
+        assert_eq!(s[0].lines[0].dir, "ik.256k");
+        assert_eq!(s[0].lines[0].branch, "perf/256k-single-context");
+        assert_eq!(s[0].lines[0].pin, "a0506f2");
+    }
+
+    // A parallel line materializes on its own branch at its own pin — not the
+    // canonical pin the bare dir-list form would have used (issue #6).
+    #[cfg(unix)]
+    #[test]
+    fn explicit_worktree_lands_on_its_own_branch_and_pin() {
+        let base = std::env::temp_dir().join(format!("hl-wt-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let host = base.join("host");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        let g = |cwd: &Path, args: &[&str]| assert!(git_ok(cwd, args), "git {args:?}");
+        g(&src, &["init", "-q", "-b", "main"]);
+        g(&src, &["config", "user.email", "t@t"]);
+        g(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("a.txt"), "one").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "one"]);
+        let canon = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+        // a second commit on a feature branch — the parallel line's pin
+        g(&src, &["checkout", "-q", "-b", "feature"]);
+        fs::write(src.join("b.txt"), "two").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "two"]);
+        let line_pin = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+        g(&src, &["checkout", "-q", "main"]);
+
+        let recipe = vec![Software {
+            name: "demo".to_string(),
+            url: src.to_string_lossy().to_string(),
+            pin: canon.clone(),
+            worktrees: Vec::new(),
+            lines: vec![Worktree {
+                dir: "demo.line".to_string(),
+                branch: "feature".to_string(),
+                pin: line_pin.clone(),
+            }],
+        }];
+        software_materialize(&host, &recipe);
+
+        let line = host.join("demo.line");
+        assert!(line.is_dir(), "parallel worktree created");
+        // at its OWN pin, not the canonical one
+        assert_eq!(git_out(&line, &["rev-parse", "HEAD"]).unwrap(), line_pin);
+        assert_ne!(line_pin, canon, "fixture sanity: the two pins differ");
+        assert_eq!(git_out(&line, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(), "feature");
+        software_check(&host, &recipe); // passes on a matching branch+pin
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     // Materialise from a local source repo, then check the pin round-trips.
@@ -1165,6 +1849,7 @@ mod software_tests {
             url: src.to_string_lossy().to_string(),
             pin: pin.clone(),
             worktrees: Vec::new(),
+            lines: Vec::new(),
         }];
         software_materialize(&host, &recipe);
 
@@ -1264,6 +1949,123 @@ mod upgrade_tests {
         assert!(!upgrade_applies(&base, &r2, &r1), "newer repo skips an older action");
         assert!(!upgrade_applies(&base, &r2, &r2), "same revision is not pending");
         assert!(upgrade_applies(&base, &r1, "deadbeefdeadbeef"), "unknown landed → behind it");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod book_tests {
+    use super::*;
+
+    #[test]
+    fn first_heading_finds_title() {
+        assert_eq!(first_heading("# Mara — operator\n\nbody"), Some("Mara — operator".to_string()));
+        assert_eq!(first_heading("intro\n## sub\n# Real\n").as_deref(), Some("Real"));
+        assert_eq!(first_heading("no heading here\n"), None);
+        assert_eq!(first_heading("#nospace\n"), None);
+    }
+
+    #[test]
+    fn humanize_replaces_separators() {
+        assert_eq!(humanize("0001-migration-protocol"), "0001 migration protocol");
+        assert_eq!(humanize("a_b-c"), "a b c");
+    }
+
+    #[test]
+    fn book_toml_scopes_src_to_docs() {
+        let base = std::env::temp_dir().join(format!("hl-toml-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let toml = book_toml(&base);
+        assert!(toml.contains("src = \"docs\""), "never src = \".\" (call/0005)");
+        assert!(!toml.contains("src = \".\""));
+        assert!(toml.contains("default-theme = \"light\""));
+        // no custom.css → no additional-css line
+        assert!(!toml.contains("additional-css"));
+        fs::write(base.join("custom.css"), "body{}").unwrap();
+        assert!(book_toml(&base).contains("additional-css = [\"custom.css\"]"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn where_stub_renders_recipe_without_walking_worktrees() {
+        let recipe = vec![Software {
+            name: "ik".to_string(),
+            url: "https://example.test/ik.git".to_string(),
+            pin: "b217881".to_string(),
+            worktrees: Vec::new(),
+            lines: vec![Worktree {
+                dir: "ik.256k".to_string(),
+                branch: "perf/256k".to_string(),
+                pin: "a0506f2deadbeef".to_string(),
+            }],
+        }];
+        let s = where_stub(&recipe);
+        assert!(s.contains("## ik"));
+        assert!(s.contains("b217881"));
+        assert!(s.contains("host-lifecycle software --materialize ."));
+        assert!(s.contains("ik.256k (perf/256k @ a0506f2deadb)"));
+    }
+
+    #[test]
+    fn spec_page_fences_grow_past_body_backticks() {
+        let plain = spec_page("x.allium", "REQUIRE foo\n", "allium");
+        assert!(plain.starts_with("# x.allium\n\n```allium\n"));
+        assert!(plain.trim_end().ends_with("```"));
+        // a body containing a triple fence forces a longer fence
+        let nested = spec_page("y.tla", "a\n```\nb", "tla");
+        assert!(nested.contains("````tla\n"), "fence longer than the body's run");
+    }
+
+    // End-to-end: a tiny repo plans into six lifecycle-ordered sections, every room
+    // covered; remove MEMORY.md and the Memory room fails the coverage predicate.
+    #[test]
+    fn plan_book_covers_every_room_in_lifecycle_order() {
+        let base = std::env::temp_dir().join(format!("hl-book-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let mk = |rel: &str, body: &str| {
+            let p = base.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        };
+        mk("cast/README.md", "# Cast\n");
+        mk("cast/mara.md", "# Mara\n");
+        mk("PLAN.md", "# Plan\n");
+        mk("plan/0001-foundation/README.md", "# 0001 foundation\n");
+        mk("plan/0001-foundation/spec/decode.allium", "REQUIRE decode\n");
+        mk("call/0000-use-records.md", "# Use records\n");
+        mk("CLAUDE.md", "# CLAUDE\n");
+        mk("BOOTSTRAP.md", "# Bootstrap\n");
+        mk("MEMORY.md", "# Memory\n");
+        mk(".host-software", "[software \"demo\"]\nurl = https://x.test/d.git\npin = abc123\nworktrees =\n");
+
+        let sections = plan_book(&base);
+        let rooms: Vec<&str> = sections.iter().map(|s| s.room).collect();
+        assert_eq!(rooms, vec!["cast", "plan", "software", "call", "reference", "memory"]);
+        for s in &sections {
+            assert!(s.pages.iter().any(page_has_content), "{} room has a content page", s.room);
+        }
+        // the spec body is rendered as a page (S3), not just a filename bullet
+        let plan = sections.iter().find(|s| s.room == "plan").unwrap();
+        assert!(plan.pages.iter().any(|p| p.dest == "plan/0001-foundation/spec/decode.allium.md"));
+        // loose root doc lands under Reference; CLAUDE.md is its landing
+        let refr = sections.iter().find(|s| s.room == "reference").unwrap();
+        assert!(refr.pages.iter().any(|p| p.dest == "CLAUDE.md" && p.depth == 0));
+        assert!(refr.pages.iter().any(|p| p.dest == "BOOTSTRAP.md"));
+
+        // SUMMARY is valid-shaped and in order: Cast part appears before Call part
+        let summary = summary_text(&sections);
+        let cast_at = summary.find("# Cast — who").unwrap();
+        let call_at = summary.find("# Call — why").unwrap();
+        let where_at = summary.find("# Software — where").unwrap();
+        assert!(cast_at < where_at && where_at < call_at, "lifecycle order in SUMMARY");
+
+        // remove the Memory room's only source → coverage predicate fails for it
+        fs::remove_file(base.join("MEMORY.md")).unwrap();
+        let sections = plan_book(&base);
+        let mem = sections.iter().find(|s| s.room == "memory").unwrap();
+        assert!(!mem.pages.iter().any(page_has_content), "empty Memory room fails the gate");
 
         let _ = fs::remove_dir_all(&base);
     }
