@@ -1307,14 +1307,81 @@ fn book(args: &[String]) {
 /// Build the six sections in lifecycle order. Pure: reads the repo, writes nothing,
 /// so `--check` and generation see the same plan.
 fn plan_book(root: &Path) -> Vec<Section> {
-    vec![
+    segregate_records(vec![
         flat_room(root, "cast", "Cast — who", "cast"),
         plan_plan(root),
         plan_software(root),
         flat_room(root, "call", "Call — why", "call"),
         plan_reference(root),
         plan_memory(root),
-    ]
+    ])
+}
+
+/// A retired decision (`Status:` superseded/deprecated/rejected) gets a banner and a
+/// nav-label suffix; live pages return None. `Status:` is the methodology's intentional
+/// retire signal — `book` keys off it alone, not the naming-audit's `.host-lintignore`
+/// (which carries unrelated meanings). Only file-backed (Copy) pages are checked.
+fn record_mark(page: &Page) -> Option<(&'static str, &'static str)> {
+    let src = match &page.body {
+        PageBody::Copy(p) => p,
+        PageBody::Inline(_) => return None,
+    };
+    let text = fs::read_to_string(src).unwrap_or_default();
+    let status = decision_field(&text, "Status").unwrap_or_default().to_ascii_lowercase();
+    if status.starts_with("superseded") {
+        return Some(("> **Superseded.** Retained as immutable history, not current guidance.", " (superseded)"));
+    }
+    if status.starts_with("deprecated") {
+        return Some(("> **Deprecated.** No longer in force; retained as history.", " (deprecated)"));
+    }
+    if status.starts_with("rejected") {
+        return Some(("> **Rejected.** Not adopted; retained as history.", " (rejected)"));
+    }
+    None
+}
+
+/// Move retired decisions out of their live rooms into a trailing "Archive / Record"
+/// section, each banner-marked and label-suffixed, so the book does not ship retired
+/// content as current chapters (issue #8). A room emptied of live content is no longer
+/// gated by `--check`.
+fn segregate_records(sections: Vec<Section>) -> Vec<Section> {
+    let mut live = Vec::new();
+    let mut records: Vec<Page> = Vec::new();
+    for mut sec in sections {
+        let mut kept = Vec::new();
+        for p in std::mem::take(&mut sec.pages) {
+            match record_mark(&p) {
+                Some((banner, suffix)) => {
+                    let body = match &p.body {
+                        PageBody::Copy(s) => fs::read_to_string(s).unwrap_or_default(),
+                        PageBody::Inline(t) => t.clone(),
+                    };
+                    records.push(Page {
+                        dest: p.dest,
+                        label: format!("{}{}", p.label, suffix),
+                        depth: 0,
+                        body: PageBody::Inline(format!("{banner}\n\n{body}")),
+                    });
+                }
+                None => kept.push(p),
+            }
+        }
+        sec.required = sec.required && kept.iter().any(page_has_content);
+        sec.pages = kept;
+        live.push(sec);
+    }
+    if !records.is_empty() {
+        for (i, p) in records.iter_mut().enumerate() {
+            p.depth = usize::from(i > 0);
+        }
+        live.push(Section {
+            title: "Archive / Record".to_string(),
+            room: "archive",
+            required: false,
+            pages: records,
+        });
+    }
+    live
 }
 
 /// A room that is a flat directory of `.md` files (cast, call): the first file is
@@ -1367,12 +1434,20 @@ fn plan_plan(root: &Path) -> Section {
         };
         pages.push(Page { dest, label, depth: 1, body });
 
-        let specs = spec_files(&m.join("spec"));
+        let spec_dir = m.join("spec");
+        let specs = spec_files(&spec_dir);
         if !specs.is_empty() {
+            // Path relative to spec/, forward-slashed, preserving <topic>/ nesting.
+            let rel = |sp: &Path| {
+                sp.strip_prefix(&spec_dir)
+                    .unwrap_or(sp)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            };
             let mut idx = String::from("# Specs\n\n");
             for sp in &specs {
-                let sname = file_name_str(sp);
-                idx.push_str(&format!("- [{sname}](spec/{sname}.md)\n"));
+                let r = rel(sp);
+                idx.push_str(&format!("- [{r}](spec/{r}.md)\n"));
             }
             pages.push(Page {
                 dest: format!("plan/{dname}/spec-index.md"),
@@ -1381,11 +1456,12 @@ fn plan_plan(root: &Path) -> Section {
                 body: PageBody::Inline(idx),
             });
             for sp in &specs {
+                let r = rel(sp);
                 let sname = file_name_str(sp);
                 let ext = sp.extension().and_then(|e| e.to_str()).unwrap_or("");
                 let src = fs::read_to_string(sp).unwrap_or_default();
                 pages.push(Page {
-                    dest: format!("plan/{dname}/spec/{sname}.md"),
+                    dest: format!("plan/{dname}/spec/{r}.md"),
                     label: sname.clone(),
                     depth: 3,
                     body: PageBody::Inline(spec_page(&sname, &src, ext)),
@@ -1689,19 +1765,27 @@ fn milestone_dirs(plan: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// Spec files (`.allium`/`.tla`/`.cfg`) in a milestone's `spec/` dir, sorted.
+/// Spec files (`.allium`/`.tla`/`.cfg`) under a milestone's `spec/` dir, recursively
+/// (nested `spec/<topic>/` included), sorted by path (issue #7).
 fn spec_files(dir: &Path) -> Vec<PathBuf> {
-    let rd = match fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return Vec::new(),
-    };
-    let mut v: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && is_spec_ext(p.extension().and_then(|e| e.to_str()).unwrap_or("")))
-        .collect();
+    let mut v = Vec::new();
+    collect_specs(dir, &mut v);
     v.sort();
     v
+}
+
+fn collect_specs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
+        if p.is_dir() {
+            collect_specs(&p, out);
+        } else if p.is_file() && is_spec_ext(p.extension().and_then(|e| e.to_str()).unwrap_or("")) {
+            out.push(p);
+        }
+    }
 }
 
 /// Root-level `.md` files not already placed in a specific room.
@@ -2222,6 +2306,7 @@ mod book_tests {
         mk("PLAN.md", "# Plan\n");
         mk("plan/0001-foundation/README.md", "# 0001 foundation\n");
         mk("plan/0001-foundation/spec/decode.allium", "REQUIRE decode\n");
+        mk("plan/0001-foundation/spec/dflash/multi.tla", "---- MODULE M ----\n====\n");
         mk("call/0000-use-records.md", "# Use records\n");
         mk("CLAUDE.md", "# CLAUDE\n");
         mk("BOOTSTRAP.md", "# Bootstrap\n");
@@ -2237,6 +2322,9 @@ mod book_tests {
         // the spec body is rendered as a page (S3), not just a filename bullet
         let plan = sections.iter().find(|s| s.room == "plan").unwrap();
         assert!(plan.pages.iter().any(|p| p.dest == "plan/0001-foundation/spec/decode.allium.md"));
+        // nested spec/<topic>/ renders at the mirrored path (issue #7), not dropped
+        assert!(plan.pages.iter().any(|p| p.dest == "plan/0001-foundation/spec/dflash/multi.tla.md"));
+        assert!(plan.pages.iter().any(|p| matches!(&p.body, PageBody::Inline(s) if s.contains("(spec/dflash/multi.tla.md)"))), "nested spec listed in index");
         // loose root doc lands under Reference; CLAUDE.md is its landing
         let refr = sections.iter().find(|s| s.room == "reference").unwrap();
         assert!(refr.pages.iter().any(|p| p.dest == "CLAUDE.md" && p.depth == 0));
@@ -2268,6 +2356,36 @@ mod book_tests {
         let mem = sections.iter().find(|s| s.room == "memory").unwrap();
         assert!(!mem.required, "absent Memory source → not gated");
         assert!(!mem.pages.iter().any(page_has_content));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn record_layer_segregated_and_marked() {
+        let base = std::env::temp_dir().join(format!("hl-record-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let mk = |rel: &str, body: &str| {
+            let p = base.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        };
+        mk("PLAN.md", "# Plan\n");
+        mk("call/0000-live.md", "# Live\n\n- Status: accepted\n- Scope: demo\n");
+        mk("call/0001-old.md", "# Old\n\n- Status: superseded by the spine\n");
+        mk("plan/0001-foundation/README.md", "# Foundation\n");
+
+        let sections = plan_book(&base);
+        // live decision stays in Call; superseded moves out
+        let call = sections.iter().find(|s| s.room == "call").unwrap();
+        assert!(call.pages.iter().any(|p| p.dest == "call/0000-live.md"));
+        assert!(!call.pages.iter().any(|p| p.dest == "call/0001-old.md"));
+        // Archive/Record section carries the superseded decision, banner + suffix
+        let arch = sections.iter().find(|s| s.room == "archive").expect("archive section");
+        let old = arch.pages.iter().find(|p| p.dest == "call/0001-old.md").unwrap();
+        assert!(old.label.ends_with("(superseded)"), "label suffixed");
+        assert!(matches!(&old.body, PageBody::Inline(s) if s.starts_with("> **Superseded.")), "banner prepended");
+        // a plain milestone README (no retire status) stays in its live room, not archived
+        assert!(!arch.pages.iter().any(|p| p.dest == "plan/0001-foundation/README.md"), "live plan README not archived");
 
         let _ = fs::remove_dir_all(&base);
     }

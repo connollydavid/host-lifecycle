@@ -170,10 +170,19 @@ generated overview linking each room.
 walk the un-materialized worktrees — `call/0005`) and regenerates `docs/` from
 scratch: a `docs/SUMMARY.md` in **lifecycle order** — Cast (Who) → Plan + specs
 (What/When) → Software (Where) → Call (Why) → Reference/CLAUDE (How) → Memory — with
-every spec rendered as a fenced code page and a **Where stub** parsed from
-`.host-software` (component, url, pin, worktrees, materialize command — read from the
-committed recipe, so no worktree need be on disk). Run it in CI before `mdbook
-build`; `book.toml` and `docs/` are generated output, gitignored.
+every spec rendered as a fenced code page — including specs nested in
+`spec/<topic>/` subdirectories, whose path is mirrored in the page tree — and a
+**Where stub** parsed from `.host-software` (component, url, pin, worktrees,
+materialize command — read from the committed recipe, so no worktree need be on
+disk). Run it in CI before `mdbook build`; `book.toml` and `docs/` are generated
+output, gitignored.
+
+A decision whose MADR `Status:` is `superseded`/`deprecated`/`rejected` is
+**record-layer**: `book` moves it out of its live room into a trailing
+**"Archive / Record"** section, prepends a banner, and suffixes its nav label
+(e.g. `(superseded)`), so retired decisions are not shipped as current chapters.
+`Status:` is the only record signal — `book` does not infer record-ness from the
+naming-audit's `.host-lintignore`, which carries unrelated meanings.
 
 `--check` is the stub-coverage gate: it fails (exit 1) naming any room that has
 source material but renders no page with content, so a generator that drops a room
