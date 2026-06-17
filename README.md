@@ -146,6 +146,15 @@ generator that drops a room or re-derives the `call/0005` src-scoping wrong.
     host-lifecycle book <dir> [--dry-run]   # generate book.toml + docs/ + SUMMARY.md
     host-lifecycle book --check <dir>        # fail unless every room renders a page
 
+The book **title** is the `.host` stamp's `name` (so it is deterministic regardless
+of the checkout directory), falling back to the directory name when the stamp
+carries none:
+
+    # .host
+    template = "https://github.com/connollydavid/host-template"
+    revision = "<sha>"
+    name     = "agentic-host"
+
 `book` writes a `book.toml` with **`src = "docs"`** (never `src = "."`, which would
 walk the un-materialized worktrees — `call/0005`) and regenerates `docs/` from
 scratch: a `docs/SUMMARY.md` in **lifecycle order** — Cast (Who) → Plan + specs
@@ -162,11 +171,11 @@ source material but renders no page with content, so a generator that drops a ro
 
 ## Pinning a released version
 
-A release tag is **annotated**, so `git ls-remote <repo> v0.6.1` resolves to the
+A release tag is **annotated**, so `git ls-remote <repo> v0.6.2` resolves to the
 tag *object*, not the commit — recording that as a submodule gitlink is silently
 wrong. Pin the dereferenced commit:
 
-    git ls-remote https://github.com/connollydavid/host-lifecycle 'v0.6.1^{}'   # the commit
-    git rev-list -n1 v0.6.1                                                      # same, locally
+    git ls-remote https://github.com/connollydavid/host-lifecycle 'v0.6.2^{}'   # the commit
+    git rev-list -n1 v0.6.2                                                      # same, locally
 
 Released into the public domain (Unlicense).

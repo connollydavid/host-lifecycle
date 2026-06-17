@@ -230,8 +230,14 @@ fn stamp_body(revision: &str, date: &str) -> String {
 
 /// Pull the `revision` value out of a stamp file's text.
 fn parse_revision(text: &str) -> Option<String> {
+    stamp_field(text, "revision")
+}
+
+/// Pull a quoted value for `key` (`key = "value"`) out of a stamp file's text.
+/// Empty values count as absent.
+fn stamp_field(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("revision") {
+        if let Some(rest) = line.trim_start().strip_prefix(key) {
             let v = rest.trim_start().strip_prefix('=')?.trim().trim_matches('"');
             if !v.is_empty() {
                 return Some(v.to_string());
@@ -1473,9 +1479,15 @@ fn write_book(root: &Path, sections: &[Section], dry: bool) {
 
 /// The mdBook config: `src = "docs"` (never `"."`, which would walk the
 /// un-materialized worktrees — `call/0005`), the house light/navy theme, and
-/// `custom.css` only if the repo ships one.
+/// `custom.css` only if the repo ships one. The title is the stamp's `name` (so it
+/// is deterministic regardless of the checkout directory), falling back to the
+/// directory name when the stamp carries none.
 fn book_toml(root: &Path) -> String {
-    let title = root.file_name().and_then(|n| n.to_str()).unwrap_or("docs");
+    let stamp_name = fs::read_to_string(root.join(STAMP)).ok().and_then(|t| stamp_field(&t, "name"));
+    let title = stamp_name
+        .as_deref()
+        .or_else(|| root.file_name().and_then(|n| n.to_str()))
+        .unwrap_or("docs");
     let mut s = format!(
         "[book]\nlanguage = \"en\"\nsrc = \"docs\"\ntitle = \"{title}\"\n\n[output.html]\ndefault-theme = \"light\"\npreferred-dark-theme = \"navy\"\n"
     );
@@ -1993,6 +2005,30 @@ mod book_tests {
         fs::write(base.join("custom.css"), "body{}").unwrap();
         assert!(book_toml(&base).contains("additional-css = [\"custom.css\"]"));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn book_toml_title_comes_from_stamp_name() {
+        let base = std::env::temp_dir().join(format!("hl-title-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        // no stamp → title is the directory basename
+        let dir = base.file_name().unwrap().to_string_lossy().to_string();
+        assert!(book_toml(&base).contains(&format!("title = \"{dir}\"")));
+        // stamp `name` pins the title deterministically, regardless of dir name
+        fs::write(base.join(STAMP), "template = \"x\"\nrevision = \"abc\"\nname = \"agentic-host\"\n").unwrap();
+        assert!(book_toml(&base).contains("title = \"agentic-host\""));
+        assert!(!book_toml(&base).contains(&format!("title = \"{dir}\"")));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stamp_field_reads_quoted_values() {
+        let t = "template = \"u\"\nrevision = \"r1\"\nname = \"proj\"\n";
+        assert_eq!(stamp_field(t, "name").as_deref(), Some("proj"));
+        assert_eq!(stamp_field(t, "revision").as_deref(), Some("r1"));
+        assert_eq!(stamp_field(t, "missing"), None);
+        assert_eq!(stamp_field("name = \"\"\n", "name"), None); // empty = absent
     }
 
     #[test]
