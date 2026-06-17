@@ -155,16 +155,18 @@ every spec rendered as a fenced code page and a **Where stub** parsed from
 committed recipe, so no worktree need be on disk). Run it in CI before `mdbook
 build`; `book.toml` and `docs/` are generated output, gitignored.
 
-`--check` is the stub-coverage gate: it fails (exit 1) naming any room that renders
-no page with content, so a half-room site cannot ship green.
+`--check` is the stub-coverage gate: it fails (exit 1) naming any room that has
+source material but renders no page with content, so a generator that drops a room
+(or ships a content-free page) cannot pass green. A room with no source — a fresh
+`call/`, a project with no `.host-software` yet — is legitimately empty and skipped.
 
 ## Pinning a released version
 
-A release tag is **annotated**, so `git ls-remote <repo> v0.6.0` resolves to the
+A release tag is **annotated**, so `git ls-remote <repo> v0.6.1` resolves to the
 tag *object*, not the commit — recording that as a submodule gitlink is silently
 wrong. Pin the dereferenced commit:
 
-    git ls-remote https://github.com/connollydavid/host-lifecycle 'v0.6.0^{}'   # the commit
-    git rev-list -n1 v0.6.0                                                      # same, locally
+    git ls-remote https://github.com/connollydavid/host-lifecycle 'v0.6.1^{}'   # the commit
+    git rev-list -n1 v0.6.1                                                      # same, locally
 
 Released into the public domain (Unlicense).

@@ -1166,6 +1166,11 @@ struct Section {
     title: String,
     /// The room this covers, named in a coverage failure.
     room: &'static str,
+    /// The room has source material, so it MUST render a page — `--check` fails if
+    /// it does not (the generator dropped a room, or rendered a content-free page).
+    /// A room with no source (a fresh `call/`, a project with no `.host-software`)
+    /// is legitimately empty and not gated.
+    required: bool,
     pages: Vec<Page>,
 }
 
@@ -1252,7 +1257,7 @@ fn flat_room(root: &Path, dir_name: &str, title: &str, room: &'static str) -> Se
             body: PageBody::Copy(f.clone()),
         });
     }
-    Section { title: title.to_string(), room, pages }
+    Section { title: title.to_string(), room, required: !pages.is_empty(), pages }
 }
 
 /// The Plan room (What/When): a landing page (root `PLAN.md` if present, else a
@@ -1313,7 +1318,7 @@ fn plan_plan(root: &Path) -> Section {
             }
         }
     }
-    Section { title: "Plan — what & when".to_string(), room: "plan", pages }
+    Section { title: "Plan — what & when".to_string(), room: "plan", required: true, pages }
 }
 
 /// The Where room: a stub generated from `.host-software` — component name, url,
@@ -1333,7 +1338,7 @@ fn plan_software(root: &Path) -> Section {
             });
         }
     }
-    Section { title: "Software — where".to_string(), room: "software", pages }
+    Section { title: "Software — where".to_string(), room: "software", required: !pages.is_empty(), pages }
 }
 
 /// The How room: `CLAUDE.md` (the operating manual), then a `reference/` dir if
@@ -1370,7 +1375,7 @@ fn plan_reference(root: &Path) -> Section {
             body: PageBody::Copy(f),
         });
     }
-    Section { title: "Reference — how".to_string(), room: "reference", pages }
+    Section { title: "Reference — how".to_string(), room: "reference", required: !pages.is_empty(), pages }
 }
 
 /// The Memory room: the append-only `MEMORY.md` scratchpad.
@@ -1385,7 +1390,7 @@ fn plan_memory(root: &Path) -> Section {
             body: PageBody::Copy(mem),
         });
     }
-    Section { title: "Memory".to_string(), room: "memory", pages }
+    Section { title: "Memory".to_string(), room: "memory", required: !pages.is_empty(), pages }
 }
 
 /// `--check`: every room must render at least one page with content. Exit 1 naming
@@ -1395,16 +1400,18 @@ fn book_check(sections: &[Section]) {
     for s in sections {
         if s.pages.iter().any(page_has_content) {
             println!("ok       {} ({} page(s))", s.room, s.pages.len());
-        } else {
-            println!("MISSING  {} renders no page with content", s.room);
+        } else if s.required {
+            println!("MISSING  {} has source but renders no page with content", s.room);
             missing += 1;
+        } else {
+            println!("skip     {} (no source — not gated)", s.room);
         }
     }
     if missing > 0 {
         eprintln!("-- {missing} room(s) unrendered");
         process::exit(1);
     }
-    println!("-- every room renders at least one page");
+    println!("-- every room with source renders at least one page");
 }
 
 /// Does a page carry real content? Inline bodies are checked directly; a copied
@@ -2061,11 +2068,18 @@ mod book_tests {
         let where_at = summary.find("# Software — where").unwrap();
         assert!(cast_at < where_at && where_at < call_at, "lifecycle order in SUMMARY");
 
-        // remove the Memory room's only source → coverage predicate fails for it
+        // every room here has source, so each is required and must render content
+        for s in &sections {
+            assert!(s.required && s.pages.iter().any(page_has_content), "{} required + rendered", s.room);
+        }
+
+        // remove the Memory source → the room is no longer required (tolerant gate):
+        // a legitimately-absent room does not fail --check.
         fs::remove_file(base.join("MEMORY.md")).unwrap();
         let sections = plan_book(&base);
         let mem = sections.iter().find(|s| s.room == "memory").unwrap();
-        assert!(!mem.pages.iter().any(page_has_content), "empty Memory room fails the gate");
+        assert!(!mem.required, "absent Memory source → not gated");
+        assert!(!mem.pages.iter().any(page_has_content));
 
         let _ = fs::remove_dir_all(&base);
     }
