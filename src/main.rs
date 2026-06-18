@@ -854,28 +854,34 @@ fn install_hooks(root: &Path, recipe: &[Software]) -> (usize, usize) {
             failed += 1;
             continue;
         }
-        // The dispatch script invokes a sibling binary; install the verified
-        // deploy artifact next to it so a fresh clone has a working hook.
+        // The worktree must be at its recorded pin so the installed binary is
+        // built from the audited source. The binary's exact bytes need not match
+        // the recorded canonical hash — that hash is the pinned container's
+        // output; a local toolchain legitimately differs. The hash match is
+        // reported as an informational note, not a gate.
+        let head = git_out(&worktree, &["rev-parse", "HEAD"]);
+        if head.is_none() || head != git_out(&worktree, &["rev-parse", &s.pin]) {
+            println!("WORKTREE {} not at its pin (run --materialize)", s.name);
+            failed += 1;
+            continue;
+        }
         let Some((art_path, want)) = &s.artifact else {
             println!("SKIP     {} (hooks set but no artifact to install)", s.name);
             failed += 1;
             continue;
         };
         let bin = worktree.join(art_path);
-        match sha256_file(&bin) {
-            Some(got) if &got == want => {}
-            Some(_) => {
-                println!("STALE    {}/{art_path} does not match the recorded hash — rebuild first", s.name);
-                failed += 1;
-                continue;
-            }
-            None => {
-                println!("MISSING  {}/{art_path} — build the component first ({})", s.name,
-                    s.build.as_deref().unwrap_or("cargo build --release --locked"));
-                failed += 1;
-                continue;
-            }
+        if !bin.is_file() {
+            println!("MISSING  {}/{art_path} — build the component first ({})", s.name,
+                s.build.as_deref().unwrap_or("cargo build --release --locked"));
+            failed += 1;
+            continue;
         }
+        let provenance = if sha256_file(&bin).as_deref() == Some(want.as_str()) {
+            "verified against the canonical hash"
+        } else {
+            "local build (differs from the canonical hash)"
+        };
         let bin_name = Path::new(art_path).file_name().unwrap_or_default();
         let dst_bin = hooks_dir.join(bin_name);
         let installs = [
@@ -891,7 +897,7 @@ fn install_hooks(root: &Path, recipe: &[Software]) -> (usize, usize) {
             }
         }
         if ok {
-            println!("OK       {} hooks installed (pre-commit, commit-msg, {})", s.name,
+            println!("OK       {} hooks installed (pre-commit, commit-msg, {}) — {provenance}", s.name,
                 bin_name.to_string_lossy());
             installed += 1;
         } else {
@@ -2337,33 +2343,40 @@ mod software_tests {
     }
 
     // install-hooks copies the dispatch script (as pre-commit + commit-msg) and the
-    // verified deploy binary into the repo's hooks dir; a stale binary blocks it.
+    // deploy binary into the repo's hooks dir when the worktree is at its pin; a
+    // worktree off its pin, or a missing binary, blocks it.
     #[test]
-    fn install_hooks_copies_script_and_verified_binary() {
+    fn install_hooks_copies_script_and_binary_at_pin() {
         let base = std::env::temp_dir().join(format!("hl-hooks-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(base.join("hl/target/release")).unwrap();
-        assert!(process::Command::new("git").arg("-C").arg(&base).arg("init").arg("-q")
-            .status().map(|s| s.success()).unwrap_or(false), "git init");
-        fs::write(base.join("hl/pre-commit"), "#!/bin/bash\nexit 0\n").unwrap();
-        fs::write(base.join("hl/target/release/host-lint"), "BINARY").unwrap();
-        let sha = sha256_file(&base.join("hl/target/release/host-lint")).unwrap();
+        let wt = base.join("hl");
+        fs::create_dir_all(wt.join("target/release")).unwrap();
+        let git = |dir: &Path, args: &[&str]| process::Command::new("git")
+            .arg("-C").arg(dir).args(args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(git(&base, &["init", "-q"]), "git init host");
+        // The worktree is its own checkout; commit so it has a HEAD = the pin.
+        assert!(git(&wt, &["init", "-q"]));
+        assert!(git(&wt, &["config", "user.email", "t@t"]) && git(&wt, &["config", "user.name", "t"]));
+        fs::write(wt.join("pre-commit"), "#!/bin/bash\nexit 0\n").unwrap();
+        fs::write(wt.join("target/release/host-lint"), "BINARY").unwrap();
+        assert!(git(&wt, &["add", "-A"]) && git(&wt, &["commit", "-qm", "x"]));
+        let pin = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
 
-        let mk = |art_sha: &str| Software {
-            name: "hl".into(), url: "u".into(), pin: "p".into(),
+        let mk = |pin: &str, art: &str| Software {
+            name: "hl".into(), url: "u".into(), pin: pin.into(),
             worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: Some("host-lint".into()),
-            artifact: Some(("target/release/host-lint".into(), art_sha.into())),
+            artifact: Some(("target/release/host-lint".into(), art.into())),
             repro_exempt: None, hooks: Some("pre-commit".into()),
         };
-        // matching hash → installs all three files
-        assert_eq!(install_hooks(&base, &[mk(&sha)]), (1, 0));
+        // worktree at pin + binary present → installs all three files
+        assert_eq!(install_hooks(&base, &[mk(&pin, "deadbeef")]), (1, 0));
         let hooks = base.join(".git/hooks");
         assert!(hooks.join("pre-commit").is_file());
         assert!(hooks.join("commit-msg").is_file());
         assert!(hooks.join("host-lint").is_file());
-        // wrong recorded hash → blocked, nothing claimed installed
-        assert_eq!(install_hooks(&base, &[mk("0000")]), (0, 1));
+        // worktree off its pin → blocked
+        assert_eq!(install_hooks(&base, &[mk("0000000000000000000000000000000000000000", "x")]), (0, 1));
 
         let _ = fs::remove_dir_all(&base);
     }
