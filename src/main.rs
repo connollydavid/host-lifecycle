@@ -52,7 +52,7 @@ fn main() {
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
             eprintln!("  version <dir>                 — print the adopted template revision");
-            eprintln!("  classify <dir>                — print the migration case (a|b|c)");
+            eprintln!("  classify <dir>                — print the migration case (a|b|c); refuse a software repo");
             eprintln!("  remap --check <dir>           — tells left after the .host-remap dictionary applies");
             eprintln!("  remap --apply <dir> [--dry-run] — apply the dictionary (archive-first via a clean git tree)");
             eprintln!("  software --materialize <dir>  — clone the bare store(s) + worktrees from .host-software");
@@ -254,10 +254,37 @@ fn classify(dir: Option<&String>) {
         process::exit(2);
     };
     let root = Path::new(dir);
+    if let Some(manifest) = adopt_in_place_refusal(root) {
+        eprint!("{}", refuse_adopt_in_place(dir, manifest));
+        process::exit(3);
+    }
     println!(
         "{}",
         classify_case(root.join(STAMP).is_file(), root.join("CLAUDE.md").is_file())
     );
+}
+
+/// The refusal message: why adopting software in place is forbidden, and the
+/// exact steps to embed it as the Where room of a separate host instead.
+fn refuse_adopt_in_place(dir: &str, manifest: &str) -> String {
+    format!(
+        "refuse: {dir} is a software repository ({manifest} at its root), not an empty \
+or agentic-host folder.\n\n\
+This methodology never turns a software repository into a host. Software is\n\
+embedded into a *host* (a separate meta-repo) as the Where room — a bare store\n\
+with worktrees recorded in .host-software — so the code and the governance stay\n\
+separable and independently versioned.\n\n\
+To proceed:\n\
+\x20 1. Create or choose a host repository, separate from this software\n\
+\x20    (e.g. a new empty repo `agentic-<name>`).\n\
+\x20 2. In the host, run: host-lifecycle adopt <host-dir> <revision>\n\
+\x20    (scaffolds the rooms and writes the .host stamp).\n\
+\x20 3. Embed THIS software as the Where room: add a [software \"<name>\"] stanza to\n\
+\x20    the host's .host-software (this repo's URL, a pinned SHA, the worktree set),\n\
+\x20    gitignore the trees, then: host-lifecycle software --materialize <host-dir>.\n\
+\x20 4. Wire the tools and verify (host README, steps 3 and 6).\n\n\
+Do not run adopt inside this software repository.\n"
+    )
 }
 
 /// The stamp file body — a plain key/value record of the adopted template.
@@ -326,6 +353,32 @@ fn classify_case(has_stamp: bool, has_claude: bool) -> &'static str {
     } else {
         "a"
     }
+}
+
+/// Root-level build manifests that mark a directory as a software repository. A
+/// host root never carries these — its software lives in gitignored worktrees
+/// recorded in `.host-software` — so finding one at first adoption means the
+/// target is software being adopted in place, which the methodology forbids.
+const SOFTWARE_MANIFESTS: &[&str] = &[
+    "Cargo.toml", "package.json", "go.mod", "pyproject.toml", "setup.py",
+    "pom.xml", "build.gradle", "build.gradle.kts", "Gemfile", "composer.json",
+    "CMakeLists.txt", "mix.exs", "Package.swift",
+];
+
+/// The first root-level software manifest present, if any.
+fn software_manifest(root: &Path) -> Option<&'static str> {
+    SOFTWARE_MANIFESTS.iter().copied().find(|m| root.join(m).is_file())
+}
+
+/// First-adoption guard. Returns the detected manifest when the target carries
+/// software but is neither stamped (case c, already a host) nor already managing
+/// software via a `.host-software` recipe — i.e. an attempt to adopt a software
+/// repository in place, which the methodology refuses. `None` means proceed.
+fn adopt_in_place_refusal(root: &Path) -> Option<&'static str> {
+    if root.join(STAMP).is_file() || root.join(SOFTWARE).is_file() {
+        return None;
+    }
+    software_manifest(root)
 }
 
 /// Today's date as `YYYY-MM-DD` (UTC). Deterministic formatting via
@@ -2620,6 +2673,31 @@ mod tests {
         assert_eq!(classify_case(true, false), "c");
         assert_eq!(classify_case(false, true), "b");
         assert_eq!(classify_case(false, false), "a");
+    }
+
+    #[test]
+    fn refuse_adopting_software_in_place() {
+        let base = std::env::temp_dir().join(format!("hl-refuse-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // empty / greenfield → proceed
+        assert_eq!(adopt_in_place_refusal(&base), None);
+
+        // a root build manifest → refuse, naming the manifest
+        fs::write(base.join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(adopt_in_place_refusal(&base), Some("Cargo.toml"));
+
+        // a stamp means it is already a host (case c) → proceed
+        fs::write(base.join(STAMP), "revision = \"x\"\n").unwrap();
+        assert_eq!(adopt_in_place_refusal(&base), None);
+        fs::remove_file(base.join(STAMP)).unwrap();
+
+        // already managing software via .host-software → proceed
+        fs::write(base.join(SOFTWARE), "[software \"x\"]\n").unwrap();
+        assert_eq!(adopt_in_place_refusal(&base), None);
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
