@@ -57,6 +57,7 @@ fn main() {
             eprintln!("  software --materialize <dir>  — clone the bare store(s) + worktrees from .host-software");
             eprintln!("  software --check <dir>        — verify each canonical worktree is at its recorded pin");
             eprintln!("  software --verify-build <dir> — rebuild from the pin and prove the artifact reproduces");
+            eprintln!("  software --install-hooks <dir>— install each component's commit hooks + verified binary");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
             eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
@@ -216,13 +217,11 @@ fn print_adopt_checklist() {
     for (name, url) in TOOL_SUBMODULES {
         println!("       git submodule add {url} tools/{name}");
     }
-    println!("  2. install the host-lint git hooks so new commits are gated (one");
-    println!("     script dispatches on its installed name):");
-    println!("       cp tools/host-lint/pre-commit .git/hooks/pre-commit");
-    println!("       cp tools/host-lint/pre-commit .git/hooks/commit-msg");
-    println!("       chmod +x .git/hooks/pre-commit .git/hooks/commit-msg");
-    println!("  3. embed the software in the Where slot (.host-software) and run:");
+    println!("  2. embed the software in the Where slot (.host-software), record a");
+    println!("     `hooks` and `artifact` for the gating tool, and run:");
     println!("       host-lifecycle software --materialize .");
+    println!("  3. build the gating tool, then install its commit hooks + binary:");
+    println!("       host-lifecycle software --install-hooks .");
 }
 
 /// `version <dir>` — print the template revision recorded in the stamp.
@@ -755,6 +754,10 @@ struct Software {
     deploy: Option<String>,
     artifact: Option<(String, String)>,
     repro_exempt: Option<String>,
+    /// `hooks` — a commit-hook dispatch script (relative to the canonical
+    /// worktree) that `--install-hooks` copies into `.git/hooks` as both
+    /// `pre-commit` and `commit-msg`, alongside the verified deploy artifact.
+    hooks: Option<String>,
 }
 
 /// An explicit parallel worktree: a directory checked out on `branch` at `pin`.
@@ -778,15 +781,16 @@ fn software(args: &[String]) {
             "--materialize" => mode = Some("materialize"),
             "--check" => mode = Some("check"),
             "--verify-build" => mode = Some("verify-build"),
+            "--install-hooks" => mode = Some("install-hooks"),
             _ => pos.push(a),
         }
     }
     let Some(dir) = pos.first() else {
-        eprintln!("host-lifecycle software <--materialize|--check|--verify-build> <dir>");
+        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks> <dir>");
         process::exit(2);
     };
     let Some(mode) = mode else {
-        eprintln!("host-lifecycle software needs --materialize, --check, or --verify-build");
+        eprintln!("host-lifecycle software needs --materialize, --check, --verify-build, or --install-hooks");
         process::exit(2);
     };
     let root = match fs::canonicalize(Path::new(dir.as_str())) {
@@ -805,8 +809,127 @@ fn software(args: &[String]) {
         "materialize" => software_materialize(&root, &recipe),
         "check" => software_check(&root, &recipe),
         "verify-build" => software_verify_build(&root, &recipe),
+        "install-hooks" => software_install_hooks(&root, &recipe),
         _ => unreachable!(),
     }
+}
+
+/// `--install-hooks`: for each component with a `hooks` script, copy it into
+/// `.git/hooks` as `pre-commit` and `commit-msg`, alongside the verified deploy
+/// artifact (the binary the dispatch script invokes). Closes the fresh-clone gap
+/// where the worktree and skill symlink were materialized but the commit hooks
+/// were not. Exits non-zero if any component with `hooks` cannot be installed.
+fn software_install_hooks(root: &Path, recipe: &[Software]) {
+    let (installed, failed) = install_hooks(root, recipe);
+    if installed == 0 && failed == 0 {
+        println!("no components declare a `hooks` script; nothing to install");
+    }
+    if failed > 0 {
+        process::exit(1);
+    }
+}
+
+/// The install loop, factored out to return `(installed, failed)` counts instead
+/// of exiting — keeps it testable.
+fn install_hooks(root: &Path, recipe: &[Software]) -> (usize, usize) {
+    let hooks_dir = match git_hooks_dir(root) {
+        Some(d) => d,
+        None => {
+            eprintln!("host-lifecycle: not a git repository: {}", root.display());
+            return (0, 1);
+        }
+    };
+    if let Err(e) = fs::create_dir_all(&hooks_dir) {
+        eprintln!("host-lifecycle: cannot create {}: {e}", hooks_dir.display());
+        return (0, 1);
+    }
+    let mut installed = 0;
+    let mut failed = 0;
+    for s in recipe {
+        let Some(hooks_rel) = &s.hooks else { continue };
+        let worktree = root.join(&s.name);
+        let script = worktree.join(hooks_rel);
+        if !script.is_file() {
+            println!("MISSING  {}/{hooks_rel} (run --materialize)", s.name);
+            failed += 1;
+            continue;
+        }
+        // The dispatch script invokes a sibling binary; install the verified
+        // deploy artifact next to it so a fresh clone has a working hook.
+        let Some((art_path, want)) = &s.artifact else {
+            println!("SKIP     {} (hooks set but no artifact to install)", s.name);
+            failed += 1;
+            continue;
+        };
+        let bin = worktree.join(art_path);
+        match sha256_file(&bin) {
+            Some(got) if &got == want => {}
+            Some(_) => {
+                println!("STALE    {}/{art_path} does not match the recorded hash — rebuild first", s.name);
+                failed += 1;
+                continue;
+            }
+            None => {
+                println!("MISSING  {}/{art_path} — build the component first ({})", s.name,
+                    s.build.as_deref().unwrap_or("cargo build --release --locked"));
+                failed += 1;
+                continue;
+            }
+        }
+        let bin_name = Path::new(art_path).file_name().unwrap_or_default();
+        let dst_bin = hooks_dir.join(bin_name);
+        let installs = [
+            (script.as_path(), hooks_dir.join("pre-commit")),
+            (script.as_path(), hooks_dir.join("commit-msg")),
+            (bin.as_path(), dst_bin),
+        ];
+        let mut ok = true;
+        for (src, dst) in installs {
+            if let Err(e) = copy_executable(src, &dst) {
+                println!("FAIL     {} -> {}: {e}", src.display(), dst.display());
+                ok = false;
+            }
+        }
+        if ok {
+            println!("OK       {} hooks installed (pre-commit, commit-msg, {})", s.name,
+                bin_name.to_string_lossy());
+            installed += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    (installed, failed)
+}
+
+/// The repo's actual hooks directory, via `git rev-parse --git-path hooks` (so a
+/// worktree or a custom `core.hooksPath` resolves correctly). Relative paths are
+/// resolved against `root`.
+fn git_hooks_dir(root: &Path) -> Option<PathBuf> {
+    let o = process::Command::new("git")
+        .arg("-C").arg(root)
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if p.is_empty() {
+        return None;
+    }
+    let path = Path::new(&p);
+    Some(if path.is_absolute() { path.to_path_buf() } else { root.join(path) })
+}
+
+/// Copy a file and mark it executable (0o755 on Unix).
+fn copy_executable(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::copy(src, dst)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dst, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
 }
 
 /// `--verify-build`: prove reproducibility (the heavy lane). For each component with a
@@ -915,6 +1038,7 @@ fn parse_software(text: &str) -> Vec<Software> {
                 deploy: None,
                 artifact: None,
                 repro_exempt: None,
+                hooks: None,
             });
             continue;
         }
@@ -959,6 +1083,7 @@ fn parse_software(text: &str) -> Vec<Software> {
                 cur.artifact = Some((path.to_string(), sha.to_string()));
             }
             "repro-exempt" => cur.repro_exempt = Some(val.to_string()),
+            "hooks" => cur.hooks = Some(val.to_string()),
             _ => {}
         }
     }
@@ -2189,7 +2314,7 @@ mod software_tests {
             build: None, toolchain: None,
             deploy: Some(deploy.into()),
             artifact: Some(("build/bin/srv".into(), art_sha.into())),
-            repro_exempt: exempt.map(String::from),
+            repro_exempt: exempt.map(String::from), hooks: None,
         };
         // recorded deploy line + matching artifact hash + valid exemption → clean
         assert_eq!(provenance_problems(&base, &mk("ik", &sha, Some("call/0009"))), 0);
@@ -2197,6 +2322,48 @@ mod software_tests {
         assert_eq!(provenance_problems(&base, &mk("ik", "0000", None)), 1);
         // unrecorded deploy line → 1; exemption citing a missing decision → 1 (so 2)
         assert_eq!(provenance_problems(&base, &mk("ghost", &sha, Some("call/9999"))), 2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A `hooks` key parses into the optional hook-script path.
+    #[test]
+    fn parses_hooks_field() {
+        let s = parse_software("[software \"hl\"]\nurl = u\npin = p\nhooks = pre-commit\n");
+        assert_eq!(s[0].hooks.as_deref(), Some("pre-commit"));
+        // absent by default
+        let t = parse_software("[software \"hl\"]\nurl = u\npin = p\n");
+        assert_eq!(t[0].hooks, None);
+    }
+
+    // install-hooks copies the dispatch script (as pre-commit + commit-msg) and the
+    // verified deploy binary into the repo's hooks dir; a stale binary blocks it.
+    #[test]
+    fn install_hooks_copies_script_and_verified_binary() {
+        let base = std::env::temp_dir().join(format!("hl-hooks-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("hl/target/release")).unwrap();
+        assert!(process::Command::new("git").arg("-C").arg(&base).arg("init").arg("-q")
+            .status().map(|s| s.success()).unwrap_or(false), "git init");
+        fs::write(base.join("hl/pre-commit"), "#!/bin/bash\nexit 0\n").unwrap();
+        fs::write(base.join("hl/target/release/host-lint"), "BINARY").unwrap();
+        let sha = sha256_file(&base.join("hl/target/release/host-lint")).unwrap();
+
+        let mk = |art_sha: &str| Software {
+            name: "hl".into(), url: "u".into(), pin: "p".into(),
+            worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: Some("host-lint".into()),
+            artifact: Some(("target/release/host-lint".into(), art_sha.into())),
+            repro_exempt: None, hooks: Some("pre-commit".into()),
+        };
+        // matching hash → installs all three files
+        assert_eq!(install_hooks(&base, &[mk(&sha)]), (1, 0));
+        let hooks = base.join(".git/hooks");
+        assert!(hooks.join("pre-commit").is_file());
+        assert!(hooks.join("commit-msg").is_file());
+        assert!(hooks.join("host-lint").is_file());
+        // wrong recorded hash → blocked, nothing claimed installed
+        assert_eq!(install_hooks(&base, &[mk("0000")]), (0, 1));
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -2257,7 +2424,7 @@ mod software_tests {
                 branch: "feature".to_string(),
                 pin: line_pin.clone(),
             }],
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None,
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None,
         }];
         software_materialize(&host, &recipe);
 
@@ -2299,7 +2466,7 @@ mod software_tests {
             pin: pin.clone(),
             worktrees: Vec::new(),
             lines: Vec::new(),
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None,
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None,
         }];
         software_materialize(&host, &recipe);
 
@@ -2500,7 +2667,7 @@ mod book_tests {
                 branch: "perf/256k".to_string(),
                 pin: "a0506f2deadbeef".to_string(),
             }],
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None,
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None,
         }];
         let s = where_stub(&recipe);
         assert!(s.contains("## ik"));
