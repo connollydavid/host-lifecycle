@@ -45,8 +45,9 @@ fn main() {
         Some("software") => software(&args[2..]),
         Some("upgrade") => upgrade(args.get(2)),
         Some("book") => book(&args[2..]),
+        Some("obligations") => obligations(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -61,6 +62,7 @@ fn main() {
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
             eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
+            eprintln!("  obligations <spec.allium>     — every `allium plan` obligation is dispositioned in <stem>.obligations");
             process::exit(2);
         }
     }
@@ -1650,6 +1652,162 @@ fn read_workflows(worktree: &Path) -> String {
     text
 }
 
+/// `obligations <spec.allium> [--manifest <f>] [--tests <dir>]` — the
+/// remap-dictionary discipline for tests: every obligation `allium plan` derives
+/// from the spec MUST be dispositioned in the sibling `<stem>.obligations`
+/// manifest. Each line is `<id> => <disposition>`, where the disposition is
+/// `test:<name>` (a named test discharges it), `structural` (the spec's own
+/// `check`/`analyse` lane covers it), or `waived: <reason>`. Fails on any
+/// obligation with no disposition, any stale manifest id no longer derived, and —
+/// when `--tests <dir>` is given — any `test:<name>` whose name is absent from the
+/// test sources.
+fn obligations(args: &[String]) {
+    let mut pos: Vec<&String> = Vec::new();
+    let mut manifest_arg: Option<&String> = None;
+    let mut tests_arg: Option<&String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--manifest" => {
+                manifest_arg = args.get(i + 1);
+                i += 1;
+            }
+            "--tests" => {
+                tests_arg = args.get(i + 1);
+                i += 1;
+            }
+            _ => pos.push(&args[i]),
+        }
+        i += 1;
+    }
+    let Some(spec) = pos.first() else {
+        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>]");
+        process::exit(2);
+    };
+    let spec_path = Path::new(spec.as_str());
+    let manifest = match manifest_arg {
+        Some(m) => PathBuf::from(m.as_str()),
+        None => spec_path.with_extension("obligations"),
+    };
+    // 1. Derive the obligations from the spec.
+    let plan = match process::Command::new("allium").arg("plan").arg(spec_path).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            eprintln!("host-lifecycle: `allium plan` failed: {}", String::from_utf8_lossy(&o.stderr).trim());
+            process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("host-lifecycle: cannot run `allium plan` (is allium-cli installed?): {e}");
+            process::exit(2);
+        }
+    };
+    let plan_ids = extract_obligation_ids(&plan);
+    if plan_ids.is_empty() {
+        eprintln!("host-lifecycle: `allium plan` produced no obligations for {spec}");
+        process::exit(2);
+    }
+    // 2. Read the dispositions.
+    let dispositions = match fs::read_to_string(&manifest) {
+        Ok(t) => parse_obligation_manifest(&t),
+        Err(e) => {
+            eprintln!("host-lifecycle: cannot read manifest {} ({e}); a .allium needs a sibling .obligations", manifest.display());
+            process::exit(2);
+        }
+    };
+    let tests = tests_arg.map(|d| read_dir_recursive(Path::new(d.as_str())));
+    // 3. Every obligation dispositioned; no stale dispositions; test refs exist.
+    let problems = obligation_gaps(&plan_ids, &dispositions, tests.as_deref());
+    for p in &problems {
+        println!("{p}");
+    }
+    if !problems.is_empty() {
+        eprintln!("-- {} obligation(s) undispositioned, stale, or missing a test ({})", problems.len(), manifest.display());
+        process::exit(1);
+    }
+    println!("-- all {} obligation(s) dispositioned", plan_ids.len());
+}
+
+/// The disposition gaps between the derived obligations and the manifest:
+/// `MISSING` (obligation with no disposition), `STALE` (disposition for a
+/// no-longer-derived obligation), and `ABSENT` (a `test:<name>` whose name is not
+/// in the test sources, when those are supplied). Pure, so it is unit-tested.
+fn obligation_gaps(plan_ids: &[String], dispositions: &[(String, String)], tests: Option<&str>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for id in plan_ids {
+        match dispositions.iter().find(|(k, _)| k == id) {
+            None => problems.push(format!("MISSING  {id} — no disposition")),
+            Some((_, disp)) => {
+                if let (Some(name), Some(src)) = (disp.strip_prefix("test:"), tests) {
+                    let name = name.trim();
+                    if !name.is_empty() && !src.contains(name) {
+                        problems.push(format!("ABSENT   {id} — `test:{name}` not in the test sources"));
+                    }
+                }
+            }
+        }
+    }
+    for (id, _) in dispositions {
+        if !plan_ids.iter().any(|p| p == id) {
+            problems.push(format!("STALE    {id} — dispositioned but no longer an obligation"));
+        }
+    }
+    problems
+}
+
+/// Pull obligation ids from `allium plan` JSON without a JSON dependency: each
+/// obligation carries a `"id": "<value>"` line.
+fn extract_obligation_ids(json: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for line in json.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("\"id\":") {
+            let v = rest.trim().trim_end_matches(',').trim().trim_matches('"');
+            if !v.is_empty() && !ids.iter().any(|x| x == v) {
+                ids.push(v.to_string());
+            }
+        }
+    }
+    ids
+}
+
+/// Parse a `.obligations` manifest: `<id> => <disposition>` per line, `#` comments
+/// and blanks skipped. Returns `(id, disposition)` pairs.
+fn parse_obligation_manifest(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some((id, disp)) = t.split_once("=>") {
+            let id = id.trim();
+            if !id.is_empty() {
+                out.push((id.to_string(), disp.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Concatenate every file under `dir` (recursively), for substring checks.
+fn read_dir_recursive(dir: &Path) -> String {
+    let mut text = String::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(t) = fs::read_to_string(&p) {
+                text.push_str(&t);
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
 /// One entry in the template's `UPGRADING.md`: an action that became required at a
 /// given template revision, to be applied when upgrading a repo stamped older.
 struct Upgrade {
@@ -2663,6 +2821,41 @@ mod software_tests {
         // an un-materialized component is skipped, not failed
         assert_eq!(spec_lane_problems(&base, &Software { name: "absent".into(), ..mk() }), 0);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // Obligation discharge: every `allium plan` id must be dispositioned; stale
+    // dispositions and absent `test:` references are flagged.
+    #[test]
+    fn obligation_gaps_require_full_disposition() {
+        // allium plan is pretty-printed: each obligation's `"id"` on its own line.
+        let plan = "{\n  \"obligations\": [\n    {\n      \"id\": \"rule-success.DetectPhaseSynonym\",\n      \"category\": \"rule_success\"\n    },\n    {\n      \"id\": \"transition-edge.Check.scanning.blocked\"\n    },\n    {\n      \"id\": \"entity-fields.Line\"\n    }\n  ]\n}";
+        let ids = extract_obligation_ids(plan);
+        assert_eq!(ids.len(), 3);
+
+        // a manifest covering two of three, with one stale entry
+        let manifest = parse_obligation_manifest(
+            "# map\n\
+             rule-success.DetectPhaseSynonym => test:phase_synonym_flags\n\
+             entity-fields.Line => structural\n\
+             gone.obligation => waived: removed\n",
+        );
+        // transition-edge... is MISSING; gone.obligation is STALE → 2 problems
+        let p = obligation_gaps(&ids, &manifest, None);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p.iter().any(|x| x.contains("MISSING") && x.contains("transition-edge")));
+        assert!(p.iter().any(|x| x.contains("STALE") && x.contains("gone.obligation")));
+
+        // full, non-stale manifest → clean
+        let full = parse_obligation_manifest(
+            "rule-success.DetectPhaseSynonym => test:phase_synonym_flags\n\
+             transition-edge.Check.scanning.blocked => test:flag_blocks\n\
+             entity-fields.Line => structural\n",
+        );
+        assert!(obligation_gaps(&ids, &full, None).is_empty());
+        // with test sources: the named test must exist
+        let p2 = obligation_gaps(&ids, &full, Some("fn flag_blocks() {}"));
+        assert!(p2.iter().any(|x| x.contains("ABSENT") && x.contains("phase_synonym_flags")));
+        assert_eq!(obligation_gaps(&ids, &full, Some("fn phase_synonym_flags(){} fn flag_blocks(){}")).len(), 0);
     }
 
     // A `hooks` key parses into the optional hook-script path.
