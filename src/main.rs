@@ -1575,7 +1575,7 @@ fn spec_lane_problems(root: &Path, s: &Software) -> usize {
     if !worktree.is_dir() {
         return 0;
     }
-    let (has_allium, has_tla) = find_specs(&worktree);
+    let (has_allium, has_tla, has_obligations) = find_specs(&worktree);
     if !has_allium && !has_tla {
         return 0;
     }
@@ -1587,6 +1587,17 @@ fn spec_lane_problems(root: &Path, s: &Software) -> usize {
         } else {
             println!(
                 "HAZARD   {} carries a .allium spec but no CI workflow runs `allium check` + `allium analyse`",
+                s.name
+            );
+            bad += 1;
+        }
+        // The obligations must be dispositioned: a `.obligations` manifest beside
+        // the spec, checked by `host-lifecycle obligations` in CI.
+        if has_obligations {
+            println!("ok       {} obligations manifest present", s.name);
+        } else {
+            println!(
+                "HAZARD   {} carries a .allium spec but no `.obligations` manifest (run `host-lifecycle obligations`)",
                 s.name
             );
             bad += 1;
@@ -1604,10 +1615,11 @@ fn spec_lane_problems(root: &Path, s: &Software) -> usize {
 }
 
 /// Walk a worktree (skipping `.git`, `target`, `node_modules`) and report whether
-/// any `.allium` / `.tla` spec exists.
-fn find_specs(dir: &Path) -> (bool, bool) {
+/// any `.allium` spec, `.tla` spec, and `.obligations` manifest exist.
+fn find_specs(dir: &Path) -> (bool, bool, bool) {
     let mut allium = false;
     let mut tla = false;
+    let mut obligations = false;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = fs::read_dir(&d) else { continue };
@@ -1624,15 +1636,16 @@ fn find_specs(dir: &Path) -> (bool, bool) {
                 match p.extension().and_then(|x| x.to_str()) {
                     Some("allium") => allium = true,
                     Some("tla") => tla = true,
+                    Some("obligations") => obligations = true,
                     _ => {}
                 }
             }
         }
-        if allium && tla {
+        if allium && tla && obligations {
             break;
         }
     }
-    (allium, tla)
+    (allium, tla, obligations)
 }
 
 /// Concatenate every workflow under `.github/workflows/` (`*.yml`/`*.yaml`).
@@ -2807,10 +2820,13 @@ mod software_tests {
             build: None, toolchain: None, deploy: None, artifact: None,
             repro_exempt: None, hooks: None, builds: vec![],
         };
-        // .allium present, no workflow → HAZARD
-        assert_eq!(spec_lane_problems(&base, &mk()), 1);
-        // a workflow running check + analyse → clean
+        // .allium present, no workflow + no manifest → 2 HAZARDs
+        assert_eq!(spec_lane_problems(&base, &mk()), 2);
+        // a workflow running check + analyse clears one; still missing the manifest
         fs::write(wt.join(".github/workflows/allium.yml"), "run: allium check x\nrun: allium analyse x\n").unwrap();
+        assert_eq!(spec_lane_problems(&base, &mk()), 1);
+        // the obligations manifest clears the rest
+        fs::write(wt.join("thing.obligations"), "x => structural\n").unwrap();
         assert_eq!(spec_lane_problems(&base, &mk()), 0);
         // add a .tla with no TLC lane → HAZARD again
         fs::write(wt.join("Spec.tla"), "---- MODULE Spec ----\n").unwrap();
