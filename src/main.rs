@@ -8,7 +8,7 @@
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -821,10 +821,18 @@ struct Software {
 }
 
 /// An explicit parallel worktree: a directory checked out on `branch` at `pin`.
+/// `dir` is always the in-structure handle (under the host root). When `store` is
+/// set the git worktree physically lives there — possibly off-tree / off-filesystem
+/// — and `dir` is materialized as a symlink/junction to it, so an agent editing
+/// `dir/…` writes the files under test (issue #2). `host`, when set, gates the line
+/// to one OS (`std::env::consts::OS`), mirroring a build's `attest_host`: off-platform
+/// the line is skipped by `--materialize`/`--check` rather than reported missing.
 struct Worktree {
     dir: String,
     branch: String,
     pin: String,
+    store: Option<String>,
+    host: Option<String>,
 }
 
 /// One platform's build of a component, sharing the component's `url`+`pin` but
@@ -1246,19 +1254,35 @@ fn parse_software(text: &str) -> Vec<Software> {
             "pin" => cur.pin = val.to_string(),
             "worktrees" => cur.worktrees = val.split_whitespace().map(String::from).collect(),
             "worktree" => {
-                // `worktree = <dir> <branch> <pin>` — a parallel line, fully pinned.
+                // `worktree = <dir> <branch> <pin> [store=<path>] [host=<os>]` — a
+                // parallel line, fully pinned; optional external store + OS gate.
                 let f: Vec<&str> = val.split_whitespace().collect();
-                let [dir, branch, pin] = f[..] else {
+                if f.len() < 3 {
                     eprintln!(
-                        "host-lifecycle: {SOFTWARE}:{}: `worktree` needs `<dir> <branch> <pin>`",
+                        "host-lifecycle: {SOFTWARE}:{}: `worktree` needs `<dir> <branch> <pin> [store=<path>] [host=<os>]`",
                         i + 1
                     );
                     process::exit(2);
-                };
+                }
+                let (dir, branch, pin) = (f[0], f[1], f[2]);
+                let mut store = None;
+                let mut host = None;
+                for tok in &f[3..] {
+                    if let Some(v) = tok.strip_prefix("store=") {
+                        store = Some(v.to_string());
+                    } else if let Some(v) = tok.strip_prefix("host=") {
+                        host = Some(v.to_string());
+                    } else {
+                        eprintln!("host-lifecycle: {SOFTWARE}:{}: unknown `worktree` token `{tok}` (expected store=/host=)", i + 1);
+                        process::exit(2);
+                    }
+                }
                 cur.lines.push(Worktree {
                     dir: dir.to_string(),
                     branch: branch.to_string(),
                     pin: pin.to_string(),
+                    store,
+                    host,
                 });
             }
             "build" => cur.build = Some(val.to_string()),
@@ -1285,6 +1309,68 @@ fn parse_software(text: &str) -> Vec<Software> {
         }
     }
     out
+}
+
+/// True if `dir` (a recorded worktree path) would escape the host root: an
+/// absolute path, or one whose `..` components climb above the root. Purely
+/// lexical (no filesystem access), so it catches the wrong-tree footgun before
+/// materialize. The sanctioned way to back a worktree with an off-tree store is a
+/// `store=` line, whose `dir` is still an in-tree handle (issue #2).
+fn escapes_root(dir: &str) -> bool {
+    let p = Path::new(dir);
+    let mut depth: i32 = 0;
+    for c in p.components() {
+        match c {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            // RootDir / Prefix → absolute, always escapes.
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Create the in-structure handle `link` → `target` for an external-store worktree:
+/// a symlink on unix, a directory junction on Windows (a junction needs no
+/// privilege, unlike a Windows symlink). The handle lives under the host root so an
+/// agent editing through it writes the files under test.
+#[cfg(unix)]
+fn make_handle(link: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn make_handle(link: &Path, target: &Path) -> std::io::Result<()> {
+    let status = process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("mklink /J failed"))
+    }
+}
+
+/// A parallel line's filesystem location: the external `store` if set, else the
+/// in-tree `root/<dir>`.
+fn line_target(root: &Path, w: &Worktree) -> PathBuf {
+    match &w.store {
+        Some(s) => PathBuf::from(s),
+        None => root.join(&w.dir),
+    }
+}
+
+/// True when a host-gated line should be skipped on the current OS.
+fn off_platform(host: &Option<String>) -> bool {
+    host.as_deref().is_some_and(|h| h != std::env::consts::OS)
 }
 
 /// `--materialize`: clone the bare store and add the worktrees, skipping any that
@@ -1343,21 +1429,36 @@ fn software_materialize(root: &Path, recipe: &[Software]) {
             made += 1;
         }
         for w in &s.lines {
-            let wtp = root.join(&w.dir);
-            if wtp.exists() {
-                println!("skip     {}/ (exists)", w.dir);
+            if off_platform(&w.host) {
+                println!("skip     {}/ (host {}, not {})", w.dir, w.host.as_deref().unwrap_or(""), std::env::consts::OS);
                 continue;
             }
-            let wtp_s = wtp.to_string_lossy();
-            // `-B` creates or resets `branch` to the recorded `pin`, so a parallel
-            // line lands on its own branch at its own commit — not the canonical pin.
-            if !git_ok(&bare, &["worktree", "add", "-B", &w.branch, &wtp_s, &w.pin]) {
-                eprintln!("host-lifecycle: worktree add {}/ @ {} failed", w.dir, short(&w.pin));
+            let handle = root.join(&w.dir);
+            let target = line_target(root, w);
+            let target_s = target.to_string_lossy().to_string();
+            // The git worktree itself, at the external store or in-tree. `-B` creates
+            // or resets `branch` to the recorded `pin`, so a parallel line lands on its
+            // own branch at its own commit — not the canonical pin.
+            if target.exists() {
+                println!("skip     {target_s} (exists)");
+            } else if !git_ok(&bare, &["worktree", "add", "-B", &w.branch, &target_s, &w.pin]) {
+                eprintln!("host-lifecycle: worktree add {target_s} @ {} failed", short(&w.pin));
                 process::exit(2);
+            } else {
+                git_ok(&target, &["submodule", "update", "--init", "--recursive"]);
+                println!("worktree {target_s} ({} @ {})", w.branch, short(&w.pin));
+                made += 1;
             }
-            git_ok(&wtp, &["submodule", "update", "--init", "--recursive"]);
-            println!("worktree {}/ ({} @ {})", w.dir, w.branch, short(&w.pin));
-            made += 1;
+            // The in-structure handle: a symlink/junction so an external store still
+            // surfaces under the host root (issue #2).
+            if w.store.is_some() && fs::symlink_metadata(&handle).is_err() {
+                if let Err(e) = make_handle(&handle, &target) {
+                    eprintln!("host-lifecycle: handle {}/ -> {target_s} failed: {e}", w.dir);
+                    process::exit(2);
+                }
+                println!("handle   {}/ -> {target_s}", w.dir);
+                made += 1;
+            }
         }
     }
     println!("-- {made} item(s) materialized");
@@ -1370,6 +1471,21 @@ fn software_check(root: &Path, recipe: &[Software]) {
     for s in recipe {
         let bare = root.join(format!("{}.git", s.name));
         let canon = root.join(&s.name);
+        // Where-room invariant (issue #2): every materialized worktree path must
+        // stay under the host root. A path that escapes — absolute or `..`-climbing
+        // — is the wrong-tree footgun; the sanctioned off-tree store is a `store=`
+        // line, whose `dir` is still an in-tree handle.
+        if escapes_root(&s.name) {
+            println!("HAZARD   {}/ escapes the host root", s.name);
+            bad += 1;
+            continue;
+        }
+        for wt in &s.worktrees {
+            if escapes_root(wt) {
+                println!("HAZARD   {wt}/ escapes the host root");
+                bad += 1;
+            }
+        }
         if !bare.is_dir() {
             println!("MISSING  {}.git (run --materialize)", s.name);
             bad += 1;
@@ -1393,9 +1509,37 @@ fn software_check(root: &Path, recipe: &[Software]) {
                 bad += 1;
             }
         }
-        // Explicit parallel worktrees: each at its own branch and pin (issue #6).
+        // Explicit parallel worktrees: each at its own branch and pin (issue #6),
+        // optionally backed by an external store reached through an in-tree handle
+        // (issue #2). The pin/branch check runs against the resolved store.
         for w in &s.lines {
-            let wt = root.join(&w.dir);
+            if off_platform(&w.host) {
+                println!("skip     {}/ (host {}, not {})", w.dir, w.host.as_deref().unwrap_or(""), std::env::consts::OS);
+                continue;
+            }
+            if escapes_root(&w.dir) {
+                println!("HAZARD   {}/ escapes the host root (use store=<path> with an in-tree handle)", w.dir);
+                bad += 1;
+                continue;
+            }
+            let handle = root.join(&w.dir);
+            let wt = line_target(root, w);
+            // A store-backed line: the in-tree handle must resolve to the store.
+            if w.store.is_some() {
+                match (fs::canonicalize(&handle), fs::canonicalize(&wt)) {
+                    (Ok(h), Ok(t)) if h == t => {}
+                    (Ok(h), Ok(t)) => {
+                        println!("HAZARD   {}/ resolves to {} not the store {}", w.dir, h.display(), t.display());
+                        bad += 1;
+                        continue;
+                    }
+                    _ => {
+                        println!("HAZARD   {}/ has no in-structure handle to store {} (run --materialize)", w.dir, wt.to_string_lossy());
+                        bad += 1;
+                        continue;
+                    }
+                }
+            }
             if !wt.is_dir() {
                 println!("MISSING  {}/ (run --materialize)", w.dir);
                 bad += 1;
@@ -3056,6 +3200,8 @@ mod software_tests {
                 dir: "demo.line".to_string(),
                 branch: "feature".to_string(),
                 pin: line_pin.clone(),
+                store: None,
+                host: None,
             }],
             build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
         }];
@@ -3068,6 +3214,91 @@ mod software_tests {
         assert_ne!(line_pin, canon, "fixture sanity: the two pins differ");
         assert_eq!(git_out(&line, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(), "feature");
         software_check(&host, &recipe); // passes on a matching branch+pin
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn host_root_escape_is_detected() {
+        // The wrong-tree footgun: an absolute or `..`-climbing worktree path.
+        assert!(escapes_root("/mnt/d/dev/ik_llama.cpp"));
+        assert!(escapes_root("../outside"));
+        assert!(escapes_root("a/../../escape"));
+        // In-tree paths are fine, including a descent that stays under root.
+        assert!(!escapes_root("ik_llama.cpp.windows"));
+        assert!(!escapes_root("nested/handle"));
+        assert!(!escapes_root("a/b/../c"));
+    }
+
+    #[test]
+    fn worktree_line_parses_store_and_host() {
+        let s = parse_software(
+            "[software \"x\"]\n  url = u\n  pin = p\n  \
+             worktree = ik.win windows/msvc abc123 store=/mnt/d/dev/ik host=linux\n",
+        );
+        let w = &s[0].lines[0];
+        assert_eq!(w.dir, "ik.win");
+        assert_eq!(w.branch, "windows/msvc");
+        assert_eq!(w.pin, "abc123");
+        assert_eq!(w.store.as_deref(), Some("/mnt/d/dev/ik"));
+        assert_eq!(w.host.as_deref(), Some("linux"));
+        // back-compat: a bare 3-token line carries no store/host
+        let b = parse_software("[software \"x\"]\n url=u\n pin=p\n worktree = d br pin\n");
+        assert!(b[0].lines[0].store.is_none() && b[0].lines[0].host.is_none());
+    }
+
+    // An external-store line materializes the git worktree at the store and an
+    // in-tree symlink handle to it; --check resolves the handle to the store (#2).
+    #[cfg(unix)]
+    #[test]
+    fn external_store_line_materializes_an_in_tree_handle() {
+        let base = std::env::temp_dir().join(format!("hl-store-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let host = base.join("host");
+        let store = base.join("external").join("ik"); // a path NOT under host/
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(base.join("external")).unwrap();
+        let g = |cwd: &Path, args: &[&str]| assert!(git_ok(cwd, args), "git {args:?}");
+        g(&src, &["init", "-q", "-b", "main"]);
+        g(&src, &["config", "user.email", "t@t"]);
+        g(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("a.txt"), "one").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "one"]);
+        let canon = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+        g(&src, &["checkout", "-q", "-b", "win"]);
+        fs::write(src.join("b.txt"), "two").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "two"]);
+        let line_pin = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+        g(&src, &["checkout", "-q", "main"]);
+
+        let recipe = vec![Software {
+            name: "demo".to_string(),
+            url: src.to_string_lossy().to_string(),
+            pin: canon,
+            worktrees: Vec::new(),
+            lines: vec![Worktree {
+                dir: "demo.win".to_string(),
+                branch: "win".to_string(),
+                pin: line_pin.clone(),
+                store: Some(store.to_string_lossy().to_string()),
+                host: None,
+            }],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
+        }];
+        software_materialize(&host, &recipe);
+
+        let handle = host.join("demo.win");
+        // the in-tree handle exists and is a symlink to the external store
+        assert!(fs::symlink_metadata(&handle).unwrap().file_type().is_symlink(), "handle is a symlink");
+        assert_eq!(fs::canonicalize(&handle).unwrap(), fs::canonicalize(&store).unwrap());
+        // the git worktree physically lives at the store, at the line pin
+        assert!(store.join(".git").exists(), "worktree at the external store");
+        assert_eq!(git_out(&store, &["rev-parse", "HEAD"]).unwrap(), line_pin);
+        software_check(&host, &recipe); // passes: handle resolves to store, pin+branch match
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -3299,6 +3530,8 @@ mod book_tests {
                 dir: "ik.256k".to_string(),
                 branch: "perf/256k".to_string(),
                 pin: "a0506f2deadbeef".to_string(),
+                store: None,
+                host: None,
             }],
             build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
         }];
