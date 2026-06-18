@@ -297,18 +297,107 @@ fn parse_revision(text: &str) -> Option<String> {
     stamp_field(text, "revision")
 }
 
-/// Pull a quoted value for `key` (`key = "value"`) out of a stamp file's text.
-/// Empty values count as absent.
-fn stamp_field(text: &str, key: &str) -> Option<String> {
+/// The value after `=` in a stamp line: the contents of the first double-quoted
+/// run if present, else the first whitespace-delimited token. An inline
+/// `# comment` outside quotes is ignored. Empty counts as absent.
+fn stamp_value_after_eq(rest: &str) -> Option<String> {
+    let rest = rest.trim_start();
+    if let Some(after_q) = rest.strip_prefix('"') {
+        let end = after_q.find('"')?;
+        let v = &after_q[..end];
+        return (!v.is_empty()).then(|| v.to_string());
+    }
+    let v: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != '#').collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Every value for `key` (`key = "v"` or `key = v …`), in file order. The key must
+/// be followed (after optional spaces) by `=`, so `revision` never matches
+/// `revisionx`. Comment- and quote-tolerant. Multi-valued for repeated keys
+/// (e.g. `applied`).
+fn stamp_values(text: &str, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
     for line in text.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix(key) {
-            let v = rest.trim_start().strip_prefix('=')?.trim().trim_matches('"');
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
+        let Some(rest) = line.trim_start().strip_prefix(key) else { continue };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else { continue };
+        if let Some(v) = stamp_value_after_eq(rest) {
+            out.push(v);
         }
     }
-    None
+    out
+}
+
+/// The first value for `key`; empty counts as absent.
+fn stamp_field(text: &str, key: &str) -> Option<String> {
+    stamp_values(text, key).into_iter().next()
+}
+
+/// The applied entry ids: the first token of each `applied = …` line (the rest of
+/// the line is provenance — `recorded=… via=…` — written by `--record`).
+#[allow(dead_code)] // wired into `upgrade`/`--record` in plan/0022 steps 3–4
+fn applied_ids(text: &str) -> Vec<String> {
+    stamp_values(text, "applied")
+}
+
+/// The `baseline` ledger entry id (every ledger entry at-or-before its position is
+/// applied), if the stamp carries one.
+#[allow(dead_code)] // wired into `upgrade` in plan/0022 step 3
+fn baseline_field(text: &str) -> Option<String> {
+    stamp_field(text, "baseline")
+}
+
+/// Whether ledger entry `id` is applied: explicitly in the `applied` set, or at/before
+/// the `baseline`'s position in `ledger_ids` (file order). Pure position/membership —
+/// no git ancestry (plan/0022 v2: ledger SHAs are linear-chain artifacts, and some
+/// are orphaned from HEAD, so `merge-base` is the wrong and unreliable basis).
+#[allow(dead_code)] // wired into `upgrade`/`software --check` in plan/0022 steps 3,6
+fn entry_applied(id: &str, ledger_ids: &[String], baseline: Option<&str>, applied: &[String]) -> bool {
+    if applied.iter().any(|a| a == id) {
+        return true;
+    }
+    let Some(base) = baseline else { return false };
+    let pos = |x: &str| ledger_ids.iter().position(|e| e == x);
+    matches!((pos(id), pos(base)), (Some(i), Some(b)) if i <= b)
+}
+
+/// Replace the first `key = …` line's value, preserving every other line (so `name`
+/// and unknown keys survive — `stamp_body` drops them). Inserts the line if absent.
+/// The all-field-preserving writer the re-stamp/baseline-advance paths use.
+#[allow(dead_code)] // wired into `--record`/baseline-advance/migration in steps 4,5,8
+fn set_stamp_field(text: &str, key: &str, value: &str) -> String {
+    let trailing = text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let mut replaced = false;
+    for l in lines.iter_mut() {
+        let after = l.trim_start().strip_prefix(key).map(str::trim_start);
+        if matches!(after, Some(a) if a.starts_with('=')) {
+            *l = format!("{key} = \"{value}\"");
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        lines.push(format!("{key} = \"{value}\""));
+    }
+    let mut s = lines.join("\n");
+    if trailing {
+        s.push('\n');
+    }
+    s
+}
+
+/// Append a raw line to a stamp (an `applied = …` provenance line), preserving
+/// everything before it. Append-only — never rewrites a prior line, so a fumbled
+/// `--record` can re-list but never corrupt an existing claim.
+#[allow(dead_code)] // wired into `--record` in plan/0022 step 4
+fn append_stamp_line(text: &str, line: &str) -> String {
+    let mut s = text.to_string();
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s.push_str(line);
+    s.push('\n');
+    s
 }
 
 /// Read a MADR header field (`- Status: accepted`, `Scope: x`) from a decision body.
@@ -3517,6 +3606,66 @@ mod book_tests {
         assert_eq!(stamp_field(t, "revision").as_deref(), Some("r1"));
         assert_eq!(stamp_field(t, "missing"), None);
         assert_eq!(stamp_field("name = \"\"\n", "name"), None); // empty = absent
+    }
+
+    #[test]
+    fn stamp_field_is_comment_and_boundary_robust() {
+        // inline comment after a quoted value (the design's own example stamp)
+        assert_eq!(stamp_field("revision = \"abc123\"  # adopted rev\n", "revision").as_deref(), Some("abc123"));
+        // unquoted value, no spaces around '='
+        assert_eq!(stamp_field("baseline=ae1e688\n", "baseline").as_deref(), Some("ae1e688"));
+        // unquoted with trailing comment
+        assert_eq!(stamp_field("baseline = 7de7cb1 # newest\n", "baseline").as_deref(), Some("7de7cb1"));
+        // boundary: `revision` must not match `revisionx`, and a non-match must not
+        // abort the search for a later real match
+        assert_eq!(stamp_field("revisionx = \"x\"\nrevision = \"r\"\n", "revision").as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn applied_ids_reads_multiple_provenance_lines() {
+        let t = "revision = \"r\"\n\
+                 applied = 7de7cb1 recorded=2026-06-18 via=verify\n\
+                 applied = ae1e688 recorded=2026-06-18 via=call/0042\n";
+        assert_eq!(applied_ids(t), vec!["7de7cb1".to_string(), "ae1e688".to_string()]);
+        assert_eq!(baseline_field(t), None);
+    }
+
+    #[test]
+    fn entry_applied_by_position_or_membership_no_git() {
+        let ledger: Vec<String> = ["b6232a5", "c771d60", "b8c54fc", "821a216", "ae1e688", "7de7cb1"]
+            .iter().map(|s| s.to_string()).collect();
+        let applied = vec!["7de7cb1".to_string()]; // cherry-applied the newest, out of order
+        // at/before baseline = applied
+        assert!(entry_applied("b6232a5", &ledger, Some("c771d60"), &applied));
+        assert!(entry_applied("c771d60", &ledger, Some("c771d60"), &applied));
+        // after baseline and not in the set = PENDING (fail-safe: owed work re-lists)
+        assert!(!entry_applied("b8c54fc", &ledger, Some("c771d60"), &applied));
+        // explicitly in the applied set = applied, even though it is far past baseline
+        assert!(entry_applied("7de7cb1", &ledger, Some("c771d60"), &applied));
+        // no baseline → only membership counts
+        assert!(!entry_applied("b6232a5", &ledger, None, &applied));
+        // an orphaned/unknown id (not in ledger) never panics, never silently applied
+        assert!(!entry_applied("8c28e33", &ledger, Some("c771d60"), &applied));
+    }
+
+    #[test]
+    fn stamp_writers_preserve_all_fields() {
+        let t = "template = \"u\"\nrevision = \"r\"\nadopted  = \"2026-03-01\"\nname     = \"yarn-agentic\"\n";
+        // insert a new field — name and the rest survive (the stamp_body drop bug)
+        let t2 = set_stamp_field(t, "baseline", "ae1e688");
+        assert_eq!(stamp_field(&t2, "baseline").as_deref(), Some("ae1e688"));
+        assert!(t2.contains("name     = \"yarn-agentic\""));
+        assert!(t2.ends_with('\n'));
+        // update an existing field — name still not dropped
+        let t3 = set_stamp_field(&t2, "revision", "rr");
+        assert_eq!(stamp_field(&t3, "revision").as_deref(), Some("rr"));
+        assert!(t3.contains("name     = \"yarn-agentic\""));
+        // append an applied provenance line (append-only)
+        let t4 = append_stamp_line(&t3, "applied = 7de7cb1 recorded=2026-06-18 via=verify");
+        assert_eq!(applied_ids(&t4), vec!["7de7cb1".to_string()]);
+        assert!(t4.contains("name     = \"yarn-agentic\""));
+        // round-trip stable: applying the same set is byte-idempotent
+        assert_eq!(set_stamp_field(&t3, "revision", "rr"), t3);
     }
 
     #[test]
