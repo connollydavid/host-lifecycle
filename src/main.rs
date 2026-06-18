@@ -43,7 +43,7 @@ fn main() {
         Some("classify") => classify(args.get(2)),
         Some("remap") => remap(&args[2..]),
         Some("software") => software(&args[2..]),
-        Some("upgrade") => upgrade(args.get(2)),
+        Some("upgrade") => upgrade(&args[2..]),
         Some("book") => book(&args[2..]),
         Some("obligations") => obligations(&args[2..]),
         _ => {
@@ -334,14 +334,12 @@ fn stamp_field(text: &str, key: &str) -> Option<String> {
 
 /// The applied entry ids: the first token of each `applied = …` line (the rest of
 /// the line is provenance — `recorded=… via=…` — written by `--record`).
-#[allow(dead_code)] // wired into `upgrade`/`--record` in plan/0022 steps 3–4
 fn applied_ids(text: &str) -> Vec<String> {
     stamp_values(text, "applied")
 }
 
 /// The `baseline` ledger entry id (every ledger entry at-or-before its position is
 /// applied), if the stamp carries one.
-#[allow(dead_code)] // wired into `upgrade` in plan/0022 step 3
 fn baseline_field(text: &str) -> Option<String> {
     stamp_field(text, "baseline")
 }
@@ -350,7 +348,6 @@ fn baseline_field(text: &str) -> Option<String> {
 /// the `baseline`'s position in `ledger_ids` (file order). Pure position/membership —
 /// no git ancestry (plan/0022 v2: ledger SHAs are linear-chain artifacts, and some
 /// are orphaned from HEAD, so `merge-base` is the wrong and unreliable basis).
-#[allow(dead_code)] // wired into `upgrade`/`software --check` in plan/0022 steps 3,6
 fn entry_applied(id: &str, ledger_ids: &[String], baseline: Option<&str>, applied: &[String]) -> bool {
     if applied.iter().any(|a| a == id) {
         return true;
@@ -363,7 +360,6 @@ fn entry_applied(id: &str, ledger_ids: &[String], baseline: Option<&str>, applie
 /// Replace the first `key = …` line's value, preserving every other line (so `name`
 /// and unknown keys survive — `stamp_body` drops them). Inserts the line if absent.
 /// The all-field-preserving writer the re-stamp/baseline-advance paths use.
-#[allow(dead_code)] // wired into `--record`/baseline-advance/migration in steps 4,5,8
 fn set_stamp_field(text: &str, key: &str, value: &str) -> String {
     let trailing = text.ends_with('\n');
     let mut lines: Vec<String> = text.lines().map(String::from).collect();
@@ -2114,6 +2110,11 @@ struct Upgrade {
     title: String,
     action: String,
     requires: String,
+    /// `independent = true` — applies with no prerequisite ledger entry.
+    independent: bool,
+    /// `depends = <id> …` — ledger entries that must be applied first (logical
+    /// prerequisite, distinct from `requires` which is a tool-version floor).
+    depends: Vec<String>,
 }
 
 /// `upgrade <dir>` — list the template `UPGRADING.md` actions newer than the repo's
@@ -2121,8 +2122,19 @@ struct Upgrade {
 /// answers "since the revision I adopted, what must I do?" by git ancestry, so a
 /// doc diff is no longer the only signal for the structural migrations a revision
 /// span introduced.
-fn upgrade(dir: Option<&String>) {
-    let dir = dir.map(String::as_str).unwrap_or(".");
+fn upgrade(args: &[String]) {
+    let mut dir = ".";
+    let mut next_only = false;
+    for a in args {
+        match a.as_str() {
+            "--next" => next_only = true,
+            s if s.starts_with("--") => {
+                eprintln!("host-lifecycle: unknown upgrade flag {s}");
+                process::exit(2);
+            }
+            s => dir = s,
+        }
+    }
     let root = match fs::canonicalize(Path::new(dir)) {
         Ok(p) => p,
         Err(_) => {
@@ -2130,9 +2142,12 @@ fn upgrade(dir: Option<&String>) {
             process::exit(2);
         }
     };
-    let Some(rev) = fs::read_to_string(root.join(STAMP)).ok().and_then(|s| parse_revision(&s)) else {
-        eprintln!("host-lifecycle: no {STAMP} revision — not an adopted repo");
-        process::exit(2);
+    let stamp = match fs::read_to_string(root.join(STAMP)) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("host-lifecycle: no {STAMP} — not an adopted repo");
+            process::exit(2);
+        }
     };
     let Some(template) = find_template_dir(&root) else {
         eprintln!("host-lifecycle: cannot find the template submodule (none carries UPGRADING.md)");
@@ -2145,21 +2160,96 @@ fn upgrade(dir: Option<&String>) {
             process::exit(2);
         }
     };
-    let pending: Vec<Upgrade> = parse_upgrading(&text)
-        .into_iter()
-        .filter(|e| upgrade_applies(&template, &rev, &e.revision))
-        .collect();
-    if pending.is_empty() {
-        println!("up to date — no UPGRADING.md actions newer than {}", short(&rev));
+    let entries = parse_upgrading(&text);
+    let ledger_problems = validate_ledger(&entries);
+    if !ledger_problems.is_empty() {
+        for p in &ledger_problems {
+            eprintln!("host-lifecycle: ledger: {p}");
+        }
+        process::exit(1);
+    }
+    let ledger_ids: Vec<String> = entries.iter().map(|e| e.revision.clone()).collect();
+    let applied = applied_ids(&stamp);
+
+    // Determine the baseline; migrate a legacy single-`revision` stamp once.
+    let baseline = match baseline_field(&stamp) {
+        Some(b) => b,
+        None => {
+            let Some(rev) = parse_revision(&stamp) else {
+                eprintln!("host-lifecycle: {STAMP} has neither `baseline` nor `revision`");
+                process::exit(2);
+            };
+            let Some(b) = derive_baseline(&template, &ledger_ids, &rev) else {
+                eprintln!("host-lifecycle: cannot map revision {} to a ledger baseline — fetch the template to it first", short(&rev));
+                process::exit(2);
+            };
+            let migrated = set_stamp_field(&stamp, "baseline", &b);
+            if let Err(e) = fs::write(root.join(STAMP), &migrated) {
+                eprintln!("host-lifecycle: cannot write migrated {STAMP}: {e}");
+                process::exit(2);
+            }
+            println!("migrated stamp: revision {} -> baseline {}", short(&rev), short(&b));
+            b
+        }
+    };
+    let base = Some(baseline.as_str());
+    let is_applied = |id: &str| entry_applied(id, &ledger_ids, base, &applied);
+
+    // Consistency: an applied entry whose declared `depends` is unapplied is a corrupt
+    // record — fail loud (the teeth a membership set alone lacks).
+    let mut inconsistent = false;
+    for e in &entries {
+        if is_applied(&e.revision) {
+            for d in &e.depends {
+                if !is_applied(d) {
+                    eprintln!("host-lifecycle: INCONSISTENT — {} is applied but its dependency {} is not", short(&e.revision), short(d));
+                    inconsistent = true;
+                }
+            }
+        }
+    }
+    if inconsistent {
+        process::exit(1);
+    }
+
+    let pending: Vec<&Upgrade> = entries.iter().filter(|e| !is_applied(&e.revision)).collect();
+    let deps_ready = |e: &Upgrade| e.depends.iter().all(|d| is_applied(d));
+
+    if next_only {
+        match pending.iter().find(|e| deps_ready(e)) {
+            Some(e) => {
+                println!("next: {}  {}", short(&e.revision), e.title);
+                println!("  action: {}", e.action);
+                if !e.requires.is_empty() {
+                    println!("  requires: {}", e.requires);
+                }
+                println!("  record after applying: host-lifecycle upgrade --record {} {dir}", short(&e.revision));
+            }
+            None if pending.is_empty() => println!("up to date (baseline {}, {} applied out of order)", short(&baseline), applied.len()),
+            None => println!("blocked: {} pending, none with all dependencies applied", pending.len()),
+        }
         return;
     }
-    println!("from {} — {} action(s) to apply:", short(&rev), pending.len());
+
+    if pending.is_empty() {
+        println!("up to date (baseline {}, {} applied out of order)", short(&baseline), applied.len());
+        return;
+    }
+    println!("baseline {} — {} pending:", short(&baseline), pending.len());
     for e in &pending {
-        println!("\n[{}] {}", short(&e.revision), e.title);
-        println!("  action:   {}", e.action);
-        if !e.requires.is_empty() {
-            println!("  requires: {}", e.requires);
-        }
+        let dep = if e.independent {
+            "  [independent]".to_string()
+        } else if e.depends.is_empty() {
+            String::new()
+        } else {
+            let unmet: Vec<String> = e.depends.iter().filter(|d| !is_applied(d)).map(|d| short(d).to_string()).collect();
+            if unmet.is_empty() {
+                "  [deps ok]".to_string()
+            } else {
+                format!("  [blocked on: {}]", unmet.join(" "))
+            }
+        };
+        println!("  {}  {}{}", short(&e.revision), e.title, dep);
     }
 }
 
@@ -2178,6 +2268,8 @@ fn parse_upgrading(text: &str) -> Vec<Upgrade> {
                 title: String::new(),
                 action: String::new(),
                 requires: String::new(),
+                independent: false,
+                depends: Vec::new(),
             });
             continue;
         }
@@ -2192,10 +2284,80 @@ fn parse_upgrading(text: &str) -> Vec<Upgrade> {
             "title" => cur.title = val.to_string(),
             "action" => cur.action = val.to_string(),
             "requires" => cur.requires = val.to_string(),
+            "independent" => cur.independent = val.eq_ignore_ascii_case("true"),
+            "depends" => cur.depends = val.split_whitespace().map(String::from).collect(),
             _ => {}
         }
     }
     out
+}
+
+/// Validate the ledger's dependency declarations. Returns one message per problem:
+/// a self-dependency, an entry both `independent` and `depends`, a `depends` naming
+/// an entry not in the ledger, or a dependency cycle.
+fn validate_ledger(entries: &[Upgrade]) -> Vec<String> {
+    let ids: std::collections::HashSet<&str> = entries.iter().map(|e| e.revision.as_str()).collect();
+    let mut problems = Vec::new();
+    for e in entries {
+        if e.independent && !e.depends.is_empty() {
+            problems.push(format!("{}: both `independent` and `depends`", short(&e.revision)));
+        }
+        for d in &e.depends {
+            if d == &e.revision {
+                problems.push(format!("{}: depends on itself", short(&e.revision)));
+            } else if !ids.contains(d.as_str()) {
+                problems.push(format!("{}: depends on unknown entry {}", short(&e.revision), short(d)));
+            }
+        }
+    }
+    // cycle detection over the depends graph (DFS with a recursion stack)
+    let by_id: std::collections::HashMap<&str, &Upgrade> =
+        entries.iter().map(|e| (e.revision.as_str(), e)).collect();
+    let mut state: std::collections::HashMap<&str, u8> = std::collections::HashMap::new(); // 0=open,1=in-stack,2=done
+    fn dfs<'a>(
+        id: &'a str,
+        by_id: &std::collections::HashMap<&'a str, &'a Upgrade>,
+        state: &mut std::collections::HashMap<&'a str, u8>,
+    ) -> bool {
+        match state.get(id) {
+            Some(1) => return true,
+            Some(2) => return false,
+            _ => {}
+        }
+        state.insert(id, 1);
+        if let Some(e) = by_id.get(id) {
+            for d in &e.depends {
+                if by_id.contains_key(d.as_str()) && dfs(d.as_str(), by_id, state) {
+                    return true;
+                }
+            }
+        }
+        state.insert(id, 2);
+        false
+    }
+    let mut saw_cycle = false;
+    for e in entries {
+        if dfs(e.revision.as_str(), &by_id, &mut state) {
+            saw_cycle = true;
+        }
+    }
+    if saw_cycle {
+        problems.push("dependency cycle in the ledger".to_string());
+    }
+    problems
+}
+
+/// The newest ledger entry (latest in file order) whose commit is an ancestor-or-equal
+/// of `revision` in the template — the baseline a legacy single-`revision` stamp maps
+/// to. Uses git ONCE, at migration time only (never in the applied/pending hot path).
+fn derive_baseline(template: &Path, ledger_ids: &[String], revision: &str) -> Option<String> {
+    for id in ledger_ids.iter().rev() {
+        let resolves = git_out(template, &["rev-parse", "--verify", &format!("{id}^{{commit}}")]).is_some();
+        if resolves && git_ok(template, &["merge-base", "--is-ancestor", id, revision]) {
+            return Some(id.clone());
+        }
+    }
+    None
 }
 
 /// The submodule path that carries `UPGRADING.md` (the template).
@@ -2208,20 +2370,6 @@ fn find_template_dir(root: &Path) -> Option<PathBuf> {
     }
     let conv = root.join("host-template");
     conv.join("UPGRADING.md").is_file().then_some(conv)
-}
-
-/// Does an action that landed at template revision `landed` apply to a repo stamped
-/// at `have`? Yes when `have` is strictly older (an ancestor, and not equal). If the
-/// local template cannot resolve `landed` (not fetched to the target yet) the repo
-/// is behind it, so the action applies.
-fn upgrade_applies(template: &Path, have: &str, landed: &str) -> bool {
-    let Some(landed_sha) = git_out(template, &["rev-parse", "--verify", &format!("{landed}^{{commit}}")]) else {
-        return true;
-    };
-    let Some(have_sha) = git_out(template, &["rev-parse", "--verify", &format!("{have}^{{commit}}")]) else {
-        return true;
-    };
-    have_sha != landed_sha && git_ok(template, &["merge-base", "--is-ancestor", have, landed])
 }
 
 /// Root-level `.md` files the book places in a specific room (so the catch-all
@@ -3495,33 +3643,6 @@ mod upgrade_tests {
         assert!(e[1].requires.is_empty());
     }
 
-    // An action applies only to a repo stamped strictly older than where it landed.
-    #[cfg(unix)]
-    #[test]
-    fn applies_by_strict_ancestry() {
-        let base = std::env::temp_dir().join(format!("hl-upgrade-{}", process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        let g = |args: &[&str]| assert!(git_ok(&base, args), "git {args:?}");
-        g(&["init", "-q", "-b", "main"]);
-        g(&["config", "user.email", "t@t"]);
-        g(&["config", "user.name", "t"]);
-        fs::write(base.join("a"), "1").unwrap();
-        g(&["add", "-A"]);
-        g(&["commit", "-qm", "one"]);
-        let r1 = git_out(&base, &["rev-parse", "HEAD"]).unwrap();
-        fs::write(base.join("b"), "2").unwrap();
-        g(&["add", "-A"]);
-        g(&["commit", "-qm", "two"]);
-        let r2 = git_out(&base, &["rev-parse", "HEAD"]).unwrap();
-
-        assert!(upgrade_applies(&base, &r1, &r2), "older repo gets a newer action");
-        assert!(!upgrade_applies(&base, &r2, &r1), "newer repo skips an older action");
-        assert!(!upgrade_applies(&base, &r2, &r2), "same revision is not pending");
-        assert!(upgrade_applies(&base, &r1, "deadbeefdeadbeef"), "unknown landed → behind it");
-
-        let _ = fs::remove_dir_all(&base);
-    }
 }
 
 #[cfg(test)]
@@ -3666,6 +3787,50 @@ mod book_tests {
         assert!(t4.contains("name     = \"yarn-agentic\""));
         // round-trip stable: applying the same set is byte-idempotent
         assert_eq!(set_stamp_field(&t3, "revision", "rr"), t3);
+    }
+
+    #[test]
+    fn validate_ledger_flags_dependency_problems() {
+        let mk = |rev: &str, indep: bool, deps: &[&str]| Upgrade {
+            revision: rev.into(), title: String::new(), action: String::new(), requires: String::new(),
+            independent: indep, depends: deps.iter().map(|s| s.to_string()).collect(),
+        };
+        // clean: A independent, B depends on A
+        assert!(validate_ledger(&[mk("A", true, &[]), mk("B", false, &["A"])]).is_empty());
+        // self-dependency
+        assert!(validate_ledger(&[mk("A", false, &["A"])]).iter().any(|p| p.contains("itself")));
+        // both independent and depends
+        assert!(validate_ledger(&[mk("A", true, &["B"]), mk("B", false, &[])]).iter().any(|p| p.contains("both")));
+        // dependency on an unknown entry
+        assert!(validate_ledger(&[mk("A", false, &["Z"])]).iter().any(|p| p.contains("unknown")));
+        // cycle A -> B -> A
+        assert!(validate_ledger(&[mk("A", false, &["B"]), mk("B", false, &["A"])]).iter().any(|p| p.contains("cycle")));
+    }
+
+    // The migration's git logic: map a legacy `revision` to the newest ledger entry
+    // that is an ancestor-or-equal of it (the only place git ancestry is used).
+    #[cfg(unix)]
+    #[test]
+    fn derive_baseline_picks_newest_ancestor() {
+        let base = std::env::temp_dir().join(format!("hl-baseline-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let g = |args: &[&str]| assert!(git_ok(&base, args), "git {args:?}");
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        let commit = |n: &str| {
+            fs::write(base.join(n), n).unwrap();
+            assert!(git_ok(&base, &["add", "-A"]));
+            assert!(git_ok(&base, &["commit", "-qm", n]));
+            git_out(&base, &["rev-parse", "HEAD"]).unwrap()
+        };
+        let (c1, c2, c3, c4) = (commit("a"), commit("b"), commit("c"), commit("d"));
+        let ledger = vec![c1, c2, c3.clone(), c4.clone()];
+        // newest ancestor-or-equal of c3 is c3; of c4 (HEAD) is c4
+        assert_eq!(derive_baseline(&base, &ledger, &c3).as_deref(), Some(c3.as_str()));
+        assert_eq!(derive_baseline(&base, &ledger, &c4).as_deref(), Some(c4.as_str()));
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
