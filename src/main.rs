@@ -758,6 +758,11 @@ struct Software {
     /// worktree) that `--install-hooks` copies into `.git/hooks` as both
     /// `pre-commit` and `commit-msg`, alongside the verified deploy artifact.
     hooks: Option<String>,
+    /// Explicit per-platform builds (issue #1): `[build "<name>" "<platform>"]`
+    /// subsections, each a distinct toolchain/artifact of the *same* source `pin`.
+    /// When non-empty, these replace the flat `build`/`artifact`/… fields above;
+    /// when empty, the flat fields form the single default build (back-compat).
+    builds: Vec<PlatformBuild>,
 }
 
 /// An explicit parallel worktree: a directory checked out on `branch` at `pin`.
@@ -765,6 +770,61 @@ struct Worktree {
     dir: String,
     branch: String,
     pin: String,
+}
+
+/// One platform's build of a component, sharing the component's `url`+`pin` but
+/// carrying its own recipe and artifact (issue #1). `attest_host` names the OS
+/// (`std::env::consts::OS`: `linux`/`windows`/`macos`) on which this build is
+/// reproducible; `--check`/`--verify-build` skip it on any other host, the way an
+/// exempt component is skipped, rather than failing.
+struct PlatformBuild {
+    platform: String,
+    build: Option<String>,
+    toolchain: Option<String>,
+    deploy: Option<String>,
+    artifact: Option<(String, String)>,
+    repro_exempt: Option<String>,
+    attest_host: Option<String>,
+}
+
+/// A component's effective builds for provenance: borrows either the explicit
+/// per-platform builds or, when there are none, the flat single-build fields.
+struct BuildView<'a> {
+    platform: Option<&'a str>,
+    build: Option<&'a str>,
+    deploy: Option<&'a str>,
+    artifact: Option<&'a (String, String)>,
+    repro_exempt: Option<&'a str>,
+    attest_host: Option<&'a str>,
+}
+
+impl Software {
+    /// The builds to attest: the explicit `[build …]` subsections, or a single
+    /// default view over the flat fields (no `attest-host`, so it attests on any
+    /// host — the pre-issue-#1 behaviour).
+    fn builds_view(&self) -> Vec<BuildView<'_>> {
+        if self.builds.is_empty() {
+            return vec![BuildView {
+                platform: None,
+                build: self.build.as_deref(),
+                deploy: self.deploy.as_deref(),
+                artifact: self.artifact.as_ref(),
+                repro_exempt: self.repro_exempt.as_deref(),
+                attest_host: None,
+            }];
+        }
+        self.builds
+            .iter()
+            .map(|b| BuildView {
+                platform: Some(&b.platform),
+                build: b.build.as_deref(),
+                deploy: b.deploy.as_deref(),
+                artifact: b.artifact.as_ref(),
+                repro_exempt: b.repro_exempt.as_deref(),
+                attest_host: b.attest_host.as_deref(),
+            })
+            .collect()
+    }
 }
 
 /// `software --materialize|--check <dir>` — realise the `.host-software` recipe.
@@ -945,70 +1005,88 @@ fn copy_executable(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// escape clause for not-yet-reproducible migrated software (issue #10).
 fn software_verify_build(root: &Path, recipe: &[Software]) {
     let mut bad = 0usize;
+    let host = std::env::consts::OS;
     for s in recipe {
-        let Some((path, sha)) = &s.artifact else {
-            println!("skip     {} (no artifact recorded)", s.name);
-            continue;
-        };
-        if let Some(cite) = &s.repro_exempt {
-            if cited_decision_exists(root, cite) {
-                println!("warn     {} repro-exempt ({}) — rebuild comparison skipped", s.name, cite);
-            } else {
-                println!("DRIFT    {} repro-exempt cites missing decision {}", s.name, cite);
-                bad += 1;
-            }
-            continue;
-        }
-        let Some(build) = &s.build else {
-            println!("DRIFT    {} has an artifact but no `build` recipe to reproduce it", s.name);
-            bad += 1;
-            continue;
-        };
         let bare = root.join(format!("{}.git", s.name));
-        if !bare.is_dir() {
-            println!("MISSING  {}.git (run --materialize)", s.name);
-            bad += 1;
-            continue;
-        }
-        let work = root.join(format!(".host-verify-{}", s.name));
-        let _ = fs::remove_dir_all(&work);
-        let work_s = work.to_string_lossy().to_string();
-        if !git_ok(&bare, &["worktree", "add", "--detach", &work_s, &s.pin]) {
-            println!("ERROR    {} — cannot create a verify worktree at {}", s.name, short(&s.pin));
-            bad += 1;
-            continue;
-        }
-        let built = process::Command::new("sh")
-            .arg("-c")
-            .arg(build)
-            .current_dir(&work)
-            .status()
-            .map(|st| st.success())
-            .unwrap_or(false);
-        if !built {
-            println!("ERROR    {} — build failed: `{}`", s.name, build);
-            bad += 1;
-        } else {
-            match sha256_file(&work.join(path)) {
-                Some(h) if &h == sha => println!("ok       {} rebuild reproduces {} @ {}", s.name, path, short(sha)),
-                Some(h) => {
-                    println!("DRIFT    {} rebuild is {} but recorded {} — NOT reproducible", s.name, short(&h), short(sha));
-                    bad += 1;
-                }
-                None => {
-                    println!("ERROR    {} — built artifact {} not found", s.name, path);
-                    bad += 1;
+        for b in s.builds_view() {
+            let tag = match b.platform {
+                Some(p) => format!("{} [{}]", s.name, p),
+                None => s.name.clone(),
+            };
+            let Some((path, sha)) = b.artifact else {
+                println!("skip     {tag} (no artifact recorded)");
+                continue;
+            };
+            // A build reproduces only on its `attest-host` (it cannot run a foreign
+            // toolchain here) — skipped like an exemption, not failed.
+            if let Some(ah) = b.attest_host {
+                if ah != host {
+                    println!("skip     {tag} reproduces on {ah} (host is {host})");
+                    continue;
                 }
             }
+            if let Some(cite) = b.repro_exempt {
+                if cited_decision_exists(root, cite) {
+                    println!("warn     {tag} repro-exempt ({cite}) — rebuild comparison skipped");
+                } else {
+                    println!("DRIFT    {tag} repro-exempt cites missing decision {cite}");
+                    bad += 1;
+                }
+                continue;
+            }
+            let Some(build) = b.build else {
+                println!("DRIFT    {tag} has an artifact but no `build` recipe to reproduce it");
+                bad += 1;
+                continue;
+            };
+            if !bare.is_dir() {
+                println!("MISSING  {}.git (run --materialize)", s.name);
+                bad += 1;
+                continue;
+            }
+            // A per-platform verify worktree, so concurrent platform builds of the
+            // same source pin do not collide on one tree.
+            let suffix = b.platform.map(|p| format!("-{p}")).unwrap_or_default();
+            let work = root.join(format!(".host-verify-{}{suffix}", s.name));
+            let _ = fs::remove_dir_all(&work);
+            let work_s = work.to_string_lossy().to_string();
+            if !git_ok(&bare, &["worktree", "add", "--detach", &work_s, &s.pin]) {
+                println!("ERROR    {tag} — cannot create a verify worktree at {}", short(&s.pin));
+                bad += 1;
+                continue;
+            }
+            let built = process::Command::new("sh")
+                .arg("-c")
+                .arg(build)
+                .current_dir(&work)
+                .status()
+                .map(|st| st.success())
+                .unwrap_or(false);
+            if !built {
+                println!("ERROR    {tag} — build failed: `{build}`");
+                bad += 1;
+            } else {
+                match sha256_file(&work.join(path)) {
+                    Some(h) if &h == sha => println!("ok       {tag} rebuild reproduces {path} @ {}", short(sha)),
+                    Some(h) => {
+                        println!("DRIFT    {tag} rebuild is {} but recorded {} — NOT reproducible", short(&h), short(sha));
+                        bad += 1;
+                    }
+                    None => {
+                        println!("ERROR    {tag} — built artifact {path} not found");
+                        bad += 1;
+                    }
+                }
+            }
+            let _ = git_ok(&bare, &["worktree", "remove", "--force", &work_s]);
+            let _ = fs::remove_dir_all(&work);
         }
-        let _ = git_ok(&bare, &["worktree", "remove", "--force", &work_s]);
-        let _ = fs::remove_dir_all(&work);
     }
     if bad > 0 {
-        eprintln!("-- {bad} component(s) failed reproducibility verification");
+        eprintln!("-- {bad} build(s) failed reproducibility verification");
         process::exit(1);
     }
-    println!("-- every non-exempt component reproduces its recorded artifact");
+    println!("-- every non-exempt build reproduces its recorded artifact");
 }
 
 /// Read `.host-software` from the repo root, exiting if it is absent.
@@ -1027,6 +1105,9 @@ fn load_software(root: &Path) -> Vec<Software> {
 /// keys are ignored; a stanza missing `url` or `pin` is fatal (not materialisable).
 fn parse_software(text: &str) -> Vec<Software> {
     let mut out: Vec<Software> = Vec::new();
+    // While inside a `[build "s" "p"]` subsection, key=val lines configure the
+    // current platform build rather than the software stanza.
+    let mut in_build = false;
     for (i, line) in text.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
@@ -1045,7 +1126,36 @@ fn parse_software(text: &str) -> Vec<Software> {
                 artifact: None,
                 repro_exempt: None,
                 hooks: None,
+                builds: Vec::new(),
             });
+            in_build = false;
+            continue;
+        }
+        // `[build "<software>" "<platform>"]` — a per-platform build nested under
+        // the matching software stanza (issue #1).
+        if let Some(inner) = t.strip_prefix("[build \"").and_then(|r| r.strip_suffix("\"]")) {
+            let Some((soft, plat)) = inner.split_once("\" \"") else {
+                eprintln!("host-lifecycle: {SOFTWARE}:{}: `[build]` needs `\"<software>\" \"<platform>\"`", i + 1);
+                process::exit(2);
+            };
+            let Some(cur) = out.last_mut() else {
+                eprintln!("host-lifecycle: {SOFTWARE}:{}: [build] before any [software \"...\"] stanza", i + 1);
+                process::exit(2);
+            };
+            if cur.name != soft {
+                eprintln!("host-lifecycle: {SOFTWARE}:{}: [build \"{soft}\" …] must follow [software \"{soft}\"]", i + 1);
+                process::exit(2);
+            }
+            cur.builds.push(PlatformBuild {
+                platform: plat.to_string(),
+                build: None,
+                toolchain: None,
+                deploy: None,
+                artifact: None,
+                repro_exempt: None,
+                attest_host: None,
+            });
+            in_build = true;
             continue;
         }
         let Some((key, val)) = t.split_once('=') else {
@@ -1056,6 +1166,26 @@ fn parse_software(text: &str) -> Vec<Software> {
             eprintln!("host-lifecycle: {SOFTWARE}:{}: `{key}` before any [software \"...\"] stanza", i + 1);
             process::exit(2);
         };
+        if in_build {
+            let b = cur.builds.last_mut().expect("in_build implies a pushed build");
+            match key {
+                "build" => b.build = Some(val.to_string()),
+                "toolchain" => b.toolchain = Some(val.to_string()),
+                "deploy" => b.deploy = Some(val.to_string()),
+                "artifact" => {
+                    let f: Vec<&str> = val.split_whitespace().collect();
+                    let [path, sha] = f[..] else {
+                        eprintln!("host-lifecycle: {SOFTWARE}:{}: `artifact` needs `<path> <sha256>`", i + 1);
+                        process::exit(2);
+                    };
+                    b.artifact = Some((path.to_string(), sha.to_string()));
+                }
+                "repro-exempt" => b.repro_exempt = Some(val.to_string()),
+                "attest-host" => b.attest_host = Some(val.to_string()),
+                _ => {}
+            }
+            continue;
+        }
         match key {
             "url" => cur.url = val.to_string(),
             "pin" => cur.pin = val.to_string(),
@@ -1376,40 +1506,57 @@ fn cited_decision_exists(root: &Path, cite: &str) -> bool {
 /// the rebuild *proof* is `--verify-build`). Returns the count of failures.
 fn provenance_problems(root: &Path, s: &Software) -> usize {
     let mut bad = 0;
-    // The deployed line must be a recorded worktree (canonical or an explicit line).
-    if let Some(dep) = &s.deploy {
-        if dep == &s.name || s.lines.iter().any(|w| &w.dir == dep) {
-            println!("ok       {} deploy line `{}` is recorded", s.name, dep);
-        } else {
-            println!("DRIFT    {} deploy line `{}` is not a recorded worktree", s.name, dep);
-            bad += 1;
+    let host = std::env::consts::OS;
+    for b in s.builds_view() {
+        // Tag findings with the platform when there is more than the default build.
+        let tag = match b.platform {
+            Some(p) => format!("{} [{}]", s.name, p),
+            None => s.name.clone(),
+        };
+        // The deployed line must be a recorded worktree (canonical or an explicit
+        // line) — a static check, independent of the build host.
+        if let Some(dep) = b.deploy {
+            if dep == s.name || s.lines.iter().any(|w| w.dir == dep) {
+                println!("ok       {tag} deploy line `{dep}` is recorded");
+            } else {
+                println!("DRIFT    {tag} deploy line `{dep}` is not a recorded worktree");
+                bad += 1;
+            }
         }
-    }
-    // An exemption must cite a real decision.
-    if let Some(cite) = &s.repro_exempt {
-        if cited_decision_exists(root, cite) {
-            println!("warn     {} build is repro-exempt ({}) — reproducibility not proven", s.name, cite);
-        } else {
-            println!("DRIFT    {} repro-exempt cites missing decision {}", s.name, cite);
-            bad += 1;
+        // A build attests only on its `attest-host`; on any other host it is
+        // skipped (its artifact is not built here), as an exempt build is skipped.
+        if let Some(ah) = b.attest_host {
+            if ah != host {
+                println!("skip     {tag} attested on {ah} (host is {host})");
+                continue;
+            }
         }
-    }
-    // Attestation: when the artifact is present in the canonical worktree, it must
-    // hash to the record (a deploy/build host has it; a bare checkout does not).
-    if let Some((path, sha)) = &s.artifact {
-        let p = root.join(&s.name).join(path);
-        if !p.exists() {
-            println!("skip     {} artifact {} not present (not a deploy/build host)", s.name, path);
-        } else {
-            match sha256_file(&p) {
-                Some(h) if &h == sha => println!("ok       {} artifact {} @ {}", s.name, path, short(sha)),
-                Some(h) => {
-                    println!("DRIFT    {} artifact {} is {} but recorded {}", s.name, path, short(&h), short(sha));
-                    bad += 1;
-                }
-                None => {
-                    println!("ERROR    {} artifact {} — cannot hash", s.name, path);
-                    bad += 1;
+        // An exemption must cite a real decision.
+        if let Some(cite) = b.repro_exempt {
+            if cited_decision_exists(root, cite) {
+                println!("warn     {tag} build is repro-exempt ({cite}) — reproducibility not proven");
+            } else {
+                println!("DRIFT    {tag} repro-exempt cites missing decision {cite}");
+                bad += 1;
+            }
+        }
+        // Attestation: when the artifact is present in the canonical worktree, it
+        // must hash to the record (a deploy/build host has it; a bare checkout does not).
+        if let Some((path, sha)) = b.artifact {
+            let p = root.join(&s.name).join(path);
+            if !p.exists() {
+                println!("skip     {tag} artifact {path} not present (not a deploy/build host)");
+            } else {
+                match sha256_file(&p) {
+                    Some(h) if &h == sha => println!("ok       {tag} artifact {path} @ {}", short(sha)),
+                    Some(h) => {
+                        println!("DRIFT    {tag} artifact {path} is {} but recorded {}", short(&h), short(sha));
+                        bad += 1;
+                    }
+                    None => {
+                        println!("ERROR    {tag} artifact {path} — cannot hash");
+                        bad += 1;
+                    }
                 }
             }
         }
@@ -2007,10 +2154,15 @@ anchor. Materialize the worktrees locally with:\n\n```\nhost-lifecycle software 
             wts.push(format!("{} ({} @ {})", w.dir, w.branch, short(&w.pin)));
         }
         if wts.is_empty() {
-            s.push_str("- worktrees: — (single canonical line)\n\n");
+            s.push_str("- worktrees: — (single canonical line)\n");
         } else {
-            s.push_str(&format!("- worktrees: {}\n\n", wts.join(", ")));
+            s.push_str(&format!("- worktrees: {}\n", wts.join(", ")));
         }
+        if !c.builds.is_empty() {
+            let plats: Vec<&str> = c.builds.iter().map(|b| b.platform.as_str()).collect();
+            s.push_str(&format!("- builds: {}\n", plats.join(", ")));
+        }
+        s.push('\n');
     }
     s
 }
@@ -2320,7 +2472,7 @@ mod software_tests {
             build: None, toolchain: None,
             deploy: Some(deploy.into()),
             artifact: Some(("build/bin/srv".into(), art_sha.into())),
-            repro_exempt: exempt.map(String::from), hooks: None,
+            repro_exempt: exempt.map(String::from), hooks: None, builds: vec![],
         };
         // recorded deploy line + matching artifact hash + valid exemption → clean
         assert_eq!(provenance_problems(&base, &mk("ik", &sha, Some("call/0009"))), 0);
@@ -2329,6 +2481,68 @@ mod software_tests {
         // unrecorded deploy line → 1; exemption citing a missing decision → 1 (so 2)
         assert_eq!(provenance_problems(&base, &mk("ghost", &sha, Some("call/9999"))), 2);
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // `[build "<name>" "<platform>"]` subsections parse into per-platform builds
+    // sharing the component pin (issue #1); flat fields stay empty.
+    #[test]
+    fn parses_platform_builds() {
+        let text = "\
+[software \"ik\"]
+\turl = https://x.test/ik.git
+\tpin = abc123
+[build \"ik\" \"linux-cuda\"]
+\ttoolchain   = nvidia/cuda:12
+\tbuild        = cmake --preset cuda
+\tartifact     = build/srv aaaa
+\tdeploy       = ik
+\tattest-host  = linux
+[build \"ik\" \"windows-msvc-cuda\"]
+\tbuild        = cmake --preset msvc
+\tartifact     = build/srv.exe bbbb
+\tattest-host  = windows
+\trepro-exempt = call/0009
+";
+        let s = parse_software(text);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].build.is_none(), "flat build stays empty when [build] sections drive it");
+        assert_eq!(s[0].builds.len(), 2);
+        assert_eq!(s[0].builds[0].platform, "linux-cuda");
+        assert_eq!(s[0].builds[0].attest_host.as_deref(), Some("linux"));
+        assert_eq!(s[0].builds[0].artifact, Some(("build/srv".into(), "aaaa".into())));
+        assert_eq!(s[0].builds[1].platform, "windows-msvc-cuda");
+        assert_eq!(s[0].builds[1].repro_exempt.as_deref(), Some("call/0009"));
+        // builds_view yields the two explicit builds, not a flat default.
+        let v = s[0].builds_view();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].platform, Some("linux-cuda"));
+    }
+
+    // A foreign-platform build is skipped, not failed: only the build whose
+    // `attest-host` matches the current OS is attested (issue #1).
+    #[test]
+    fn foreign_platform_build_is_skipped_not_failed() {
+        let base = std::env::temp_dir().join(format!("hl-plat-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("ik")).unwrap();
+        // A build pinned to a host that is never this test runner: its artifact is
+        // absent and its hash is wrong, yet it must not count as a failure.
+        let other = if std::env::consts::OS == "linux" { "windows" } else { "linux" };
+        let s = Software {
+            name: "ik".into(), url: "u".into(), pin: "p".into(),
+            worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None,
+            repro_exempt: None, hooks: None,
+            builds: vec![PlatformBuild {
+                platform: "foreign".into(),
+                build: None, toolchain: None, deploy: None,
+                artifact: Some(("build/srv".into(), "0000".into())),
+                repro_exempt: None,
+                attest_host: Some(other.into()),
+            }],
+        };
+        assert_eq!(provenance_problems(&base, &s), 0, "foreign-host build is skipped, not failed");
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -2367,7 +2581,7 @@ mod software_tests {
             worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: Some("host-lint".into()),
             artifact: Some(("target/release/host-lint".into(), art.into())),
-            repro_exempt: None, hooks: Some("pre-commit".into()),
+            repro_exempt: None, hooks: Some("pre-commit".into()), builds: vec![],
         };
         // worktree at pin + binary present → installs all three files
         assert_eq!(install_hooks(&base, &[mk(&pin, "deadbeef")]), (1, 0));
@@ -2437,7 +2651,7 @@ mod software_tests {
                 branch: "feature".to_string(),
                 pin: line_pin.clone(),
             }],
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None,
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
         }];
         software_materialize(&host, &recipe);
 
@@ -2479,7 +2693,7 @@ mod software_tests {
             pin: pin.clone(),
             worktrees: Vec::new(),
             lines: Vec::new(),
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None,
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
         }];
         software_materialize(&host, &recipe);
 
@@ -2680,7 +2894,7 @@ mod book_tests {
                 branch: "perf/256k".to_string(),
                 pin: "a0506f2deadbeef".to_string(),
             }],
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None,
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
         }];
         let s = where_stub(&recipe);
         assert!(s.contains("## ik"));
