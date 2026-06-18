@@ -1373,6 +1373,9 @@ fn software_check(root: &Path, recipe: &[Software]) {
         // Reproducible-build provenance: deploy line recorded, exemption cited,
         // deployed artifact attested (issue #10).
         bad += provenance_problems(root, s);
+        // Verification lanes are mandatory when a spec of their kind exists: a
+        // materialized component carrying a `.allium`/`.tla` must run its lane.
+        bad += spec_lane_problems(root, s);
     }
     // Worktree-absence coherence (call/0005): a tracked symlink whose target is not
     // itself tracked here points into a separately-materialized path — a software
@@ -1558,6 +1561,93 @@ fn provenance_problems(root: &Path, s: &Software) -> usize {
         }
     }
     bad
+}
+
+/// The verification lanes are mandatory **when a spec of their kind exists**: a
+/// materialized component carrying any `.allium` MUST have a CI workflow running
+/// `allium check` + `allium analyse`; any `.tla` MUST have a TLC lane. Returns the
+/// count of components with a present spec but a missing lane (a HAZARD). An
+/// un-materialized worktree is skipped (the specs cannot be seen).
+fn spec_lane_problems(root: &Path, s: &Software) -> usize {
+    let worktree = root.join(&s.name);
+    if !worktree.is_dir() {
+        return 0;
+    }
+    let (has_allium, has_tla) = find_specs(&worktree);
+    if !has_allium && !has_tla {
+        return 0;
+    }
+    let workflows = read_workflows(&worktree);
+    let mut bad = 0;
+    if has_allium {
+        if workflows.contains("allium check") && workflows.contains("allium analyse") {
+            println!("ok       {} allium lane present (check + analyse)", s.name);
+        } else {
+            println!(
+                "HAZARD   {} carries a .allium spec but no CI workflow runs `allium check` + `allium analyse`",
+                s.name
+            );
+            bad += 1;
+        }
+    }
+    if has_tla {
+        if workflows.contains("tlc2.TLC") || workflows.contains("tla2tools") {
+            println!("ok       {} specula/TLC lane present", s.name);
+        } else {
+            println!("HAZARD   {} carries a .tla spec but no CI workflow model-checks it (TLC)", s.name);
+            bad += 1;
+        }
+    }
+    bad
+}
+
+/// Walk a worktree (skipping `.git`, `target`, `node_modules`) and report whether
+/// any `.allium` / `.tla` spec exists.
+fn find_specs(dir: &Path) -> (bool, bool) {
+    let mut allium = false;
+    let mut tla = false;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name == ".git" || name == "target" || name == "node_modules" {
+                    continue;
+                }
+                stack.push(p);
+            } else {
+                match p.extension().and_then(|x| x.to_str()) {
+                    Some("allium") => allium = true,
+                    Some("tla") => tla = true,
+                    _ => {}
+                }
+            }
+        }
+        if allium && tla {
+            break;
+        }
+    }
+    (allium, tla)
+}
+
+/// Concatenate every workflow under `.github/workflows/` (`*.yml`/`*.yaml`).
+fn read_workflows(worktree: &Path) -> String {
+    let dir = worktree.join(".github/workflows");
+    let Ok(rd) = fs::read_dir(&dir) else { return String::new() };
+    let mut text = String::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if matches!(p.extension().and_then(|x| x.to_str()), Some("yml") | Some("yaml")) {
+            if let Ok(t) = fs::read_to_string(&p) {
+                text.push_str(&t);
+                text.push('\n');
+            }
+        }
+    }
+    text
 }
 
 /// One entry in the template's `UPGRADING.md`: an action that became required at a
@@ -2541,6 +2631,37 @@ mod software_tests {
             }],
         };
         assert_eq!(provenance_problems(&base, &s), 0, "foreign-host build is skipped, not failed");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A materialized component carrying a spec must have its CI lane: a `.allium`
+    // without `allium check`+`analyse`, or a `.tla` without TLC, is a HAZARD.
+    #[test]
+    fn spec_lane_gate_requires_a_lane_when_a_spec_is_present() {
+        let base = std::env::temp_dir().join(format!("hl-lane-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("comp");
+        fs::create_dir_all(wt.join(".github/workflows")).unwrap();
+        fs::write(wt.join("thing.allium"), "-- allium: 3\n").unwrap();
+        let mk = || Software {
+            name: "comp".into(), url: "u".into(), pin: "p".into(),
+            worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None,
+            repro_exempt: None, hooks: None, builds: vec![],
+        };
+        // .allium present, no workflow → HAZARD
+        assert_eq!(spec_lane_problems(&base, &mk()), 1);
+        // a workflow running check + analyse → clean
+        fs::write(wt.join(".github/workflows/allium.yml"), "run: allium check x\nrun: allium analyse x\n").unwrap();
+        assert_eq!(spec_lane_problems(&base, &mk()), 0);
+        // add a .tla with no TLC lane → HAZARD again
+        fs::write(wt.join("Spec.tla"), "---- MODULE Spec ----\n").unwrap();
+        assert_eq!(spec_lane_problems(&base, &mk()), 1);
+        // a TLC lane clears it
+        fs::write(wt.join(".github/workflows/specula.yml"), "run: java -cp tla2tools.jar tlc2.TLC Spec.tla\n").unwrap();
+        assert_eq!(spec_lane_problems(&base, &mk()), 0);
+        // an un-materialized component is skipped, not failed
+        assert_eq!(spec_lane_problems(&base, &Software { name: "absent".into(), ..mk() }), 0);
         let _ = fs::remove_dir_all(&base);
     }
 
