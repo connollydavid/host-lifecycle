@@ -232,16 +232,23 @@ fn version(dir: Option<&String>) {
         eprintln!("host-lifecycle version <dir>");
         process::exit(2);
     };
-    match fs::read_to_string(Path::new(dir).join(STAMP))
-        .ok()
-        .as_deref()
-        .and_then(parse_revision)
-    {
-        Some(rev) => println!("{rev}"),
-        None => {
-            eprintln!("host-lifecycle: no readable {STAMP} in {dir}");
-            process::exit(1);
+    let Ok(stamp) = fs::read_to_string(Path::new(dir).join(STAMP)) else {
+        eprintln!("host-lifecycle: no readable {STAMP} in {dir}");
+        process::exit(1);
+    };
+    // The applied state, not just the legacy revision: a single `revision` would
+    // hide an `applied` set and mislead about what is actually adopted (plan/0022).
+    if let Some(b) = baseline_field(&stamp) {
+        println!("baseline {b}");
+        let applied = applied_ids(&stamp);
+        if !applied.is_empty() {
+            println!("applied {}: {}", applied.len(), applied.join(" "));
         }
+    } else if let Some(rev) = parse_revision(&stamp) {
+        println!("revision {rev} (legacy stamp — run `host-lifecycle upgrade` to migrate to a baseline)");
+    } else {
+        eprintln!("host-lifecycle: {STAMP} in {dir} has neither baseline nor revision");
+        process::exit(1);
     }
 }
 
