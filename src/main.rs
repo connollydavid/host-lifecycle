@@ -1937,7 +1937,7 @@ fn spec_lane_problems(root: &Path, s: &Software) -> usize {
         return 0;
     }
     let (has_allium, has_tla, has_obligations) = find_specs(&worktree);
-    if !has_allium && !has_tla {
+    if !has_allium && !has_tla && !has_obligations {
         return 0;
     }
     let workflows = read_workflows(&worktree);
@@ -1972,7 +1972,58 @@ fn spec_lane_problems(root: &Path, s: &Software) -> usize {
             bad += 1;
         }
     }
+    // Deep-verification tiers (host-prove) are opt-in and inert: a tier's lane is
+    // required only once a `.obligations` manifest *declares* it (a `kani:` /
+    // `apalache:` / `tlaps:` disposition). No declaration → no requirement, no HAZARD
+    // — bare `.tla`/crate presence never activates a tier.
+    if has_obligations {
+        let manifests = read_obligations_text(&worktree);
+        for (token, label, lane_present) in [
+            ("kani:", "Kani code-conformance", workflows.contains("cargo kani") || workflows.contains("kani-verifier")),
+            ("apalache:", "Apalache symbolic", workflows.contains("apalache-mc")),
+            ("tlaps:", "TLAPS proof", workflows.contains("tlapm")),
+        ] {
+            if manifests.contains(token) {
+                if lane_present {
+                    println!("ok       {} {label} lane present (declares {token})", s.name);
+                } else {
+                    println!(
+                        "HAZARD   {} declares an obligation {token} but no CI workflow runs the {label} lane",
+                        s.name
+                    );
+                    bad += 1;
+                }
+            }
+        }
+    }
     bad
+}
+
+/// Concatenate every `.obligations` manifest in the worktree (for tier-declaration
+/// substring checks). Skips `.git`, `target`, `node_modules`, like `find_specs`.
+fn read_obligations_text(dir: &Path) -> String {
+    let mut text = String::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name == ".git" || name == "target" || name == "node_modules" {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("obligations") {
+                if let Ok(t) = fs::read_to_string(&p) {
+                    text.push_str(&t);
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    text
 }
 
 /// Walk a worktree (skipping `.git`, `target`, `node_modules`) and report whether
@@ -2026,19 +2077,21 @@ fn read_workflows(worktree: &Path) -> String {
     text
 }
 
-/// `obligations <spec.allium> [--manifest <f>] [--tests <dir>]` — the
-/// remap-dictionary discipline for tests: every obligation `allium plan` derives
+/// `obligations <spec.allium> [--manifest <f>] [--tests <dir>] [--prove <dir>]` —
+/// the remap-dictionary discipline for tests: every obligation `allium plan` derives
 /// from the spec MUST be dispositioned in the sibling `<stem>.obligations`
 /// manifest. Each line is `<id> => <disposition>`, where the disposition is
 /// `test:<name>` (a named test discharges it), `structural` (the spec's own
-/// `check`/`analyse` lane covers it), or `waived: <reason>`. Fails on any
-/// obligation with no disposition, any stale manifest id no longer derived, and —
-/// when `--tests <dir>` is given — any `test:<name>` whose name is absent from the
-/// test sources.
+/// `check`/`analyse` lane covers it), `waived: <reason>`, or a deep-verification
+/// tier — `kani:<harness>`, `apalache:<inv>`, `tlaps:<theorem>` (host-prove). Fails
+/// on any obligation with no disposition, any stale manifest id no longer derived,
+/// any `test:<name>` absent from the `--tests` sources, and any tier proof name
+/// absent from the `--prove` sources (the crate / `.tla`).
 fn obligations(args: &[String]) {
     let mut pos: Vec<&String> = Vec::new();
     let mut manifest_arg: Option<&String> = None;
     let mut tests_arg: Option<&String> = None;
+    let mut prove_arg: Option<&String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2050,12 +2103,16 @@ fn obligations(args: &[String]) {
                 tests_arg = args.get(i + 1);
                 i += 1;
             }
+            "--prove" => {
+                prove_arg = args.get(i + 1);
+                i += 1;
+            }
             _ => pos.push(&args[i]),
         }
         i += 1;
     }
     let Some(spec) = pos.first() else {
-        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>]");
+        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>] [--prove <dir>]");
         process::exit(2);
     };
     let spec_path = Path::new(spec.as_str());
@@ -2089,8 +2146,9 @@ fn obligations(args: &[String]) {
         }
     };
     let tests = tests_arg.map(|d| read_dir_recursive(Path::new(d.as_str())));
-    // 3. Every obligation dispositioned; no stale dispositions; test refs exist.
-    let problems = obligation_gaps(&plan_ids, &dispositions, tests.as_deref());
+    let prove = prove_arg.map(|d| read_dir_recursive(Path::new(d.as_str())));
+    // 3. Every obligation dispositioned; no stale dispositions; test/proof refs exist.
+    let problems = obligation_gaps(&plan_ids, &dispositions, tests.as_deref(), prove.as_deref());
     for p in &problems {
         println!("{p}");
     }
@@ -2103,9 +2161,15 @@ fn obligations(args: &[String]) {
 
 /// The disposition gaps between the derived obligations and the manifest:
 /// `MISSING` (obligation with no disposition), `STALE` (disposition for a
-/// no-longer-derived obligation), and `ABSENT` (a `test:<name>` whose name is not
-/// in the test sources, when those are supplied). Pure, so it is unit-tested.
-fn obligation_gaps(plan_ids: &[String], dispositions: &[(String, String)], tests: Option<&str>) -> Vec<String> {
+/// no-longer-derived obligation), and `ABSENT` (a `test:<name>` not in the test
+/// sources, or a deep-verification `kani:`/`apalache:`/`tlaps:` proof name not in
+/// the prove sources, when those are supplied). Pure, so it is unit-tested.
+fn obligation_gaps(
+    plan_ids: &[String],
+    dispositions: &[(String, String)],
+    tests: Option<&str>,
+    prove: Option<&str>,
+) -> Vec<String> {
     let mut problems = Vec::new();
     for id in plan_ids {
         match dispositions.iter().find(|(k, _)| k == id) {
@@ -2115,6 +2179,17 @@ fn obligation_gaps(plan_ids: &[String], dispositions: &[(String, String)], tests
                     let name = name.trim();
                     if !name.is_empty() && !src.contains(name) {
                         problems.push(format!("ABSENT   {id} — `test:{name}` not in the test sources"));
+                    }
+                }
+                // Deep-verification tiers (host-prove): a proof discharges the
+                // obligation. When prove sources are supplied, the named harness /
+                // invariant / theorem must occur in them — the analog of `test:`.
+                for pfx in ["kani:", "apalache:", "tlaps:"] {
+                    if let (Some(name), Some(src)) = (disp.strip_prefix(pfx), prove) {
+                        let name = name.trim();
+                        if !name.is_empty() && !src.contains(name) {
+                            problems.push(format!("ABSENT   {id} — `{pfx}{name}` not in the prove sources"));
+                        }
                     }
                 }
             }
@@ -3548,6 +3623,35 @@ mod software_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    // Deep-verification tiers are opt-in and inert: a HAZARD fires only when a
+    // `.obligations` manifest declares the tier and its CI lane is absent. With no
+    // declaration the worktree is inert (0), even though it materializes fine.
+    #[test]
+    fn tier_lanes_are_opt_in_and_inert() {
+        let base = std::env::temp_dir().join(format!("hl-tier-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("comp");
+        fs::create_dir_all(wt.join(".github/workflows")).unwrap();
+        let mk = || Software {
+            name: "comp".into(), url: "u".into(), pin: "p".into(),
+            worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None,
+            repro_exempt: None, hooks: None, builds: vec![],
+        };
+        // inert: no spec, no tier declaration → no HAZARD
+        assert_eq!(spec_lane_problems(&base, &mk()), 0);
+        // declare two tiers with no lanes wired → one HAZARD each, nothing else
+        fs::write(wt.join("p.obligations"), "a => kani:verify_thing\nb => apalache:Inv\n").unwrap();
+        assert_eq!(spec_lane_problems(&base, &mk()), 2);
+        // wiring the Kani lane clears only the Kani HAZARD
+        fs::write(wt.join(".github/workflows/kani.yml"), "run: cargo kani\n").unwrap();
+        assert_eq!(spec_lane_problems(&base, &mk()), 1);
+        // wiring the Apalache lane clears the rest
+        fs::write(wt.join(".github/workflows/apalache.yml"), "run: apalache-mc check Spec.tla\n").unwrap();
+        assert_eq!(spec_lane_problems(&base, &mk()), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // Obligation discharge: every `allium plan` id must be dispositioned; stale
     // dispositions and absent `test:` references are flagged.
     #[test]
@@ -3565,7 +3669,7 @@ mod software_tests {
              gone.obligation => waived: removed\n",
         );
         // transition-edge... is MISSING; gone.obligation is STALE → 2 problems
-        let p = obligation_gaps(&ids, &manifest, None);
+        let p = obligation_gaps(&ids, &manifest, None, None);
         assert_eq!(p.len(), 2, "{p:?}");
         assert!(p.iter().any(|x| x.contains("MISSING") && x.contains("transition-edge")));
         assert!(p.iter().any(|x| x.contains("STALE") && x.contains("gone.obligation")));
@@ -3576,11 +3680,32 @@ mod software_tests {
              transition-edge.Check.scanning.blocked => test:flag_blocks\n\
              entity-fields.Line => structural\n",
         );
-        assert!(obligation_gaps(&ids, &full, None).is_empty());
+        assert!(obligation_gaps(&ids, &full, None, None).is_empty());
         // with test sources: the named test must exist
-        let p2 = obligation_gaps(&ids, &full, Some("fn flag_blocks() {}"));
+        let p2 = obligation_gaps(&ids, &full, Some("fn flag_blocks() {}"), None);
         assert!(p2.iter().any(|x| x.contains("ABSENT") && x.contains("phase_synonym_flags")));
-        assert_eq!(obligation_gaps(&ids, &full, Some("fn phase_synonym_flags(){} fn flag_blocks(){}")).len(), 0);
+        assert_eq!(obligation_gaps(&ids, &full, Some("fn phase_synonym_flags(){} fn flag_blocks(){}"), None).len(), 0);
+    }
+
+    // Deep-verification tiers: a `kani:`/`apalache:`/`tlaps:` disposition is valid,
+    // and when prove sources are supplied the named harness/invariant/theorem must
+    // occur in them (the proof analog of the `test:` existence check).
+    #[test]
+    fn obligation_gaps_validates_proof_tiers() {
+        let ids = vec!["b.Numeral".to_string(), "c.Verdict".to_string()];
+        let m = parse_obligation_manifest(
+            "b.Numeral => kani:verify_is_dotted_code\n\
+             c.Verdict => tlaps:Safety\n",
+        );
+        // no prove sources: the tier dispositions are accepted (like `structural`)
+        assert!(obligation_gaps(&ids, &m, None, None).is_empty());
+        // prove sources missing the proof names → ABSENT for each
+        let p = obligation_gaps(&ids, &m, None, Some("fn other() {}\nTHEOREM Unrelated == TRUE"));
+        assert!(p.iter().any(|x| x.contains("ABSENT") && x.contains("kani:verify_is_dotted_code")), "{p:?}");
+        assert!(p.iter().any(|x| x.contains("ABSENT") && x.contains("tlaps:Safety")), "{p:?}");
+        // prove sources containing both names → clean
+        let src = "fn verify_is_dotted_code() {}\nTHEOREM Safety == TRUE";
+        assert!(obligation_gaps(&ids, &m, None, Some(src)).is_empty());
     }
 
     // A `hooks` key parses into the optional hook-script path.
