@@ -1575,6 +1575,52 @@ fn software_materialize(root: &Path, recipe: &[Software]) {
 
 /// `--check`: each component's bare store and canonical worktree must exist, and
 /// the worktree must sit at the recorded `pin`. Exit 1 if any is missing or drifted.
+/// Re-check every recorded upgrade claim in `.host` against the ledger (plan/0022
+/// step 6): an applied entry whose declared `depends` is unapplied, or whose `verify`
+/// post-condition no longer holds, is a corrupt claim — `HAZARD`. Also surfaces the
+/// partial-upgrade state for a cold auditor. Read-only (never migrates the stamp);
+/// returns 0 silently when the repo carries no stamp or ledger. A nested invocation
+/// (a `verify` that itself ran `software --check`) skips the verify re-check, so a
+/// verify command cannot recurse infinitely.
+fn upgrade_claim_problems(root: &Path) -> usize {
+    let Ok(stamp) = fs::read_to_string(root.join(STAMP)) else { return 0 };
+    let Some(template) = find_template_dir(root) else { return 0 };
+    let Ok(text) = fs::read_to_string(template.join("UPGRADING.md")) else { return 0 };
+    let entries = parse_upgrading(&text);
+    if entries.is_empty() {
+        return 0;
+    }
+    let ledger_ids: Vec<String> = entries.iter().map(|e| e.revision.clone()).collect();
+    let applied = applied_ids(&stamp);
+    let baseline = baseline_field(&stamp)
+        .or_else(|| parse_revision(&stamp).and_then(|r| derive_baseline(&template, &ledger_ids, &r)));
+    let base = baseline.as_deref();
+    let is_applied = |id: &str| entry_applied(id, &ledger_ids, base, &applied);
+    let nested = std::env::var_os("HOST_LIFECYCLE_IN_CHECK").is_some();
+    let mut bad = 0usize;
+    for e in &entries {
+        if !is_applied(&e.revision) {
+            continue;
+        }
+        for d in &e.depends {
+            if !is_applied(d) {
+                println!("HAZARD   upgrade {} applied but its dependency {} is not", short(&e.revision), short(d));
+                bad += 1;
+            }
+        }
+        if !e.verify.is_empty() && !nested && !run_verify(root, &e.verify) {
+            println!("HAZARD   upgrade {} claimed applied but its verify no longer holds: {}", short(&e.revision), e.verify);
+            bad += 1;
+        }
+    }
+    let pending = entries.iter().filter(|e| !is_applied(&e.revision)).count();
+    match base {
+        Some(b) => println!("ok       upgrade: baseline {}, {} applied out of order, {} pending", short(b), applied.len(), pending),
+        None => println!("note     upgrade: stamp has no baseline yet (run host-lifecycle upgrade to migrate)"),
+    }
+    bad
+}
+
 fn software_check(root: &Path, recipe: &[Software]) {
     let mut bad = 0usize;
     for s in recipe {
@@ -1693,6 +1739,8 @@ fn software_check(root: &Path, recipe: &[Software]) {
         println!("HAZARD   {link} -> {target} (symlink into an un-materialized path; not tracked here)");
         bad += 1;
     }
+    // Re-check every recorded upgrade claim against the ledger (plan/0022 step 6).
+    bad += upgrade_claim_problems(root);
     if bad > 0 {
         eprintln!("-- {bad} item(s) need attention");
         process::exit(1);
@@ -2185,6 +2233,9 @@ fn run_verify(root: &Path, cmd: &str) -> bool {
         .arg(flag)
         .arg(cmd)
         .current_dir(root)
+        // Re-entrancy guard: a `verify` that invokes `software --check` would re-run
+        // the verifies; a nested check sees this and skips its own re-check.
+        .env("HOST_LIFECYCLE_IN_CHECK", "1")
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
