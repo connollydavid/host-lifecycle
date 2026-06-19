@@ -385,7 +385,6 @@ fn set_stamp_field(text: &str, key: &str, value: &str) -> String {
 /// Append a raw line to a stamp (an `applied = …` provenance line), preserving
 /// everything before it. Append-only — never rewrites a prior line, so a fumbled
 /// `--record` can re-list but never corrupt an existing claim.
-#[allow(dead_code)] // wired into `--record` in plan/0022 step 4
 fn append_stamp_line(text: &str, line: &str) -> String {
     let mut s = text.to_string();
     if !s.is_empty() && !s.ends_with('\n') {
@@ -2115,6 +2114,11 @@ struct Upgrade {
     /// `depends = <id> …` — ledger entries that must be applied first (logical
     /// prerequisite, distinct from `requires` which is a tool-version floor).
     depends: Vec<String>,
+    /// `verify = <command>` — a machine-checkable post-condition for the entry's
+    /// action, run by `--record` (a shell command in the repo root; non-zero
+    /// refuses the record). Empty when the action has none — then recording
+    /// requires an explicit `--unverified call/NNNN` citation.
+    verify: String,
 }
 
 /// `upgrade <dir>` — list the template `UPGRADING.md` actions newer than the repo's
@@ -2122,18 +2126,86 @@ struct Upgrade {
 /// answers "since the revision I adopted, what must I do?" by git ancestry, so a
 /// doc diff is no longer the only signal for the structural migrations a revision
 /// span introduced.
+/// Resolve a `--record` argument to a full ledger id: a 1-based ledger ordinal, an
+/// exact id, or an unambiguous ≥4-char prefix. Frees a low-reliability agent from
+/// retyping a hex SHA exactly, and rejects unknown/ambiguous input rather than
+/// recording a lie.
+fn resolve_ledger_id(input: &str, ledger_ids: &[String]) -> Result<String, String> {
+    if let Ok(n) = input.parse::<usize>() {
+        return (n >= 1)
+            .then(|| ledger_ids.get(n - 1).cloned())
+            .flatten()
+            .ok_or_else(|| format!("ordinal out of range (1..={})", ledger_ids.len()));
+    }
+    if ledger_ids.iter().any(|x| x == input) {
+        return Ok(input.to_string());
+    }
+    if input.len() >= 4 {
+        let m: Vec<&String> = ledger_ids.iter().filter(|x| x.starts_with(input)).collect();
+        match m.len() {
+            1 => return Ok(m[0].clone()),
+            n if n > 1 => return Err(format!("ambiguous prefix (matches {n} entries)")),
+            _ => {}
+        }
+    }
+    Err("unknown ledger id".to_string())
+}
+
+/// Run an entry's `verify` post-condition (a shell command) in the repo root;
+/// `true` only on a zero exit. The maintainer-authored ledger command is trusted
+/// the way a CI step is.
+fn run_verify(root: &Path, cmd: &str) -> bool {
+    let (sh, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    process::Command::new(sh)
+        .arg(flag)
+        .arg(cmd)
+        .current_dir(root)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Write `content` to `path` atomically (temp file + rename), so a crash or full
+/// disk during a stamp update can never leave a truncated/empty `.host`.
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("stamp");
+    let tmp = path.with_file_name(format!("{name}.tmp"));
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path)
+}
+
 fn upgrade(args: &[String]) {
     let mut dir = ".";
     let mut next_only = false;
-    for a in args {
-        match a.as_str() {
+    let mut record: Option<&str> = None;
+    let mut unverified: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--next" => next_only = true,
+            "--record" => {
+                record = args.get(i + 1).map(String::as_str);
+                if record.is_none() {
+                    eprintln!("host-lifecycle: --record needs an <id|ordinal>");
+                    process::exit(2);
+                }
+                i += 1;
+            }
+            "--unverified" => {
+                unverified = args.get(i + 1).map(String::as_str);
+                if unverified.is_none() {
+                    eprintln!("host-lifecycle: --unverified needs a call/NNNN citation");
+                    process::exit(2);
+                }
+                i += 1;
+            }
             s if s.starts_with("--") => {
                 eprintln!("host-lifecycle: unknown upgrade flag {s}");
                 process::exit(2);
             }
             s => dir = s,
         }
+        i += 1;
     }
     let root = match fs::canonicalize(Path::new(dir)) {
         Ok(p) => p,
@@ -2184,7 +2256,7 @@ fn upgrade(args: &[String]) {
                 process::exit(2);
             };
             let migrated = set_stamp_field(&stamp, "baseline", &b);
-            if let Err(e) = fs::write(root.join(STAMP), &migrated) {
+            if let Err(e) = write_atomic(&root.join(STAMP), &migrated) {
                 eprintln!("host-lifecycle: cannot write migrated {STAMP}: {e}");
                 process::exit(2);
             }
@@ -2210,6 +2282,58 @@ fn upgrade(args: &[String]) {
     }
     if inconsistent {
         process::exit(1);
+    }
+
+    // --record <id|ordinal>: record a *verified* claim that an entry was applied
+    // (plan/0022 step 4). The tool validates the id, gates on dependencies, runs the
+    // entry's `verify` post-condition (or demands an explicit `--unverified call/NNNN`
+    // citation when it has none), and appends an append-only provenance line — so a
+    // low-reliability agent never hand-edits the stamp and a bare claim cannot bury work.
+    if let Some(input) = record {
+        let id = match resolve_ledger_id(input, &ledger_ids) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("host-lifecycle: --record {input}: {e}");
+                process::exit(2);
+            }
+        };
+        let entry = entries.iter().find(|e| e.revision == id).expect("resolved id is a ledger entry");
+        if is_applied(&id) {
+            println!("already applied: {} ({})", short(&id), entry.title);
+            return;
+        }
+        let unmet: Vec<String> = entry.depends.iter().filter(|d| !is_applied(d)).map(|d| short(d).to_string()).collect();
+        if !unmet.is_empty() {
+            eprintln!("host-lifecycle: refuse — {} depends on unapplied {}", short(&id), unmet.join(" "));
+            process::exit(1);
+        }
+        let via = if !entry.verify.is_empty() {
+            if !run_verify(&root, &entry.verify) {
+                eprintln!("host-lifecycle: refuse — the verify post-condition for {} failed: {}", short(&id), entry.verify);
+                process::exit(1);
+            }
+            "verify".to_string()
+        } else {
+            let Some(cite) = unverified else {
+                eprintln!("host-lifecycle: refuse — {} declares no `verify`; recording an unverifiable claim needs `--unverified call/NNNN` (a decision authorizing it)", short(&id));
+                process::exit(1);
+            };
+            if !cited_decision_exists(&root, cite) {
+                eprintln!("host-lifecycle: refuse — cited decision {cite} not found under call/");
+                process::exit(1);
+            }
+            cite.to_string()
+        };
+        // Append-only provenance on the current (possibly just-migrated) stamp.
+        let cur = fs::read_to_string(root.join(STAMP)).unwrap_or_else(|_| stamp.clone());
+        let new = append_stamp_line(&cur, &format!("applied = {} recorded={} via={}", id, today(), via));
+        if let Err(e) = write_atomic(&root.join(STAMP), &new) {
+            eprintln!("host-lifecycle: cannot write {STAMP}: {e}");
+            process::exit(2);
+        }
+        let remaining = entries.iter().filter(|e| e.revision != id && !is_applied(&e.revision)).count();
+        println!("recorded {} ({}) via {}; {} still pending", short(&id), entry.title, via, remaining);
+        return;
     }
 
     let pending: Vec<&Upgrade> = entries.iter().filter(|e| !is_applied(&e.revision)).collect();
@@ -2270,6 +2394,7 @@ fn parse_upgrading(text: &str) -> Vec<Upgrade> {
                 requires: String::new(),
                 independent: false,
                 depends: Vec::new(),
+                verify: String::new(),
             });
             continue;
         }
@@ -2286,6 +2411,7 @@ fn parse_upgrading(text: &str) -> Vec<Upgrade> {
             "requires" => cur.requires = val.to_string(),
             "independent" => cur.independent = val.eq_ignore_ascii_case("true"),
             "depends" => cur.depends = val.split_whitespace().map(String::from).collect(),
+            "verify" => cur.verify = val.to_string(),
             _ => {}
         }
     }
@@ -3793,7 +3919,7 @@ mod book_tests {
     fn validate_ledger_flags_dependency_problems() {
         let mk = |rev: &str, indep: bool, deps: &[&str]| Upgrade {
             revision: rev.into(), title: String::new(), action: String::new(), requires: String::new(),
-            independent: indep, depends: deps.iter().map(|s| s.to_string()).collect(),
+            independent: indep, depends: deps.iter().map(|s| s.to_string()).collect(), verify: String::new(),
         };
         // clean: A independent, B depends on A
         assert!(validate_ledger(&[mk("A", true, &[]), mk("B", false, &["A"])]).is_empty());
@@ -3831,6 +3957,19 @@ mod book_tests {
         assert_eq!(derive_baseline(&base, &ledger, &c3).as_deref(), Some(c3.as_str()));
         assert_eq!(derive_baseline(&base, &ledger, &c4).as_deref(), Some(c4.as_str()));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_ledger_id_takes_ordinal_exact_or_unique_prefix() {
+        let ids: Vec<String> = ["b6232a5", "c771d60", "7de7cb1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(resolve_ledger_id("2", &ids).unwrap(), "c771d60"); // 1-based ordinal
+        assert_eq!(resolve_ledger_id("7de7cb1", &ids).unwrap(), "7de7cb1"); // exact
+        assert_eq!(resolve_ledger_id("7de7", &ids).unwrap(), "7de7cb1"); // unique prefix
+        assert!(resolve_ledger_id("0", &ids).is_err()); // ordinals are 1-based
+        assert!(resolve_ledger_id("9", &ids).is_err()); // out of range
+        assert!(resolve_ledger_id("zzzz", &ids).is_err()); // unknown
+        let ambig: Vec<String> = ["abcd111", "abcd222"].iter().map(|s| s.to_string()).collect();
+        assert!(resolve_ledger_id("abcd", &ambig).is_err()); // ambiguous prefix → refuse, not guess
     }
 
     #[test]
