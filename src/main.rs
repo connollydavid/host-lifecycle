@@ -395,6 +395,31 @@ fn append_stamp_line(text: &str, line: &str) -> String {
     s
 }
 
+/// Remove the `applied = <id> …` lines whose id is in `ids`, preserving every other
+/// line. Used by baseline-advance to drop ids it has absorbed into the contiguous
+/// baseline — a deliberate compaction (the entries stay applied via the baseline),
+/// not a silent rewrite of a live claim.
+fn remove_applied_lines(text: &str, ids: &[String]) -> String {
+    let trailing = text.ends_with('\n');
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let is_absorbed = l
+                .trim_start()
+                .strip_prefix("applied")
+                .and_then(|r| r.trim_start().strip_prefix('='))
+                .and_then(stamp_value_after_eq)
+                .is_some_and(|id| ids.iter().any(|x| x == &id));
+            !is_absorbed
+        })
+        .collect();
+    let mut s = kept.join("\n");
+    if trailing {
+        s.push('\n');
+    }
+    s
+}
+
 /// Read a MADR header field (`- Status: accepted`, `Scope: x`) from a decision body.
 fn decision_field(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
@@ -2177,12 +2202,14 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
 fn upgrade(args: &[String]) {
     let mut dir = ".";
     let mut next_only = false;
+    let mut advance = false;
     let mut record: Option<&str> = None;
     let mut unverified: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--next" => next_only = true,
+            "--advance" => advance = true,
             "--record" => {
                 record = args.get(i + 1).map(String::as_str);
                 if record.is_none() {
@@ -2333,6 +2360,45 @@ fn upgrade(args: &[String]) {
         }
         let remaining = entries.iter().filter(|e| e.revision != id && !is_applied(&e.revision)).count();
         println!("recorded {} ({}) via {}; {} still pending", short(&id), entry.title, via, remaining);
+        return;
+    }
+
+    // --advance: move the baseline forward over a contiguous run of already-applied
+    // entries and absorb their now-redundant `applied` lines (plan/0022 step 5). The
+    // guard is structural: it only ever advances across entries that are applied, so
+    // it can never sweep an unapplied entry into the baseline.
+    if advance {
+        let pos = |x: &str| ledger_ids.iter().position(|e| e == x);
+        let Some(cur) = pos(&baseline) else {
+            eprintln!("host-lifecycle: baseline {} is not a ledger entry", short(&baseline));
+            process::exit(1);
+        };
+        let mut new_pos = cur;
+        for (p, id) in ledger_ids.iter().enumerate().skip(cur + 1) {
+            if is_applied(id) {
+                new_pos = p;
+            } else {
+                break;
+            }
+        }
+        if new_pos == cur {
+            println!("baseline already at the furthest contiguous-applied entry ({})", short(&baseline));
+            return;
+        }
+        let new_baseline = ledger_ids[new_pos].clone();
+        let absorbed: Vec<String> = applied
+            .iter()
+            .filter(|a| matches!(pos(a), Some(i) if i <= new_pos))
+            .cloned()
+            .collect();
+        let cur_stamp = fs::read_to_string(root.join(STAMP)).unwrap_or_else(|_| stamp.clone());
+        let s = set_stamp_field(&cur_stamp, "baseline", &new_baseline);
+        let s = remove_applied_lines(&s, &absorbed);
+        if let Err(e) = write_atomic(&root.join(STAMP), &s) {
+            eprintln!("host-lifecycle: cannot write {STAMP}: {e}");
+            process::exit(2);
+        }
+        println!("advanced baseline {} -> {}; absorbed {} applied id(s)", short(&baseline), short(&new_baseline), absorbed.len());
         return;
     }
 
@@ -3970,6 +4036,19 @@ mod book_tests {
         assert!(resolve_ledger_id("zzzz", &ids).is_err()); // unknown
         let ambig: Vec<String> = ["abcd111", "abcd222"].iter().map(|s| s.to_string()).collect();
         assert!(resolve_ledger_id("abcd", &ambig).is_err()); // ambiguous prefix → refuse, not guess
+    }
+
+    #[test]
+    fn remove_applied_lines_drops_only_absorbed_ids() {
+        let t = "template = \"x\"\nbaseline = \"b\"\n\
+                 applied = d3dc5ed recorded=2026-06-19 via=call/0042\n\
+                 applied = 7de7cb1 recorded=2026-06-19 via=verify\n\
+                 name = \"demo\"\n";
+        let out = remove_applied_lines(t, &["d3dc5ed".to_string()]);
+        assert!(!out.contains("d3dc5ed")); // absorbed → dropped
+        assert!(out.contains("7de7cb1")); // not absorbed → kept
+        assert!(out.contains("name = \"demo\"")); // unrelated lines preserved
+        assert!(out.contains("baseline = \"b\""));
     }
 
     #[test]
