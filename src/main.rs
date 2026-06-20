@@ -206,23 +206,29 @@ fn adopt(args: &[String]) {
         println!("write  {STAMP} (revision {revision})");
     }
 
-    print_adopt_checklist();
+    print_adopt_checklist(revision);
 }
 
 /// Print the post-`adopt` checklist. `adopt` scaffolds rooms and the stamp only;
-/// wiring the verification tools and installing the hooks is manual work with no
-/// other prompt, so spell it out (`(name, url)` per tool, pinned at this revision).
-fn print_adopt_checklist() {
+/// registering the template + verification tools and installing the hooks is manual
+/// work with no other prompt, so spell it out. The template submodule is step 1: the
+/// `upgrade` phase reads `UPGRADING.md` from it, so an adoption that skips it makes
+/// the very next phase fail with no ledger to read.
+fn print_adopt_checklist(revision: &str) {
     println!("\nnext steps (adopt scaffolds rooms + the stamp only):");
-    println!("  1. wire the verification tools as submodules, each pinned to the commit");
+    println!("  1. register the methodology template as a submodule at the adopted");
+    println!("     revision — `upgrade` reads its `UPGRADING.md` ledger:");
+    println!("       git submodule add {TEMPLATE_URL} host-template");
+    println!("       (cd host-template && git checkout {revision})");
+    println!("  2. wire the verification tools as submodules, each pinned to the commit");
     println!("     the template references at this revision:");
     for (name, url) in TOOL_SUBMODULES {
         println!("       git submodule add {url} tools/{name}");
     }
-    println!("  2. embed the software in the Where slot (.host-software), record a");
+    println!("  3. embed the software in the Where slot (.host-software), record a");
     println!("     `hooks` and `artifact` for the gating tool, and run:");
     println!("       host-lifecycle software --materialize .");
-    println!("  3. build the gating tool, then install its commit hooks + binary:");
+    println!("  4. build the gating tool, then install its commit hooks + binary:");
     println!("       host-lifecycle software --install-hooks .");
 }
 
@@ -2382,7 +2388,12 @@ fn upgrade(args: &[String]) {
         }
     };
     let Some(template) = find_template_dir(&root) else {
-        eprintln!("host-lifecycle: cannot find the template submodule (none carries UPGRADING.md)");
+        eprintln!("host-lifecycle: cannot find the template — `upgrade` reads UPGRADING.md from");
+        eprintln!("  <root>/host-template/ or a registered submodule carrying it. Register it,");
+        eprintln!("  then check it out at the revision you are upgrading to:");
+        eprintln!("    git submodule add {TEMPLATE_URL} host-template");
+        eprintln!("    (cd host-template && git checkout <target-revision>)");
+        eprintln!("  (if you adopted from a fork, use the `template =` URL recorded in {STAMP})");
         process::exit(2);
     };
     let text = match fs::read_to_string(template.join("UPGRADING.md")) {
