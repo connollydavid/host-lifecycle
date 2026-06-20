@@ -1803,6 +1803,8 @@ fn software_check(root: &Path, recipe: &[Software]) {
     }
     // Re-check every recorded upgrade claim against the ledger (plan/0022 step 6).
     bad += upgrade_claim_problems(root);
+    // #12: a spec under plan/*/spec/ evades the mandatory lanes — co-locate it with software.
+    bad += plan_spec_problems(root);
     if bad > 0 {
         eprintln!("-- {bad} item(s) need attention");
         process::exit(1);
@@ -2154,6 +2156,7 @@ fn obligations(args: &[String]) {
     let mut manifest_arg: Option<&String> = None;
     let mut tests_arg: Option<&String> = None;
     let mut prove_arg: Option<&String> = None;
+    let mut rederive_arg: Option<&String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2169,12 +2172,16 @@ fn obligations(args: &[String]) {
                 prove_arg = args.get(i + 1);
                 i += 1;
             }
+            "--rederive" => {
+                rederive_arg = args.get(i + 1);
+                i += 1;
+            }
             _ => pos.push(&args[i]),
         }
         i += 1;
     }
     let Some(spec) = pos.first() else {
-        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>] [--prove <dir>]");
+        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>] [--prove <dir>] [--rederive <dir>]");
         process::exit(2);
     };
     let spec_path = Path::new(spec.as_str());
@@ -2209,16 +2216,22 @@ fn obligations(args: &[String]) {
     };
     let tests = tests_arg.map(|d| read_dir_recursive(Path::new(d.as_str())));
     let prove = prove_arg.map(|d| read_dir_recursive(Path::new(d.as_str())));
-    // 3. Every obligation dispositioned; no stale dispositions; test/proof refs exist.
-    let problems = obligation_gaps(&plan_ids, &dispositions, tests.as_deref(), prove.as_deref());
+    // 3. Every obligation dispositioned; no stale dispositions; test/proof refs present (a
+    //    presence *lint*, not discharge — #8). With `--rederive`, each rung's verifier is
+    //    re-run via host-prove and must PASS at its bound (the real discharge, `call/0018`).
+    let mut problems = obligation_gaps(&plan_ids, &dispositions, tests.as_deref(), prove.as_deref());
+    if let Some(d) = rederive_arg {
+        problems.extend(rederive_problems(&dispositions, Path::new(d.as_str())));
+    }
     for p in &problems {
         println!("{p}");
     }
     if !problems.is_empty() {
-        eprintln!("-- {} obligation(s) undispositioned, stale, or missing a test ({})", problems.len(), manifest.display());
+        eprintln!("-- {} obligation(s) undispositioned, stale, missing a test, or UNPROVEN ({})", problems.len(), manifest.display());
         process::exit(1);
     }
-    println!("-- all {} obligation(s) dispositioned", plan_ids.len());
+    let mode = if rederive_arg.is_some() { "dispositioned; rungs re-derived" } else { "dispositioned" };
+    println!("-- all {} obligation(s) {mode}", plan_ids.len());
 }
 
 /// The disposition gaps between the derived obligations and the manifest:
@@ -2263,6 +2276,164 @@ fn obligation_gaps(
         }
     }
     problems
+}
+
+/// A deep-verification rung disposition: `<tool>:<name> [bound=<b>] [spec=<file>]`,
+/// e.g. `kani:verify_x bound=unwind=20` or `apalache:Inv spec=Scan.tla bound=length=12`.
+struct Rung {
+    tool: String,           // kani | apalache | tlaps
+    name: String,           // harness | invariant | module
+    bound: Option<String>,  // host-prove bound string, e.g. "unwind=20" / "length=12"
+    spec: Option<String>,   // apalache/tlaps spec/module file (relative to the --rederive dir)
+}
+
+/// Parse a rung disposition; `None` if it is not a `kani:`/`apalache:`/`tlaps:` one.
+fn parse_rung(disp: &str) -> Option<Rung> {
+    let mut toks = disp.split_whitespace();
+    let (tool, name) = toks.next()?.split_once(':')?;
+    if !["kani", "apalache", "tlaps"].contains(&tool) || name.is_empty() {
+        return None;
+    }
+    let mut rung = Rung { tool: tool.into(), name: name.into(), bound: None, spec: None };
+    for t in toks {
+        if let Some(v) = t.strip_prefix("bound=") {
+            rung.bound = Some(v.to_string());
+        } else if let Some(v) = t.strip_prefix("spec=") {
+            rung.spec = Some(v.to_string());
+        }
+    }
+    Some(rung)
+}
+
+/// The numeric magnitude of a bound like `unwind=20` / `length=12`; `unbounded` is the max.
+fn bound_value(b: &str) -> Option<u64> {
+    if b == "unbounded" {
+        return Some(u64::MAX);
+    }
+    b.rsplit('=').next()?.trim().parse().ok()
+}
+
+/// Does a host-prove verdict line **discharge** this rung (`call/0018`)? Require the tool's
+/// PASS word, and — for a bounded tool with a declared bound — that the verdict's bound is at
+/// least the declared one. Returns `Err(reason)` on a non-discharge. Pure, so it is unit-tested.
+fn verdict_discharges(rung: &Rung, verdict: &str) -> Result<(), String> {
+    let pass_word = match rung.tool.as_str() {
+        "kani" => "SUCCESSFUL",
+        "apalache" => "PROVEN",
+        "tlaps" => "ALL-PROVED",
+        other => return Err(format!("unknown rung tool `{other}`")),
+    };
+    if !verdict.starts_with(pass_word) {
+        return Err(format!("not a PASS ({pass_word}): {verdict}"));
+    }
+    let Some(declared) = &rung.bound else {
+        return Ok(());
+    };
+    // Compare the verdict's `[bound=…]` against the declared bound. TLAPS carries
+    // `[unbounded]` and never needs a numeric bound.
+    match verdict.split_once("[bound=").and_then(|(_, r)| r.split(']').next()) {
+        Some("unspecified") => Err(format!("declared bound {declared} but the verdict bound is unspecified")),
+        Some(got) => match (bound_value(got), bound_value(declared)) {
+            (Some(g), Some(d)) if g >= d => Ok(()),
+            (Some(g), Some(d)) => Err(format!("verdict bound {got} ({g}) < declared {declared} ({d})")),
+            _ => Err(format!("uncomparable bounds: verdict `{got}`, declared `{declared}`")),
+        },
+        None if rung.tool == "tlaps" => Ok(()),
+        None => Err(format!("declared bound {declared} but the verdict carries none: {verdict}")),
+    }
+}
+
+/// Re-run a rung's verifier via `host-prove` in `dir` and return its one verdict line.
+/// host-prove must be on PATH (the verify lane installs it); the verifier is its subprocess.
+fn run_host_prove(rung: &Rung, dir: &Path) -> Result<String, String> {
+    let dir_s = dir.to_string_lossy().to_string();
+    let mut cmd = process::Command::new("host-prove");
+    match rung.tool.as_str() {
+        "kani" => {
+            cmd.args(["kani", "--harness", &rung.name, "--dir", &dir_s]);
+        }
+        "apalache" => {
+            let spec = rung.spec.as_ref().ok_or_else(|| format!("apalache:{} needs `spec=<file>`", rung.name))?;
+            cmd.args(["apalache", "--mode", "check", "--inv", &rung.name, "--spec"]).arg(dir.join(spec));
+        }
+        "tlaps" => {
+            let spec = rung.spec.clone().unwrap_or_else(|| format!("{}.tla", rung.name));
+            cmd.args(["tlaps", "--module"]).arg(dir.join(spec));
+        }
+        other => return Err(format!("unknown rung tool `{other}`")),
+    }
+    if let Some(b) = &rung.bound {
+        cmd.args(["--bound", b]);
+    }
+    match cmd.output() {
+        Ok(o) => {
+            let line = String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string();
+            if line.is_empty() {
+                Err(format!("host-prove produced no verdict (on PATH? {})", String::from_utf8_lossy(&o.stderr).trim()))
+            } else {
+                Ok(line)
+            }
+        }
+        Err(e) => Err(format!("could not run host-prove (install it on PATH): {e}")),
+    }
+}
+
+/// `--rederive` (`call/0018`): the real discharge. Re-run every rung disposition's verifier and
+/// require it to PASS at its declared bound — replacing name-presence (`#8`). `UNPROVEN` per gap.
+fn rederive_problems(dispositions: &[(String, String)], dir: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (id, disp) in dispositions {
+        let Some(rung) = parse_rung(disp) else {
+            continue;
+        };
+        match run_host_prove(&rung, dir).and_then(|v| verdict_discharges(&rung, &v).map(|()| v)) {
+            Ok(v) => println!("proved   {id} — {}", v.trim()),
+            Err(reason) => problems.push(format!("UNPROVEN {id} — {reason}")),
+        }
+    }
+    problems
+}
+
+/// Collect spec files (`.allium`/`.tla`/`.cfg`) under `dir`, recursively.
+fn collect_spec_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_spec_files(&p, out);
+            } else if matches!(p.extension().and_then(|x| x.to_str()), Some("allium" | "tla" | "cfg")) {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// `#12` (specs co-locate with software, plan/0012): a spec under `plan/*/spec/` evades the
+/// mandatory lanes, which run in the software repo — so it is a HAZARD. The spec belongs with
+/// its software, not in the host's plan room. Returns the count of offending spec files.
+fn plan_spec_problems(root: &Path) -> usize {
+    let plan = root.join("plan");
+    let Ok(milestones) = fs::read_dir(&plan) else {
+        return 0;
+    };
+    let mut bad = 0;
+    for m in milestones.flatten() {
+        let spec_dir = m.path().join("spec");
+        if !spec_dir.is_dir() {
+            continue;
+        }
+        let mut specs = Vec::new();
+        collect_spec_files(&spec_dir, &mut specs);
+        for f in specs {
+            let rel = f.strip_prefix(root).unwrap_or(&f);
+            println!(
+                "HAZARD   {} — a spec under plan/*/spec/ evades the mandatory lanes; co-locate it with its software (plan/0012, #12)",
+                rel.display()
+            );
+            bad += 1;
+        }
+    }
+    bad
 }
 
 /// Pull obligation ids from `allium plan` JSON without a JSON dependency: each
@@ -3788,6 +3959,57 @@ mod software_tests {
         // prove sources containing both names → clean
         let src = "fn verify_is_dotted_code() {}\nTHEOREM Safety == TRUE";
         assert!(obligation_gaps(&ids, &m, None, Some(src)).is_empty());
+    }
+
+    // `--rederive` (call/0018): discharge is the verifier PASSING at the declared bound,
+    // re-run via host-prove — not name-presence. The verdict-interpretation is pure.
+    #[test]
+    fn rung_disposition_parses() {
+        let r = parse_rung("kani:verify_x bound=unwind=20").unwrap();
+        assert_eq!((r.tool.as_str(), r.name.as_str(), r.bound.as_deref()), ("kani", "verify_x", Some("unwind=20")));
+        let a = parse_rung("apalache:Inv spec=Scan.tla bound=length=12").unwrap();
+        assert_eq!((a.tool.as_str(), a.name.as_str(), a.spec.as_deref(), a.bound.as_deref()), ("apalache", "Inv", Some("Scan.tla"), Some("length=12")));
+        assert!(parse_rung("test:some_test").is_none());
+        assert!(parse_rung("structural").is_none());
+    }
+
+    #[test]
+    fn verdict_discharges_only_on_pass_at_bound() {
+        let kani = parse_rung("kani:verify_x bound=unwind=20").unwrap();
+        // PASS at an adequate bound → discharged
+        assert!(verdict_discharges(&kani, "SUCCESSFUL verify_x [bound=unwind=20]").is_ok());
+        assert!(verdict_discharges(&kani, "SUCCESSFUL verify_x [bound=unwind=40]").is_ok());
+        // a real negative / error verdict → NOT discharged (the #8 bug: name-presence would pass)
+        assert!(verdict_discharges(&kani, "FAILED verify_x (replay: …)").is_err());
+        assert!(verdict_discharges(&kani, "ERROR verify_x: cargo kani could not run").is_err());
+        // PASS but UNDER the declared bound → not discharged (#9)
+        assert!(verdict_discharges(&kani, "SUCCESSFUL verify_x [bound=unwind=10]").is_err());
+        // PASS but bound unspecified though one was declared → not discharged (#9)
+        assert!(verdict_discharges(&kani, "SUCCESSFUL verify_x [bound=unspecified]").is_err());
+        // no declared bound → PASS word alone suffices
+        let nob = parse_rung("kani:verify_x").unwrap();
+        assert!(verdict_discharges(&nob, "SUCCESSFUL verify_x [bound=unspecified]").is_ok());
+        // apalache PROVEN / tlaps ALL-PROVED [unbounded]
+        let ap = parse_rung("apalache:Inv bound=length=12").unwrap();
+        assert!(verdict_discharges(&ap, "PROVEN Inv [bound=length=12]").is_ok());
+        assert!(verdict_discharges(&ap, "VIOLATED Inv (counterexample: x.tla)").is_err());
+        let tl = parse_rung("tlaps:Safety").unwrap();
+        assert!(verdict_discharges(&tl, "ALL-PROVED Safety (3 obligations) [unbounded]").is_ok());
+        assert!(verdict_discharges(&tl, "FAILED Safety: 1/3 (first: 9:1:9:5)").is_err());
+    }
+
+    // #12: a spec under plan/*/spec/ is a HAZARD (specs co-locate with software).
+    #[test]
+    fn plan_spec_under_spec_dir_hazards() {
+        let base = std::env::temp_dir().join(format!("hl-planspec-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("plan/0099-x/spec")).unwrap();
+        fs::create_dir_all(base.join("plan/0098-y")).unwrap();
+        fs::write(base.join("plan/0099-x/spec/Foo.tla"), "---- MODULE Foo ----").unwrap();
+        fs::write(base.join("plan/0099-x/README.md"), "ok").unwrap(); // not a spec, not under spec/
+        fs::write(base.join("plan/0098-y/README.md"), "ok").unwrap(); // milestone with no spec/ dir
+        assert_eq!(plan_spec_problems(&base), 1);
+        let _ = fs::remove_dir_all(&base);
     }
 
     // A `hooks` key parses into the optional hook-script path.
