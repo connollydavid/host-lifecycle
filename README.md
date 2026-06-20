@@ -30,6 +30,16 @@ under the methodology (see the template's `MIGRATION.md`):
 `adopt` is idempotent (existing rooms are left untouched) and takes `--dry-run`
 to preview. It records the adopted template revision in a `.host` stamp
 at the repo root, so a later upgrade knows exactly which revision to diff from.
+It also seeds a comment-only `LEXICON` scaffold (skipped if one exists) that
+documents host-lint's allowlist format and how to opt into strict / jira-key
+gating — no active directive, so adoption never blocks an existing repo.
+
+The `obligations` checker gains an offline **input-digest staleness** signal: a
+rung disposition may declare `inputs=<files>` (the sources its proof consumes);
+`--rederive --record-digests` fingerprints them with `git hash-object` into a
+committed `<manifest>.digests` ledger, and a later offline `obligations` run
+reports `STALE` if those inputs changed without a fresh re-derivation. The cheap
+hook signal that a proof's inputs drifted, without re-running the verifier.
 
 ## Remap — the enforced adoption rename
 

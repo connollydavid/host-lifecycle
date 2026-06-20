@@ -206,7 +206,44 @@ fn adopt(args: &[String]) {
         println!("write  {STAMP} (revision {revision})");
     }
 
+    seed_lexicon(root, dry);
     print_adopt_checklist(revision);
+}
+
+/// The starter `LEXICON` seeded at adoption: a comment-only scaffold documenting
+/// the format and how to opt into strict / jira-key gating (issue #13). No entries
+/// and no active directive, so it never blocks an existing repo — the operator
+/// audits (`host-lint --all`) and curates with `host-lint lexicon add`. The example
+/// tokens use all-caps version designators (`NT 3.1`), which host-lint recognises as
+/// version strings, so the scaffold itself never trips the linter.
+const LEXICON_SEED: &str = "\
+# LEXICON — sanctioned tell-shaped tokens for host-lint (see the host-lint README).
+# One entry per line is the full contextual phrase that legitimizes a token
+# (a version string like NT 3.1, a product like COM1), masked before detection;
+# a tracker reference carries its URL on the same line (#7 then the link).
+#
+# Do NOT hand-author entries — the tool owns every decision:
+#   host-lint lexicon add \"<phrase>\" [--url <url>]
+#
+# After auditing the repo (host-lint --all) and curating the legitimate tokens,
+# opt into escalation by adding one of these directive lines (drop the leading #):
+#   host-lint: strict            an undeclared tell-shaped token blocks, not warns
+#   host-lint: jira-key PROJ     gate a tracker key: PROJ-NNNN entries need a URL
+";
+
+/// Seed the LEXICON scaffold at the host root, skipping if one already exists.
+fn seed_lexicon(root: &Path, dry: bool) {
+    let p = root.join("LEXICON");
+    if p.exists() {
+        println!("skip   LEXICON (exists)");
+    } else if dry {
+        println!("write  LEXICON (scaffold) (dry-run)");
+    } else if let Err(e) = fs::write(&p, LEXICON_SEED) {
+        eprintln!("host-lifecycle: cannot write {}: {e}", p.display());
+        process::exit(2);
+    } else {
+        println!("write  LEXICON (scaffold)");
+    }
 }
 
 /// Print the post-`adopt` checklist. `adopt` scaffolds rooms and the stamp only;
@@ -2157,6 +2194,7 @@ fn obligations(args: &[String]) {
     let mut tests_arg: Option<&String> = None;
     let mut prove_arg: Option<&String> = None;
     let mut rederive_arg: Option<&String> = None;
+    let mut record_digests_flag = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2176,14 +2214,19 @@ fn obligations(args: &[String]) {
                 rederive_arg = args.get(i + 1);
                 i += 1;
             }
+            "--record-digests" => record_digests_flag = true,
             _ => pos.push(&args[i]),
         }
         i += 1;
     }
     let Some(spec) = pos.first() else {
-        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>] [--prove <dir>] [--rederive <dir>]");
+        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>] [--prove <dir>] [--rederive <dir>] [--record-digests]");
         process::exit(2);
     };
+    if record_digests_flag && rederive_arg.is_none() {
+        eprintln!("host-lifecycle: --record-digests requires --rederive (only a passing proof is recorded)");
+        process::exit(2);
+    }
     let spec_path = Path::new(spec.as_str());
     let manifest = match manifest_arg {
         Some(m) => PathBuf::from(m.as_str()),
@@ -2220,8 +2263,27 @@ fn obligations(args: &[String]) {
     //    presence *lint*, not discharge — #8). With `--rederive`, each rung's verifier is
     //    re-run via host-prove and must PASS at its bound (the real discharge, `call/0018`).
     let mut problems = obligation_gaps(&plan_ids, &dispositions, tests.as_deref(), prove.as_deref());
+    let ledger = digest_ledger_path(&manifest);
     if let Some(d) = rederive_arg {
-        problems.extend(rederive_problems(&dispositions, Path::new(d.as_str())));
+        let rederive_dir = Path::new(d.as_str());
+        let rd = rederive_problems(&dispositions, rederive_dir);
+        // 4. With --record-digests, fingerprint each rung's inputs — but only after a
+        //    clean re-derivation, so the recorded digest always tracks a passing proof.
+        if record_digests_flag {
+            if rd.is_empty() {
+                match record_digests(&dispositions, rederive_dir, &ledger) {
+                    Ok(n) => println!("recorded {n} input digest(s) -> {}", ledger.display()),
+                    Err(e) => problems.push(format!("DIGEST   {e}")),
+                }
+            } else {
+                problems.push("DIGEST   --record-digests skipped: not every rung re-derived".to_string());
+            }
+        }
+        problems.extend(rd);
+    } else {
+        // Offline: the cheap input-digest staleness signal (no verifier needed).
+        let base = manifest.parent().unwrap_or(Path::new("."));
+        problems.extend(staleness_problems(&dispositions, base, &ledger));
     }
     for p in &problems {
         println!("{p}");
@@ -2285,6 +2347,7 @@ struct Rung {
     name: String,           // harness | invariant | module
     bound: Option<String>,  // host-prove bound string, e.g. "unwind=20" / "length=12"
     spec: Option<String>,   // apalache/tlaps spec/module file (relative to the --rederive dir)
+    inputs: Vec<String>,    // files the proof consumes — the offline staleness signal (call/0018)
 }
 
 /// Parse a rung disposition; `None` if it is not a `kani:`/`apalache:`/`tlaps:` one.
@@ -2294,12 +2357,14 @@ fn parse_rung(disp: &str) -> Option<Rung> {
     if !["kani", "apalache", "tlaps"].contains(&tool) || name.is_empty() {
         return None;
     }
-    let mut rung = Rung { tool: tool.into(), name: name.into(), bound: None, spec: None };
+    let mut rung = Rung { tool: tool.into(), name: name.into(), bound: None, spec: None, inputs: Vec::new() };
     for t in toks {
         if let Some(v) = t.strip_prefix("bound=") {
             rung.bound = Some(v.to_string());
         } else if let Some(v) = t.strip_prefix("spec=") {
             rung.spec = Some(v.to_string());
+        } else if let Some(v) = t.strip_prefix("inputs=") {
+            rung.inputs = v.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
         }
     }
     Some(rung)
@@ -2392,6 +2457,94 @@ fn rederive_problems(dispositions: &[(String, String)], dir: &Path) -> Vec<Strin
         }
     }
     problems
+}
+
+/// The digest ledger path for a manifest: `<manifest>.digests` (e.g.
+/// `host-lint.obligations.digests`). Tool-written by `--record-digests`, committed
+/// next to the manifest as the proof's input fingerprint.
+fn digest_ledger_path(manifest: &Path) -> PathBuf {
+    let mut s = manifest.as_os_str().to_owned();
+    s.push(".digests");
+    PathBuf::from(s)
+}
+
+/// The combined `git hash-object` digest of a rung's declared `inputs`, resolved
+/// relative to `base`. A missing input or a git failure is itself a change signal
+/// (returned as `Err`, surfaced as STALE).
+fn input_digest(inputs: &[String], base: &Path) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for inp in inputs {
+        let p = base.join(inp);
+        let out = process::Command::new("git").arg("hash-object").arg(&p).output()
+            .map_err(|e| format!("git hash-object failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("cannot hash {} ({})", p.display(), String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        parts.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    Ok(parts.join(","))
+}
+
+/// Read the digest ledger into `(obligation-id, digest)` pairs; `#` comments and
+/// blank lines ignored. A missing ledger yields an empty set (the feature is opt-in).
+fn read_digest_ledger(path: &Path) -> Vec<(String, String)> {
+    let Ok(t) = fs::read_to_string(path) else { return Vec::new() };
+    t.lines()
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .filter_map(|l| l.split_once('\t').map(|(a, b)| (a.trim().to_string(), b.trim().to_string())))
+        .collect()
+}
+
+/// Offline staleness (`call/0018`'s cheap signal): a rung whose declared `inputs`
+/// no longer hash to the digest recorded at its last re-derivation is **STALE** —
+/// the proof must be re-run. A rung with no ledger entry yet is a note, not a
+/// failure (it is simply not opted into tracking until `--record-digests`). With no
+/// ledger at all, the check is a no-op.
+fn staleness_problems(dispositions: &[(String, String)], base: &Path, ledger: &Path) -> Vec<String> {
+    let recorded = read_digest_ledger(ledger);
+    if recorded.is_empty() {
+        return Vec::new();
+    }
+    let mut problems = Vec::new();
+    for (id, disp) in dispositions {
+        let Some(rung) = parse_rung(disp) else { continue };
+        if rung.inputs.is_empty() {
+            continue;
+        }
+        let Some((_, want)) = recorded.iter().find(|(rid, _)| rid == id) else {
+            println!("note     {id} — inputs declared but not recorded (run --record-digests)");
+            continue;
+        };
+        match input_digest(&rung.inputs, base) {
+            Ok(got) if &got == want => {}
+            Ok(_) => problems.push(format!("STALE    {id} — inputs changed since last re-derivation; re-derive + --record-digests")),
+            Err(e) => problems.push(format!("STALE    {id} — {e}")),
+        }
+    }
+    problems
+}
+
+/// Write the digest ledger: the `git hash-object` fingerprint of every rung's
+/// declared `inputs`. Called by `--record-digests` only after a clean `--rederive`,
+/// so the recorded fingerprint always corresponds to a passing proof.
+fn record_digests(dispositions: &[(String, String)], base: &Path, ledger: &Path) -> Result<usize, String> {
+    let mut lines = vec![
+        "# host-lifecycle obligations digest ledger (--record-digests).".to_string(),
+        "# <obligation-id>\\t<git hash-object of declared inputs at re-derivation>".to_string(),
+    ];
+    let mut n = 0;
+    for (id, disp) in dispositions {
+        let Some(rung) = parse_rung(disp) else { continue };
+        if rung.inputs.is_empty() {
+            continue;
+        }
+        lines.push(format!("{id}\t{}", input_digest(&rung.inputs, base)?));
+        n += 1;
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    fs::write(ledger, out).map_err(|e| format!("cannot write {}: {e}", ledger.display()))?;
+    Ok(n)
 }
 
 /// Collect spec files (`.allium`/`.tla`/`.cfg`) under `dir`, recursively.
@@ -3971,6 +4124,66 @@ mod software_tests {
         assert_eq!((a.tool.as_str(), a.name.as_str(), a.spec.as_deref(), a.bound.as_deref()), ("apalache", "Inv", Some("Scan.tla"), Some("length=12")));
         assert!(parse_rung("test:some_test").is_none());
         assert!(parse_rung("structural").is_none());
+    }
+
+    #[test]
+    fn rung_parses_inputs_for_staleness() {
+        let r = parse_rung("kani:verify_x bound=unwind=20 inputs=src/lib.rs,src/main.rs").unwrap();
+        assert_eq!(r.inputs, vec!["src/lib.rs".to_string(), "src/main.rs".to_string()]);
+        // No `inputs=` → empty (the staleness signal is opt-in per rung).
+        assert!(parse_rung("kani:verify_x bound=unwind=20").unwrap().inputs.is_empty());
+    }
+
+    #[test]
+    fn digest_ledger_round_trips() {
+        let dir = std::env::temp_dir().join(format!("hl-ledger-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let led = dir.join("m.obligations.digests");
+        fs::write(&led, "# header\n\nrule-success.A\tdeadbeef\nrule-success.B\tcafef00d,1234\n").unwrap();
+        let got = read_digest_ledger(&led);
+        assert_eq!(got, vec![
+            ("rule-success.A".to_string(), "deadbeef".to_string()),
+            ("rule-success.B".to_string(), "cafef00d,1234".to_string()),
+        ]);
+        // A missing ledger is empty (feature off), not an error.
+        assert!(read_digest_ledger(&dir.join("absent.digests")).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staleness_detects_an_input_change() {
+        let dir = std::env::temp_dir().join(format!("hl-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("foo.rs"), "fn a() {}\n").unwrap();
+        let disp = vec![("rule-success.X".to_string(), "kani:h inputs=foo.rs".to_string())];
+        let led = digest_ledger_path(&dir.join("m.obligations"));
+        // Record the fingerprint, then an unchanged check is clean.
+        assert_eq!(record_digests(&disp, &dir, &led).unwrap(), 1);
+        assert!(staleness_problems(&disp, &dir, &led).is_empty(), "fresh record must not be stale");
+        // Change the proven input → STALE.
+        fs::write(dir.join("foo.rs"), "fn b() {}\n").unwrap();
+        let probs = staleness_problems(&disp, &dir, &led);
+        assert_eq!(probs.len(), 1, "{probs:?}");
+        assert!(probs[0].contains("STALE"), "{probs:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_lexicon_writes_a_warn_free_scaffold() {
+        let dir = std::env::temp_dir().join(format!("hl-seed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        seed_lexicon(&dir, false);
+        let body = fs::read_to_string(dir.join("LEXICON")).unwrap();
+        assert!(body.contains("host-lint: strict"));
+        assert!(body.contains("host-lint: jira-key PROJ"));
+        // No line is the LIVE strict directive (a `# host-lint: strict` with no
+        // trailing text, which host-lint's loader would honour). The scaffold's
+        // directive lines carry trailing guidance, so seeding never blocks a repo.
+        let live = body.lines().any(|l| l.trim().trim_start_matches('#').trim() == "host-lint: strict");
+        assert!(!live, "scaffold must not enable strict");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
