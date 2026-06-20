@@ -19,6 +19,10 @@ use host_lint::{is_ci_file, is_scannable, path_ignored, scan_text_with_allow, Ma
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/host-template";
 /// The migration stamp: records which template revision a repo adopted.
 const STAMP: &str = ".host";
+/// The lifecycle manifest (plan/0025): the single tool-readable journal of the
+/// phase order + modality, in the template root, replacing the three prose copies.
+/// One `[phase "<name>"]` stanza per phase, same git-config style as `.host-software`.
+const MANIFEST: &str = "lifecycle.manifest";
 /// The rooms `adopt` scaffolds (Where = the software submodule, added by hand).
 const ROOMS: [&str; 3] = ["cast", "plan", "call"];
 
@@ -46,8 +50,9 @@ fn main() {
         Some("upgrade") => upgrade(&args[2..]),
         Some("book") => book(&args[2..]),
         Some("obligations") => obligations(&args[2..]),
+        Some("manifest") => manifest(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -63,6 +68,7 @@ fn main() {
             eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
             eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
             eprintln!("  obligations <spec.allium>     — every `allium plan` obligation is dispositioned in <stem>.obligations");
+            eprintln!("  manifest --check <path>       — the lifecycle manifest is well-formed (orders unique, requires resolve)");
             process::exit(2);
         }
     }
@@ -3702,6 +3708,203 @@ fn humanize(s: &str) -> String {
     s.replace(['-', '_'], " ")
 }
 
+// ---- Lifecycle manifest (plan/0025) ----------------------------------------
+//
+// The manifest is the single tool-readable journal of the lifecycle: one
+// `[phase "<name>"]` stanza per phase, in the template root, replacing the three
+// prose copies (CLAUDE.md / STRUCTURE.md / UPGRADING.md). `host-lifecycle` reads it
+// for phase order, `--next`, the `book` lifecycle ordering, and the receipt gate;
+// an agent reads it to see the whole lifecycle at a glance.
+
+/// One lifecycle phase. `modality` is first-class so the spine's rule becomes
+/// "every phase emits a receipt," not "every phase runs" (plan/0025 Decision A).
+struct Phase {
+    name: String,
+    order: usize,
+    /// Comma-separated modality tokens — e.g. `unconditional`,
+    /// `conditional-on-Where`, `recurring-per-component`.
+    modality: Vec<String>,
+    command: Option<String>,
+    skill: Option<String>,
+    evidence: Option<String>,
+    /// Phase names that must be `done` before this one (e.g. `release` requires
+    /// `verify`); a dependency must sit at a lower `order`.
+    requires: Vec<String>,
+    /// R2 protected core: `skippable = false` refuses a `skip`/`n-a` receipt outright
+    /// (`verify` and anything a green gate depends on). Defaults true.
+    skippable: bool,
+}
+
+impl Phase {
+    /// `recurring-per-component`: the phase runs (and is receipted) once per software
+    /// component (embed/release), not once for the project.
+    fn recurring(&self) -> bool {
+        self.modality.iter().any(|m| m == "recurring-per-component")
+    }
+
+    /// `conditional-on-<X>` → `Some("<X>")`: the phase applies only when the project
+    /// has X (e.g. `conditional-on-Where` = only with a software room). A phase that
+    /// does not apply is `n-a`, tool-computed from project state, never agent-asserted.
+    fn conditional_on(&self) -> Option<&str> {
+        self.modality.iter().find_map(|m| m.strip_prefix("conditional-on-"))
+    }
+}
+
+/// Parse a `lifecycle.manifest` (git-config style, mirrors `parse_software`): one
+/// `[phase "<name>"]` stanza, then `key = val` lines. A bad `order` records 0 and is
+/// surfaced by `manifest --check`; unknown keys are ignored (forward-compatible).
+fn parse_manifest(text: &str) -> Vec<Phase> {
+    let mut out: Vec<Phase> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = t.strip_prefix("[phase \"").and_then(|r| r.strip_suffix("\"]")) {
+            out.push(Phase {
+                name: name.to_string(),
+                order: 0,
+                modality: Vec::new(),
+                command: None,
+                skill: None,
+                evidence: None,
+                requires: Vec::new(),
+                skippable: true,
+            });
+            continue;
+        }
+        let Some((key, val)) = t.split_once('=') else {
+            continue;
+        };
+        let (key, val) = (key.trim(), val.trim());
+        let Some(cur) = out.last_mut() else {
+            eprintln!("host-lifecycle: {MANIFEST}:{}: `{key}` before any [phase \"...\"] stanza", i + 1);
+            process::exit(2);
+        };
+        let list = |v: &str| v.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+        match key {
+            "order" => cur.order = val.parse().unwrap_or(0),
+            "modality" => cur.modality = val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            "command" => cur.command = Some(val.to_string()),
+            "skill" => cur.skill = Some(val.to_string()),
+            "evidence" => cur.evidence = Some(val.to_string()),
+            "requires" => cur.requires = list(val),
+            "skippable" => cur.skippable = val != "false",
+            _ => {}
+        }
+    }
+    out
+}
+
+fn manifest(args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("--check") => manifest_check(args.get(1).map(Path::new)),
+        Some(p) => manifest_show(Path::new(p)),
+        None => {
+            eprintln!("usage: host-lifecycle manifest [--check] <path>");
+            process::exit(2);
+        }
+    }
+}
+
+fn read_manifest_or_exit(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("host-lifecycle: cannot read {}: {e}", path.display());
+            process::exit(2);
+        }
+    }
+}
+
+/// `manifest <path>`: the whole lifecycle at a glance, in `order` (plan/0025 — "an
+/// agent reads it to see the whole lifecycle"). Surfaces each phase's modality
+/// (conditional / recurring / protected), its command, what it runs after, and the
+/// evidence a `done` receipt must carry.
+fn manifest_show(path: &Path) {
+    let mut phases = parse_manifest(&read_manifest_or_exit(path));
+    phases.sort_by_key(|p| p.order);
+    for p in &phases {
+        let mut tags: Vec<String> = Vec::new();
+        if let Some(x) = p.conditional_on() {
+            tags.push(format!("conditional-on-{x}"));
+        }
+        if p.recurring() {
+            tags.push("recurring-per-component".into());
+        }
+        if !p.skippable {
+            tags.push("protected".into());
+        }
+        let tagstr = if tags.is_empty() { String::new() } else { format!("  [{}]", tags.join(", ")) };
+        println!("{:>2}. {}{tagstr}", p.order, p.name);
+        if let Some(c) = &p.command {
+            println!("      run: {c}");
+        }
+        if !p.requires.is_empty() {
+            println!("      after: {}", p.requires.join(", "));
+        }
+        if let Some(e) = &p.evidence {
+            println!("      evidence: {e}");
+        }
+    }
+}
+
+/// Structural validation of a manifest file: each phase carries `order`, `command`
+/// and `skill`; `order`s are unique; every `requires` names a real phase that sits
+/// earlier (no forward or self dependency). One `ok`/`HAZARD` line per phase; exits
+/// non-zero on any HAZARD (so a CI lane can gate the template's own manifest).
+fn manifest_check(path: Option<&Path>) {
+    let Some(path) = path else {
+        eprintln!("usage: host-lifecycle manifest --check <path>");
+        process::exit(2);
+    };
+    let phases = parse_manifest(&read_manifest_or_exit(path));
+    if phases.is_empty() {
+        eprintln!("HAZARD   {} has no [phase \"...\"] stanzas", path.display());
+        process::exit(1);
+    }
+    let names: Vec<&str> = phases.iter().map(|p| p.name.as_str()).collect();
+    let order_of = |n: &str| phases.iter().find(|p| p.name == n).map(|p| p.order);
+    let mut hazards = 0;
+    for p in &phases {
+        let mut problems: Vec<String> = Vec::new();
+        if p.order == 0 {
+            problems.push("missing or zero `order`".into());
+        }
+        if p.command.is_none() {
+            problems.push("missing `command`".into());
+        }
+        if p.skill.is_none() {
+            problems.push("missing `skill`".into());
+        }
+        if p.order != 0 && phases.iter().filter(|q| q.order == p.order).count() > 1 {
+            problems.push(format!("duplicate order {}", p.order));
+        }
+        for r in &p.requires {
+            if r == &p.name {
+                problems.push("`requires` names itself".into());
+            } else if !names.contains(&r.as_str()) {
+                problems.push(format!("`requires` names unknown phase `{r}`"));
+            } else if matches!(order_of(r), Some(ro) if ro >= p.order) {
+                problems.push(format!("`requires {r}` is not earlier (order {} >= {})", order_of(r).unwrap_or(0), p.order));
+            }
+        }
+        if problems.is_empty() {
+            println!("ok       phase {} (order {})", p.name, p.order);
+        } else {
+            hazards += 1;
+            for prob in problems {
+                println!("HAZARD   phase {}: {prob}", p.name);
+            }
+        }
+    }
+    if hazards > 0 {
+        eprintln!("-- {hazards} phase(s) with problems");
+        process::exit(1);
+    }
+    println!("-- {} phase(s), well-formed and ordered", phases.len());
+}
+
 #[cfg(test)]
 mod remap_tests {
     use super::*;
@@ -3763,6 +3966,37 @@ mod tests {
         assert_eq!(parse_revision("template = \"x\"\n"), None);
         assert_eq!(parse_revision("revision = \"\"\n"), None);
         assert_eq!(parse_revision("revision=\"v0.1.0\"\n").as_deref(), Some("v0.1.0"));
+    }
+
+    #[test]
+    fn parse_manifest_reads_stanzas_modality_and_defaults() {
+        let m = "\
+[phase \"verify\"]
+    order = 7
+    command = host-lifecycle verify
+    skill = verify
+    skippable = false
+
+[phase \"release\"]
+    order = 8
+    modality = conditional-on-Where, recurring-per-component
+    command = host-lifecycle release
+    skill = release
+    evidence = attestation + tag
+    requires = verify
+";
+        let p = parse_manifest(m);
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].name, "verify");
+        assert_eq!(p[0].order, 7);
+        assert!(!p[0].skippable, "verify is the protected core (skippable = false)");
+        assert!(p[1].skippable, "skippable defaults to true when absent");
+        assert!(p[1].recurring());
+        assert!(!p[0].recurring());
+        assert_eq!(p[1].conditional_on(), Some("Where"));
+        assert_eq!(p[0].conditional_on(), None);
+        assert_eq!(p[1].requires, vec!["verify".to_string()]);
+        assert_eq!(p[0].requires, Vec::<String>::new());
     }
 
     #[test]
