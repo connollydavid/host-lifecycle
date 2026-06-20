@@ -23,6 +23,10 @@ const STAMP: &str = ".host";
 /// phase order + modality, in the template root, replacing the three prose copies.
 /// One `[phase "<name>"]` stanza per phase, same git-config style as `.host-software`.
 const MANIFEST: &str = "lifecycle.manifest";
+/// The per-project receipts ledger (plan/0025): append-only, tool-written, one
+/// stanza per recorded phase outcome. `software --check` re-verifies each by the
+/// manifest's closed `recheck =` mechanism, never the receipt's own assertion.
+const RECEIPTS: &str = ".host-receipts";
 /// The rooms `adopt` scaffolds (Where = the software submodule, added by hand).
 const ROOMS: [&str; 3] = ["cast", "plan", "call"];
 
@@ -51,8 +55,9 @@ fn main() {
         Some("book") => book(&args[2..]),
         Some("obligations") => obligations(&args[2..]),
         Some("manifest") => manifest(&args[2..]),
+        Some("receipt") => receipt(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -69,6 +74,7 @@ fn main() {
             eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
             eprintln!("  obligations <spec.allium>     — every `allium plan` obligation is dispositioned in <stem>.obligations");
             eprintln!("  manifest --check <path>       — the lifecycle manifest is well-formed (orders unique, requires resolve)");
+            eprintln!("  receipt --record <phase> ...  — append a phase receipt (done|skip); --list prints the current set");
             process::exit(2);
         }
     }
@@ -1848,11 +1854,62 @@ fn software_check(root: &Path, recipe: &[Software]) {
     bad += upgrade_claim_problems(root);
     // #12: a spec under plan/*/spec/ evades the mandatory lanes — co-locate it with software.
     bad += plan_spec_problems(root);
+    // plan/0025: every manifest phase emits a receipt; re-check each `done` by the
+    // manifest's closed `recheck =`. Inert until the adopted template declares a manifest.
+    bad += receipt_gate_problems(root, recipe);
     if bad > 0 {
         eprintln!("-- {bad} item(s) need attention");
         process::exit(1);
     }
     println!("-- all components at their pinned SHA; no worktree-symlink hazards");
+}
+
+/// The receipt gate over `software --check` (plan/0025): load the manifest the
+/// project is governed by, re-check each phase's receipt, and execute the closed
+/// `recheck =` for every `done`. Inert when the adopted template has no manifest —
+/// unless receipts already exist with no manifest to re-check them (R4 HAZARD).
+fn receipt_gate_problems(root: &Path, recipe: &[Software]) -> usize {
+    let phases = match load_project_manifest(root) {
+        ManifestState::NotAdopted => return 0,
+        ManifestState::Live(ps) => ps,
+        ManifestState::Absent => {
+            let has_receipts = !parse_receipts(&fs::read_to_string(root.join(RECEIPTS)).unwrap_or_default()).is_empty();
+            if has_receipts {
+                println!("HAZARD   {RECEIPTS} present but the adopted template has no {MANIFEST} to re-check them");
+                return 1;
+            }
+            return 0;
+        }
+    };
+    let receipts = parse_receipts(&fs::read_to_string(root.join(RECEIPTS)).unwrap_or_default());
+    let components: Vec<String> = recipe.iter().map(|s| s.name.clone()).collect();
+    let mut bad = 0;
+    for line in receipt_gate(&phases, &receipts, !recipe.is_empty(), &components) {
+        let recheck_failed = line.recheck.as_deref().is_some_and(|cmd| !run_recheck(root, cmd));
+        if line.ok && !recheck_failed {
+            println!("ok       {} — {}", line.label, line.note);
+            continue;
+        }
+        let note = if recheck_failed { format!("{} — recheck FAILED, re-opened", line.note) } else { line.note };
+        println!("HAZARD   {} — {note}", line.label);
+        if let Some(rem) = &line.remedy {
+            println!("           remedy: {rem}");
+        }
+        bad += 1;
+    }
+    bad
+}
+
+/// Run a receipt's closed `recheck =` command in the project root; a non-zero exit
+/// re-opens the `done` (R1 — evidence is re-derived, never self-asserted).
+fn run_recheck(root: &Path, cmd: &str) -> bool {
+    process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(root)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Tracked symlinks whose resolved target is **not itself tracked here** — they
@@ -3733,6 +3790,10 @@ struct Phase {
     /// R2 protected core: `skippable = false` refuses a `skip`/`n-a` receipt outright
     /// (`verify` and anything a green gate depends on). Defaults true.
     skippable: bool,
+    /// R1 closed re-check: a command `software --check` re-executes to re-verify a
+    /// `done` receipt (the analog of UPGRADING's `verify =`). A `done` whose recheck
+    /// fails re-opens as a HAZARD — evidence is never self-asserted.
+    recheck: Option<String>,
 }
 
 impl Phase {
@@ -3770,6 +3831,7 @@ fn parse_manifest(text: &str) -> Vec<Phase> {
                 evidence: None,
                 requires: Vec::new(),
                 skippable: true,
+                recheck: None,
             });
             continue;
         }
@@ -3790,6 +3852,7 @@ fn parse_manifest(text: &str) -> Vec<Phase> {
             "evidence" => cur.evidence = Some(val.to_string()),
             "requires" => cur.requires = list(val),
             "skippable" => cur.skippable = val != "false",
+            "recheck" => cur.recheck = Some(val.to_string()),
             _ => {}
         }
     }
@@ -3905,6 +3968,298 @@ fn manifest_check(path: Option<&Path>) {
     println!("-- {} phase(s), well-formed and ordered", phases.len());
 }
 
+// ---- Receipts ledger (plan/0025) -------------------------------------------
+//
+// A receipt is the per-project, append-only, tool-written record of what the
+// project did for one lifecycle phase: `done` (re-derivable evidence), `skip`
+// (a cited reason), or `n-a` (tool-computed, never hand-asserted). `software
+// --check` re-verifies each `done` by the manifest's closed `recheck =` command —
+// never the receipt's own say-so (R1) — and HAZARDs a missing receipt, a stale
+// one, a skipped protected core, or an `n-a` on a phase that applies.
+
+struct Receipt {
+    phase: String,
+    component: Option<String>,
+    disposition: String,
+    evidence: Option<String>,
+    reason: Option<String>,
+    tool: Option<String>,
+    recorded: Option<String>,
+}
+
+/// Parse `.host-receipts`: `[receipt "<phase>"]` or `[receipt "<phase>" "<component>"]`
+/// stanzas (git-config style, mirrors `parse_software`'s `[build "s" "p"]`).
+fn parse_receipts(text: &str) -> Vec<Receipt> {
+    let mut out: Vec<Receipt> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some(inner) = t.strip_prefix("[receipt \"").and_then(|r| r.strip_suffix("\"]")) {
+            let (phase, component) = match inner.split_once("\" \"") {
+                Some((p, c)) => (p.to_string(), Some(c.to_string())),
+                None => (inner.to_string(), None),
+            };
+            out.push(Receipt {
+                phase,
+                component,
+                disposition: String::new(),
+                evidence: None,
+                reason: None,
+                tool: None,
+                recorded: None,
+            });
+            continue;
+        }
+        let Some((key, val)) = t.split_once('=') else { continue };
+        let (key, val) = (key.trim(), val.trim());
+        let Some(cur) = out.last_mut() else { continue };
+        match key {
+            "disposition" => cur.disposition = val.to_string(),
+            "evidence" => cur.evidence = Some(val.to_string()),
+            "reason" => cur.reason = Some(val.to_string()),
+            "tool" => cur.tool = Some(val.to_string()),
+            "recorded" => cur.recorded = Some(val.to_string()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The current receipt for (phase, component): the LAST matching stanza (append-only,
+/// last-wins; earlier stanzas are retained history).
+fn latest_receipt<'a>(receipts: &'a [Receipt], phase: &str, component: Option<&str>) -> Option<&'a Receipt> {
+    receipts.iter().rev().find(|r| r.phase == phase && r.component.as_deref() == component)
+}
+
+fn receipt_stanza(r: &Receipt) -> String {
+    let head = match &r.component {
+        Some(c) => format!("[receipt \"{}\" \"{}\"]", r.phase, c),
+        None => format!("[receipt \"{}\"]", r.phase),
+    };
+    let mut s = format!("{head}\n    disposition = {}\n", r.disposition);
+    for (k, v) in [("evidence", &r.evidence), ("reason", &r.reason), ("tool", &r.tool), ("recorded", &r.recorded)] {
+        if let Some(v) = v {
+            s.push_str(&format!("    {k} = {v}\n"));
+        }
+    }
+    s
+}
+
+/// Append a receipt to `.host-receipts` atomically (append-only; a blank line
+/// separates stanzas). The tool is the only writer — Fen never hand-edits it.
+fn append_receipt(root: &Path, r: &Receipt) -> std::io::Result<()> {
+    let path = root.join(RECEIPTS);
+    let mut cur = fs::read_to_string(&path).unwrap_or_default();
+    if !cur.is_empty() {
+        if !cur.ends_with('\n') {
+            cur.push('\n');
+        }
+        cur.push('\n');
+    }
+    cur.push_str(&receipt_stanza(r));
+    write_atomic(&path, &cur)
+}
+
+/// Refuse a record that violates the receipt invariants (R1/R2). Pure + unit-tested:
+/// `n-a` is tool-only, a `done` needs re-derivable evidence, a `skip` needs a reason
+/// and a non-protected phase.
+fn validate_receipt_record(name: &str, disposition: &str, evidence: Option<&str>, reason: Option<&str>, skippable: bool) -> Result<(), String> {
+    match disposition {
+        "n-a" => Err(format!("`n-a` is tool-computed from project state, never recorded by hand (phase `{name}`)")),
+        "done" if evidence.is_none() => Err(format!("a `done` receipt needs `--evidence` (phase `{name}`); the evidence must be re-derivable")),
+        "done" => Ok(()),
+        "skip" if reason.is_none() => Err(format!("a `skip` receipt needs `--reason` (a `call/NNNN` for a substantive skip) (phase `{name}`)")),
+        "skip" if !skippable => Err(format!("phase `{name}` is a protected core (`skippable = false`) and cannot be skipped")),
+        "skip" => Ok(()),
+        other => Err(format!("unknown disposition `{other}` — use `done` or `skip`")),
+    }
+}
+
+/// The lifecycle the project is governed by, from the template `.host` records.
+enum ManifestState {
+    /// No `.host` — not adopted; no lifecycle gate.
+    NotAdopted,
+    /// `.host` present but the checked-out template carries no manifest (the adopted
+    /// revision predates manifests) — the gate stays inert until the project upgrades.
+    Absent,
+    Live(Vec<Phase>),
+}
+
+/// Load the manifest from the template submodule (checked out at the adopted
+/// revision, as `upgrade` already requires — same `find_template_dir` source as the
+/// UPGRADING ledger). A template with no manifest is `Absent`, not an error, so a
+/// pre-manifest adoption keeps passing ("nothing required until declared").
+fn load_project_manifest(root: &Path) -> ManifestState {
+    if !root.join(STAMP).is_file() {
+        return ManifestState::NotAdopted;
+    }
+    match find_template_dir(root).and_then(|t| fs::read_to_string(t.join(MANIFEST)).ok()) {
+        Some(text) => ManifestState::Live(parse_manifest(&text)),
+        None => ManifestState::Absent,
+    }
+}
+
+/// One gate line per (phase[,component]) the manifest declares.
+struct GateLine {
+    label: String,
+    ok: bool,
+    note: String,
+    /// Run by `software_check`; a non-zero exit re-opens the `done` as a HAZARD (R1).
+    recheck: Option<String>,
+    /// The literal remediation command to copy when this is a HAZARD — the de-risk
+    /// fold-back: never make a weak agent construct an exact command.
+    remedy: Option<String>,
+}
+
+/// The pure receipt gate: one `GateLine` per (phase[,component]) the manifest
+/// declares, given the project's receipts and capabilities. `has_where` = the
+/// project has a software room; `components` = its software names (for
+/// recurring-per-component phases). The recheck command is returned, not run, so
+/// this stays pure and unit-testable; `software_check` executes it.
+fn receipt_gate(phases: &[Phase], receipts: &[Receipt], has_where: bool, components: &[String]) -> Vec<GateLine> {
+    let mut sorted: Vec<&Phase> = phases.iter().collect();
+    sorted.sort_by_key(|p| p.order);
+    let mut out = Vec::new();
+    for p in sorted {
+        let applies = match p.conditional_on() {
+            Some("Where") => has_where,
+            Some(_) => true, // unknown condition: fail-closed, assume it applies
+            None => true,
+        };
+        let targets: Vec<Option<&str>> = if p.recurring() {
+            components.iter().map(|c| Some(c.as_str())).collect()
+        } else {
+            vec![None]
+        };
+        if !applies || (p.recurring() && targets.is_empty()) {
+            out.push(GateLine {
+                label: format!("phase {}", p.name),
+                ok: true,
+                note: "n-a (does not apply to this project)".into(),
+                recheck: None,
+                remedy: None,
+            });
+            continue;
+        }
+        for comp in targets {
+            let label = match comp {
+                Some(c) => format!("phase {} ({c})", p.name),
+                None => format!("phase {}", p.name),
+            };
+            let comp_arg = comp.map(|c| format!(" --component {c}")).unwrap_or_default();
+            let remedy = format!("host-lifecycle receipt --record {}{comp_arg} --disposition done --evidence <...>", p.name);
+            let line = match latest_receipt(receipts, &p.name, comp) {
+                None => GateLine { label, ok: false, note: "no receipt".into(), recheck: None, remedy: Some(remedy) },
+                Some(r) => match r.disposition.as_str() {
+                    "done" => match &p.recheck {
+                        Some(rc) => GateLine { label, ok: true, note: "done".into(), recheck: Some(rc.clone()), remedy: None },
+                        None => GateLine { label, ok: false, note: "done but the manifest declares no `recheck =` — a done must be re-derivable (R1)".into(), recheck: None, remedy: None },
+                    },
+                    "skip" if !p.skippable => GateLine { label, ok: false, note: "skip on a protected core (`skippable = false`)".into(), recheck: None, remedy: None },
+                    "skip" if r.reason.is_none() => GateLine { label, ok: false, note: "skip without a `reason`".into(), recheck: None, remedy: None },
+                    "skip" => GateLine { label, ok: true, note: format!("skip ({})", r.reason.as_deref().unwrap_or("")), recheck: None, remedy: None },
+                    "n-a" => GateLine { label, ok: false, note: "receipt asserts `n-a` but the phase applies (n-a is tool-computed, not recorded)".into(), recheck: None, remedy: None },
+                    other => GateLine { label, ok: false, note: format!("unknown disposition `{other}`"), recheck: None, remedy: None },
+                },
+            };
+            out.push(line);
+        }
+    }
+    out
+}
+
+fn receipt(args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("--record") => receipt_record(&args[1..]),
+        Some("--list") => receipt_list(args.get(1)),
+        _ => {
+            eprintln!("usage: host-lifecycle receipt --record <phase> [--component <c>] --disposition done|skip (--evidence <e> | --reason <r>) [<dir>]");
+            eprintln!("       host-lifecycle receipt --list [<dir>]");
+            process::exit(2);
+        }
+    }
+}
+
+fn receipt_record(args: &[String]) {
+    let (mut phase, mut component, mut disposition, mut evidence, mut reason) = (None, None, None, None, None);
+    let mut dir = String::from(".");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--component" => { component = args.get(i + 1).cloned(); i += 2; }
+            "--disposition" => { disposition = args.get(i + 1).cloned(); i += 2; }
+            "--evidence" => { evidence = args.get(i + 1).cloned(); i += 2; }
+            "--reason" => { reason = args.get(i + 1).cloned(); i += 2; }
+            s if s.starts_with("--") => { i += 1; }
+            s if phase.is_none() => { phase = Some(s.to_string()); i += 1; }
+            s => { dir = s.to_string(); i += 1; }
+        }
+    }
+    let (Some(phase), Some(disposition)) = (phase, disposition) else {
+        eprintln!("usage: host-lifecycle receipt --record <phase> --disposition done|skip (--evidence <e> | --reason <r>) [<dir>]");
+        process::exit(2);
+    };
+    let root = Path::new(&dir);
+    // Protectedness comes from the manifest when one is live; a phase the manifest
+    // does not declare is refused (you cannot receipt a phase outside the lifecycle).
+    let skippable = match load_project_manifest(root) {
+        ManifestState::Live(ps) => match ps.iter().find(|p| p.name == phase) {
+            Some(p) => p.skippable,
+            None => {
+                eprintln!("host-lifecycle: `{phase}` is not a phase in the lifecycle manifest");
+                process::exit(2);
+            }
+        },
+        _ => true,
+    };
+    if let Err(e) = validate_receipt_record(&phase, &disposition, evidence.as_deref(), reason.as_deref(), skippable) {
+        eprintln!("host-lifecycle: {e}");
+        process::exit(2);
+    }
+    let r = Receipt {
+        phase: phase.clone(),
+        component: component.clone(),
+        disposition: disposition.clone(),
+        evidence,
+        reason,
+        tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
+        recorded: Some(today()),
+    };
+    if let Err(e) = append_receipt(root, &r) {
+        eprintln!("host-lifecycle: cannot write {RECEIPTS}: {e}");
+        process::exit(2);
+    }
+    let comp = component.map(|c| format!(" ({c})")).unwrap_or_default();
+    println!("recorded receipt: phase {phase}{comp} = {disposition}");
+}
+
+fn receipt_list(dir: Option<&String>) {
+    let root = Path::new(dir.map_or(".", |s| s.as_str()));
+    let receipts = parse_receipts(&fs::read_to_string(root.join(RECEIPTS)).unwrap_or_default());
+    if receipts.is_empty() {
+        println!("no receipts recorded");
+        return;
+    }
+    let mut seen: Vec<(String, Option<String>)> = Vec::new();
+    let mut lines = Vec::new();
+    for r in receipts.iter().rev() {
+        let key = (r.phase.clone(), r.component.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let comp = r.component.as_deref().map(|c| format!(" ({c})")).unwrap_or_default();
+        let detail = r.evidence.as_deref().or(r.reason.as_deref()).unwrap_or("");
+        lines.push(format!("{:<6} {}{comp}  {detail}", r.disposition, r.phase));
+    }
+    lines.reverse();
+    for l in lines {
+        println!("{l}");
+    }
+}
+
 #[cfg(test)]
 mod remap_tests {
     use super::*;
@@ -3997,6 +4352,79 @@ mod tests {
         assert_eq!(p[0].conditional_on(), None);
         assert_eq!(p[1].requires, vec!["verify".to_string()]);
         assert_eq!(p[0].requires, Vec::<String>::new());
+    }
+
+    #[test]
+    fn receipts_parse_and_latest_wins() {
+        let text = "\
+[receipt \"verify\"]
+    disposition = done
+    evidence = gate:x
+
+[receipt \"release\" \"host-lint\"]
+    disposition = skip
+    reason = call/0031
+
+[receipt \"verify\"]
+    disposition = done
+    evidence = gate:y
+";
+        let rs = parse_receipts(text);
+        assert_eq!(rs.len(), 3);
+        assert_eq!(latest_receipt(&rs, "verify", None).unwrap().evidence.as_deref(), Some("gate:y"));
+        assert_eq!(latest_receipt(&rs, "release", Some("host-lint")).unwrap().disposition, "skip");
+        assert!(latest_receipt(&rs, "release", None).is_none());
+    }
+
+    #[test]
+    fn record_validation_enforces_invariants() {
+        assert!(validate_receipt_record("verify", "n-a", None, None, true).is_err(), "n-a is tool-only");
+        assert!(validate_receipt_record("build", "done", None, None, true).is_err(), "done needs evidence");
+        assert!(validate_receipt_record("build", "done", Some("tag:v1"), None, true).is_ok());
+        assert!(validate_receipt_record("verify", "skip", None, None, false).is_err(), "skip needs a reason");
+        assert!(validate_receipt_record("verify", "skip", None, Some("call/1"), false).is_err(), "protected core");
+        assert!(validate_receipt_record("embed", "skip", None, Some("call/1"), true).is_ok());
+        assert!(validate_receipt_record("x", "maybe", None, None, true).is_err(), "unknown disposition");
+    }
+
+    #[test]
+    fn gate_flags_missing_na_and_protected() {
+        let phases = parse_manifest("\
+[phase \"verify\"]
+    order = 1
+    command = c
+    skill = verify
+    skippable = false
+    recheck = true
+[phase \"release\"]
+    order = 2
+    modality = conditional-on-Where, recurring-per-component
+    command = c
+    skill = release
+    recheck = true
+");
+        // Where room + one component, no receipts: both phases HAZARD; the release
+        // line carries a literal --component remedy (the de-risk fold-back).
+        let g = receipt_gate(&phases, &[], true, &["host-lint".into()]);
+        assert_eq!(g.len(), 2);
+        assert!(g.iter().all(|l| !l.ok));
+        let rel = g.iter().find(|l| l.label.contains("release")).unwrap();
+        assert!(rel.remedy.as_deref().unwrap().contains("--component host-lint"));
+
+        // No Where room: release is tool-computed n-a; verify still needs a receipt.
+        let g2 = receipt_gate(&phases, &[], false, &[]);
+        let rel2 = g2.iter().find(|l| l.label.contains("release")).unwrap();
+        assert!(rel2.ok && rel2.note.contains("n-a"));
+
+        // done verify with a declared recheck → ok + a recheck to run.
+        let done = parse_receipts("[receipt \"verify\"]\n    disposition = done\n    evidence = x\n");
+        let v = receipt_gate(&phases, &done, false, &[]).into_iter().find(|l| l.label.contains("verify")).unwrap();
+        assert!(v.ok && v.recheck.is_some());
+
+        // skip of the protected core → HAZARD.
+        let skip = parse_receipts("[receipt \"verify\"]\n    disposition = skip\n    reason = call/1\n");
+        let vs = receipt_gate(&phases, &skip, false, &[]).into_iter().find(|l| l.label.contains("verify")).unwrap();
+        assert!(!vs.ok && vs.note.contains("protected"));
     }
 
     #[test]
