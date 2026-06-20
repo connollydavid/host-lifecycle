@@ -977,6 +977,7 @@ struct PlatformBuild {
 struct BuildView<'a> {
     platform: Option<&'a str>,
     build: Option<&'a str>,
+    toolchain: Option<&'a str>,
     deploy: Option<&'a str>,
     artifact: Option<&'a (String, String)>,
     repro_exempt: Option<&'a str>,
@@ -992,6 +993,7 @@ impl Software {
             return vec![BuildView {
                 platform: None,
                 build: self.build.as_deref(),
+                toolchain: self.toolchain.as_deref(),
                 deploy: self.deploy.as_deref(),
                 artifact: self.artifact.as_ref(),
                 repro_exempt: self.repro_exempt.as_deref(),
@@ -1003,6 +1005,7 @@ impl Software {
             .map(|b| BuildView {
                 platform: Some(&b.platform),
                 build: b.build.as_deref(),
+                toolchain: b.toolchain.as_deref(),
                 deploy: b.deploy.as_deref(),
                 artifact: b.artifact.as_ref(),
                 repro_exempt: b.repro_exempt.as_deref(),
@@ -1183,9 +1186,25 @@ fn copy_executable(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The first available OCI runtime (`docker`, then `podman`), or `None`. Probed by
+/// `<rt> version`, which contacts the daemon — so a present client with a stopped
+/// daemon counts as unavailable, and `--verify-build` then skips rather than failing.
+fn container_runtime() -> Option<&'static str> {
+    ["docker", "podman"].into_iter().find(|rt| {
+        process::Command::new(rt)
+            .arg("version")
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
 /// `--verify-build`: prove reproducibility (the heavy lane). For each component with a
 /// `build` recipe, materialize a clean throwaway worktree at the pin, run the recorded
-/// build, hash the `artifact`, and compare to the recorded sha. A `repro-exempt`
+/// build **inside the recorded `toolchain` container** (host#14 — never the ambient
+/// rust), hash the `artifact`, and compare to the recorded sha. A `repro-exempt`
 /// component citing a real decision is reported (warn) and its rebuild skipped — the
 /// escape clause for not-yet-reproducible migrated software (issue #10).
 fn software_verify_build(root: &Path, recipe: &[Software]) {
@@ -1224,6 +1243,19 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
                 bad += 1;
                 continue;
             };
+            // host#14: a reproducible build is only meaningful in the *recorded*
+            // toolchain. Build inside the digest-pinned `toolchain` container, never
+            // the ambient rust — which legitimately differs and yields a false DRIFT.
+            // Honor each component's own recorded image verbatim (no version is
+            // imposed). With no pin or no runtime, skip clearly — never ambient-build.
+            let Some(image) = b.toolchain else {
+                println!("skip     {tag} no `toolchain` pin — cannot verify in a pinned environment (software --check flags this)");
+                continue;
+            };
+            let Some(runtime) = container_runtime() else {
+                println!("skip     {tag} no container runtime (docker/podman) — cannot verify in the recorded toolchain {image}");
+                continue;
+            };
             if !bare.is_dir() {
                 println!("MISSING  {}.git (run --materialize)", s.name);
                 bad += 1;
@@ -1240,19 +1272,36 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
                 bad += 1;
                 continue;
             }
-            let built = process::Command::new("sh")
+            // Run the recorded recipe inside the recorded image. The container is
+            // root and writes root-owned output into the mounted worktree, so the
+            // recipe chowns /src back to the mount owner before exiting, keeping the
+            // worktree removable. An optional HOST_LIFECYCLE_DOCKER_NETWORK (e.g.
+            // `host`) covers environments whose default docker bridge lacks DNS.
+            let work_abs = fs::canonicalize(&work).unwrap_or_else(|_| work.clone());
+            let wrapped =
+                format!("{build}; rc=$?; chown -R \"$(stat -c '%u:%g' /src)\" /src 2>/dev/null || true; exit $rc");
+            let mut cmd = process::Command::new(runtime);
+            cmd.arg("run").arg("--rm");
+            if let Ok(net) = env::var("HOST_LIFECYCLE_DOCKER_NETWORK") {
+                if !net.is_empty() {
+                    cmd.arg("--network").arg(net);
+                }
+            }
+            cmd.arg("-v")
+                .arg(format!("{}:/src", work_abs.to_string_lossy()))
+                .arg("-w")
+                .arg("/src")
+                .arg(image)
+                .arg("sh")
                 .arg("-c")
-                .arg(build)
-                .current_dir(&work)
-                .status()
-                .map(|st| st.success())
-                .unwrap_or(false);
+                .arg(&wrapped);
+            let built = cmd.status().map(|st| st.success()).unwrap_or(false);
             if !built {
-                println!("ERROR    {tag} — build failed: `{build}`");
+                println!("ERROR    {tag} — build failed in {runtime} {image}: `{build}`");
                 bad += 1;
             } else {
                 match sha256_file(&work.join(path)) {
-                    Some(h) if &h == sha => println!("ok       {tag} rebuild reproduces {path} @ {}", short(sha)),
+                    Some(h) if &h == sha => println!("ok       {tag} rebuild reproduces {path} @ {} (in {image})", short(sha)),
                     Some(h) => {
                         println!("DRIFT    {tag} rebuild is {} but recorded {} — NOT reproducible", short(&h), short(sha));
                         bad += 1;
@@ -1911,6 +1960,13 @@ fn provenance_problems(root: &Path, s: &Software) -> usize {
                 println!("DRIFT    {tag} repro-exempt cites missing decision {cite}");
                 bad += 1;
             }
+        }
+        // host#14 stricter minimum: an `artifact` with no `toolchain` pin cannot be
+        // reproducibly verified — `--verify-build` has no recorded environment to
+        // rebuild in. An exempt build is excused (it cites a decision above).
+        if b.artifact.is_some() && b.toolchain.is_none() && b.repro_exempt.is_none() {
+            println!("HAZARD   {tag} records an artifact but no `toolchain` pin — not reproducibly verifiable");
+            bad += 1;
         }
         // Attestation: when the artifact is present in the canonical worktree, a
         // match is a positive "verified" note. A mismatch is *not* a fault here:
@@ -3518,10 +3574,12 @@ mod software_tests {
         fs::write(base.join("call/0009-exempt.md"), "# x\n- Status: accepted\n- Scope: ik\n").unwrap();
         let sha = sha256_file(&base.join("ik/build/bin/srv")).unwrap();
 
+        // A `toolchain` pin is present (host#14): the artifact-hash checks below test
+        // the local-build *note* path, not the no-toolchain HAZARD path (tested after).
         let mk = |deploy: &str, art_sha: &str, exempt: Option<&str>| Software {
             name: "ik".into(), url: "u".into(), pin: "p".into(),
             worktrees: vec![], lines: vec![],
-            build: None, toolchain: None,
+            build: None, toolchain: Some("gcc-13".into()),
             deploy: Some(deploy.into()),
             artifact: Some(("build/bin/srv".into(), art_sha.into())),
             repro_exempt: exempt.map(String::from), hooks: None, builds: vec![],
@@ -3534,6 +3592,19 @@ mod software_tests {
         assert_eq!(provenance_problems(&base, &mk("ik", "0000", None)), 0);
         // unrecorded deploy line → 1; exemption citing a missing decision → 1 (so 2)
         assert_eq!(provenance_problems(&base, &mk("ghost", &sha, Some("call/9999"))), 2);
+
+        // host#14: an artifact with no `toolchain` pin is a HAZARD (not reproducibly
+        // verifiable) — unless an exemption excuses it.
+        let no_tc = |exempt: Option<&str>| Software {
+            name: "ik".into(), url: "u".into(), pin: "p".into(),
+            worktrees: vec![], lines: vec![],
+            build: None, toolchain: None,
+            deploy: Some("ik".into()),
+            artifact: Some(("build/bin/srv".into(), sha.clone())),
+            repro_exempt: exempt.map(String::from), hooks: None, builds: vec![],
+        };
+        assert_eq!(provenance_problems(&base, &no_tc(None)), 1);
+        assert_eq!(provenance_problems(&base, &no_tc(Some("call/0009"))), 0);
 
         let _ = fs::remove_dir_all(&base);
     }
