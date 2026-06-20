@@ -2322,8 +2322,9 @@ fn obligation_gaps(
                 // obligation. When prove sources are supplied, the named harness /
                 // invariant / theorem must occur in them — the analog of `test:`.
                 for pfx in ["kani:", "apalache:", "tlaps:"] {
-                    if let (Some(name), Some(src)) = (disp.strip_prefix(pfx), prove) {
-                        let name = name.trim();
+                    if let (Some(rest), Some(src)) = (disp.strip_prefix(pfx), prove) {
+                        // The proof NAME is the first token; `bound=`/`spec=`/`inputs=` follow it.
+                        let name = rest.split_whitespace().next().unwrap_or("");
                         if !name.is_empty() && !src.contains(name) {
                             problems.push(format!("ABSENT   {id} — `{pfx}{name}` not in the prove sources"));
                         }
@@ -4112,6 +4113,17 @@ mod software_tests {
         // prove sources containing both names → clean
         let src = "fn verify_is_dotted_code() {}\nTHEOREM Safety == TRUE";
         assert!(obligation_gaps(&ids, &m, None, Some(src)).is_empty());
+    }
+
+    #[test]
+    fn obligation_gaps_strips_rung_suffixes_from_the_proof_name() {
+        // A rung with `bound=`/`spec=`/`inputs=` must match on the NAME alone, not
+        // the whole disposition (the dogfood bug: `inputs=` made every rung ABSENT).
+        let ids = vec!["a.X".to_string()];
+        let m = parse_obligation_manifest("a.X => kani:verify_h bound=unwind=20 inputs=src/lib.rs\n");
+        assert!(obligation_gaps(&ids, &m, None, Some("fn verify_h() {}")).is_empty(), "name should match despite the suffix");
+        // The real ABSENT (name truly missing) still fires.
+        assert!(!obligation_gaps(&ids, &m, None, Some("fn other() {}")).is_empty());
     }
 
     // `--rederive` (call/0018): discharge is the verifier PASSING at the declared bound,
