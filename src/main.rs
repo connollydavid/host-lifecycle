@@ -4548,8 +4548,11 @@ fn current_version(root: &Path, s: &Software) -> Result<String, String> {
         let toml = fs::read_to_string(work.join("Cargo.toml")).map_err(|e| format!("cannot read {}/Cargo.toml: {e}", s.name))?;
         cargo_version(&toml).ok_or_else(|| format!("{}/Cargo.toml has no [package] version", s.name))
     } else {
-        let tag = git_out(&work, &["describe", "--tags", "--abbrev=0"]).ok_or_else(|| format!("{} has no version tag to release from", s.name))?;
-        Ok(tag.trim().trim_start_matches('v').to_string())
+        // A library / tag-only component with no tag yet is at 0.0.0 — the first
+        // release computes its initial version from the change-class (plan/0029), so a
+        // never-released component is not blocked from its first tag.
+        let tag = git_out(&work, &["describe", "--tags", "--abbrev=0"]);
+        Ok(tag.map(|t| t.trim().trim_start_matches('v').to_string()).unwrap_or_else(|| "0.0.0".to_string()))
     }
 }
 
