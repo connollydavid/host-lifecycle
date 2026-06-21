@@ -4574,15 +4574,23 @@ fn release_context<'a>(root: &Path, recipe: &'a [Software], component: &str) -> 
 /// `Cargo.toml` `[package] version`; a tool reads its latest `v*` git tag.
 fn current_version(root: &Path, s: &Software) -> Result<String, String> {
     let work = worktree_dir(root, &s.name, &s.branch);
+    // The current version is the last RELEASE TAG — the canonical released version —
+    // never the worktree Cargo.toml. The release bumps Cargo.toml in place, so reading it
+    // back would drift the version on a re-run (each attempt would re-bump from the last).
+    // A never-tagged component falls back to its declared Cargo.toml version (an artifact
+    // crate, so its first release starts from the version it ships) or 0.0.0 (a tag-only
+    // tool); the first release computes from the change-class either way (plan/0029).
+    if let Some(tag) = git_out(&work, &["describe", "--tags", "--abbrev=0"]) {
+        let v = tag.trim().trim_start_matches('v');
+        if !v.is_empty() {
+            return Ok(v.to_string());
+        }
+    }
     if is_artifact_bearing(s) {
         let toml = fs::read_to_string(work.join("Cargo.toml")).map_err(|e| format!("cannot read {}/Cargo.toml: {e}", s.name))?;
         cargo_version(&toml).ok_or_else(|| format!("{}/Cargo.toml has no [package] version", s.name))
     } else {
-        // A library / tag-only component with no tag yet is at 0.0.0 — the first
-        // release computes its initial version from the change-class (plan/0029), so a
-        // never-released component is not blocked from its first tag.
-        let tag = git_out(&work, &["describe", "--tags", "--abbrev=0"]);
-        Ok(tag.map(|t| t.trim().trim_start_matches('v').to_string()).unwrap_or_else(|| "0.0.0".to_string()))
+        Ok("0.0.0".to_string())
     }
 }
 
@@ -4603,6 +4611,54 @@ fn cargo_version(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Read the `[package] name` from a Cargo.toml — the crate name, which keys the crate's
+/// own `[[package]]` block in Cargo.lock (may differ from the component name).
+fn cargo_package_name(text: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+        }
+        if in_package {
+            if let Some(rest) = t.strip_prefix("name") {
+                if let Some(v) = rest.trim_start().strip_prefix('=') {
+                    return Some(v.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Sync a crate's own version line in Cargo.lock to `new`, so a `--locked` build does not
+/// fail on a stale lock after the Cargo.toml bump. Targeted text edit of the `[[package]]`
+/// block whose `name` matches the crate — no cargo invocation, no network. Returns the
+/// updated text, or None if the crate's block (or version line) was not found.
+fn set_lock_version(lock: &str, crate_name: &str, new: &str) -> Option<String> {
+    let name_line = format!("name = \"{crate_name}\"");
+    let mut out = String::with_capacity(lock.len() + 8);
+    let mut in_target = false;
+    let mut bumped = false;
+    for line in lock.lines() {
+        let t = line.trim();
+        if t == "[[package]]" {
+            in_target = false;
+        } else if t == name_line {
+            in_target = true;
+        }
+        if in_target && !bumped && t.starts_with("version =") {
+            out.push_str(&format!("version = \"{new}\"\n"));
+            in_target = false;
+            bumped = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    bumped.then_some(out)
 }
 
 fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview: bool) {
@@ -4703,6 +4759,22 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
                 println!("  bumped {}/Cargo.toml to {new}", s.name);
             }
             None => { eprintln!("host-lifecycle: {}/Cargo.toml has no [package] version to bump", s.name); process::exit(2); }
+        }
+    }
+
+    // Sync Cargo.lock's own-version so the pinned `--locked` build does not fail on a
+    // stale lock (the bump changes the crate's version, which the lock records too).
+    let lock_path = work.join("Cargo.lock");
+    if let Ok(lock) = fs::read_to_string(&lock_path) {
+        let crate_name = cargo_package_name(&toml).unwrap_or_else(|| s.name.clone());
+        if let Some(updated) = set_lock_version(&lock, &crate_name, &new) {
+            if updated != lock {
+                if let Err(e) = fs::write(&lock_path, updated) {
+                    eprintln!("host-lifecycle: cannot write {}: {e}", lock_path.display());
+                    process::exit(2);
+                }
+                println!("  synced {}/Cargo.lock to {new}", s.name);
+            }
         }
     }
 
@@ -6210,5 +6282,22 @@ mod book_tests {
         assert!(!arch.pages.iter().any(|p| p.dest == "plan/0001-foundation/README.md"), "live plan README not archived");
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn set_lock_version_bumps_only_the_named_crate() {
+        let lock = "# auto @generated by Cargo\nversion = 4\n\n\
+            [[package]]\nname = \"host-grammar\"\nversion = \"0.2.0\"\n\n\
+            [[package]]\nname = \"host-lint\"\nversion = \"0.7.0\"\ndependencies = [\n \"host-grammar\",\n]\n\n\
+            [[package]]\nname = \"memchr\"\nversion = \"2.8.2\"\n";
+        let out = set_lock_version(lock, "host-lint", "0.8.0").expect("crate present");
+        // the named crate's own version is bumped …
+        assert!(out.contains("name = \"host-lint\"\nversion = \"0.8.0\""));
+        // … and nothing else: not the lock-format header, a dependency, or another crate
+        assert!(out.contains("version = 4\n"), "lock-format version untouched");
+        assert!(out.contains("name = \"host-grammar\"\nversion = \"0.2.0\""));
+        assert!(out.contains("name = \"memchr\"\nversion = \"2.8.2\""));
+        // a crate not in the lock yields None (no spurious write)
+        assert!(set_lock_version(lock, "absent", "9.9.9").is_none());
     }
 }
