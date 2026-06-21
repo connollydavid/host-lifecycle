@@ -1972,6 +1972,13 @@ fn software_check(root: &Path, recipe: &[Software]) {
         println!("HAZARD   {link} -> {target} (symlink into an un-materialized path; not tracked here)");
         bad += 1;
     }
+    // Generated (untracked) skill links that dangle (plan/0029): the tracked-symlink
+    // hazard above cannot see them, yet a dangling one trips a tree-walker (the Site-CI
+    // regression). Re-run link-skills.sh after (de)materialization to clear it.
+    for link in dangling_generated_links(root) {
+        println!("HAZARD   .claude/skills/{link} dangles (run link-skills.sh after materialize)");
+        bad += 1;
+    }
     // Re-check every recorded upgrade claim against the ledger (plan/0022 step 6).
     bad += upgrade_claim_problems(root);
     // #12: a spec under plan/*/spec/ evades the mandatory lanes — co-locate it with software.
@@ -2032,6 +2039,29 @@ fn run_recheck(root: &Path, cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Generated (untracked) skill links under `.claude/skills/` that dangle (plan/0029):
+/// a symlink whose target no longer resolves. These are deliberately untracked
+/// (`call/0005`), so the tracked-symlink hazard cannot see them; a dangling one trips
+/// any tree-walker (mdBook), the regression that reddened Site CI. Returns the dangling
+/// link names; an absent `.claude/skills/` (nothing generated yet) yields none.
+fn dangling_generated_links(root: &Path) -> Vec<String> {
+    let skills = root.join(".claude").join("skills");
+    let mut bad = Vec::new();
+    let Ok(rd) = fs::read_dir(&skills) else {
+        return bad;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        let p = e.path();
+        let is_link = fs::symlink_metadata(&p).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+        // a symlink (symlink_metadata Ok+symlink) whose target is gone (metadata Err)
+        if is_link && fs::metadata(&p).is_err() {
+            bad.push(e.file_name().to_string_lossy().to_string());
+        }
+    }
+    bad.sort();
+    bad
 }
 
 /// Tracked symlinks whose resolved target is **not itself tracked here** — they
@@ -5759,6 +5789,23 @@ mod software_tests {
         assert_eq!(normalize_join("a/b", "../c"), "a/c");
         assert_eq!(normalize_join("", "host-lint/SKILL.md"), "host-lint/SKILL.md");
         assert_eq!(normalize_join(".claude/skills", "../../host-lint/SKILL.md"), "host-lint/SKILL.md");
+    }
+
+    // A generated (untracked) skill link that dangles is flagged; a resolving one is
+    // not (plan/0029). The tracked-symlink hazard cannot see these.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_generated_skill_links_are_flagged() {
+        let base = std::env::temp_dir().join(format!("hl-genlink-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let skills = base.join(".claude").join("skills");
+        fs::create_dir_all(&skills).unwrap();
+        let target = base.join("real");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, skills.join("good")).unwrap();
+        std::os::unix::fs::symlink(base.join("gone"), skills.join("bad")).unwrap();
+        assert_eq!(dangling_generated_links(&base), vec!["bad".to_string()]);
+        let _ = fs::remove_dir_all(&base);
     }
 
     // A tracked symlink whose target isn't tracked here (a worktree/submodule
