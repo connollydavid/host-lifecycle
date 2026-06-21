@@ -963,6 +963,7 @@ fn require_clean_git(root: &Path) {
 
 /// One software component from `.host-software`: a bare object store plus its
 /// canonical worktree at `pin` and any parallel worktrees (`call/0010`).
+#[derive(Clone)]
 struct Software {
     name: String,
     url: String,
@@ -1007,6 +1008,7 @@ struct Software {
 /// gates the line to one OS (`std::env::consts::OS`), mirroring a build's `attest_host`:
 /// off-platform the line is skipped by `--materialize`/`--check` rather than reported
 /// missing.
+#[derive(Clone)]
 struct Worktree {
     branch: String,
     pin: String,
@@ -1019,6 +1021,7 @@ struct Worktree {
 /// (`std::env::consts::OS`: `linux`/`windows`/`macos`) on which this build is
 /// reproducible; `--check`/`--verify-build` skip it on any other host, the way an
 /// exempt component is skipped, rather than failing.
+#[derive(Clone)]
 struct PlatformBuild {
     platform: String,
     build: Option<String>,
@@ -1072,6 +1075,38 @@ impl Software {
     }
 }
 
+/// Narrow a recipe to a single `--item <name>[@<branch>]` (plan/0029). `<name>` selects
+/// the component; an optional `@<branch>` narrows to just that worktree — the branch
+/// becomes the operation's canonical, at the matching pin (a parallel line's own pin,
+/// else the component pin). Exits if the named component is absent.
+fn filter_item(recipe: Vec<Software>, spec: &str) -> Vec<Software> {
+    let (name, branch) = match spec.split_once('@') {
+        Some((n, b)) => (n, Some(b)),
+        None => (spec, None),
+    };
+    let Some(s) = recipe.into_iter().find(|s| s.name == name) else {
+        eprintln!("host-lifecycle: --item: no component named `{name}` in {SOFTWARE}");
+        process::exit(2);
+    };
+    match branch {
+        None => vec![s],
+        Some(branch) => {
+            let pin = s
+                .lines
+                .iter()
+                .find(|w| w.branch == branch)
+                .map(|w| w.pin.clone())
+                .unwrap_or_else(|| s.pin.clone());
+            let mut narrowed = s;
+            narrowed.branch = branch.to_string();
+            narrowed.pin = pin;
+            narrowed.worktrees = Vec::new();
+            narrowed.lines = Vec::new();
+            vec![narrowed]
+        }
+    }
+}
+
 /// `software --materialize|--check <dir>` — realise the `.host-software` recipe.
 /// `--materialize` clones each `<name>.git` bare store and adds the canonical
 /// worktree `<name>/` at its `pin` (plus any parallel worktrees), idempotently —
@@ -1081,17 +1116,30 @@ impl Software {
 fn software(args: &[String]) {
     let mut mode: Option<&str> = None;
     let mut pos: Vec<&String> = Vec::new();
-    for a in args {
-        match a.as_str() {
+    // `--item <name>[@<branch>]` narrows the operation to one component (plan/0029);
+    // a flag, not a positional, so it never collides with the `<dir>` positional.
+    let mut item: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--materialize" => mode = Some("materialize"),
             "--check" => mode = Some("check"),
             "--verify-build" => mode = Some("verify-build"),
             "--install-hooks" => mode = Some("install-hooks"),
-            _ => pos.push(a),
+            "--item" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("host-lifecycle: --item needs <name>[@<branch>]");
+                    process::exit(2);
+                };
+                item = Some(v.as_str());
+                i += 1;
+            }
+            _ => pos.push(&args[i]),
         }
+        i += 1;
     }
     let Some(dir) = pos.first() else {
-        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks> <dir>");
+        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks> [--item <name>[@<branch>]] <dir>");
         process::exit(2);
     };
     let Some(mode) = mode else {
@@ -1105,10 +1153,13 @@ fn software(args: &[String]) {
             process::exit(2);
         }
     };
-    let recipe = load_software(&root);
+    let mut recipe = load_software(&root);
     if recipe.is_empty() {
         eprintln!("host-lifecycle: no [software \"<name>\"] stanzas in {SOFTWARE}");
         process::exit(2);
+    }
+    if let Some(spec) = item {
+        recipe = filter_item(recipe, spec);
     }
     match mode {
         "materialize" => software_materialize(&root, &recipe),
@@ -5532,6 +5583,30 @@ mod software_tests {
         software_check(&host, &recipe); // passes on a matching branch+pin
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // `--item <name>[@<branch>]` narrows the recipe to one component, and `@<branch>`
+    // narrows further to that worktree at the matching pin (plan/0029).
+    #[test]
+    fn filter_item_narrows_to_component_and_branch() {
+        let recipe = parse_software(
+            "[software \"a\"]\n url=u\n pin=p1\n worktree = feature q9deadbeef\n\
+             [software \"b\"]\n url=u\n pin=p2\n",
+        );
+        let only_a = filter_item(recipe.clone(), "a");
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].name, "a");
+        assert_eq!(only_a[0].lines.len(), 1);
+        // a line's branch → that worktree at the LINE's pin, nothing else
+        let a_feat = filter_item(recipe.clone(), "a@feature");
+        assert_eq!(a_feat.len(), 1);
+        assert_eq!(a_feat[0].branch, "feature");
+        assert_eq!(a_feat[0].pin, "q9deadbeef");
+        assert!(a_feat[0].lines.is_empty() && a_feat[0].worktrees.is_empty());
+        // the canonical branch → the component pin
+        let a_main = filter_item(recipe, "a@main");
+        assert_eq!(a_main[0].branch, "main");
+        assert_eq!(a_main[0].pin, "p1");
     }
 
     #[test]
