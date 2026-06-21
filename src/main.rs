@@ -1726,6 +1726,12 @@ fn software_materialize(root: &Path, recipe: &[Software]) {
             println!("clone    {bare_rel}");
             made += 1;
         }
+        // Clear stale worktree admin (a prior teardown or move leaves entries that are
+        // registered but missing on disk; plan/0029) so a re-materialize re-adds a
+        // worktree path instead of hard-failing with "missing but already registered".
+        if bare.is_dir() {
+            git_ok(&bare, &["worktree", "prune"]);
+        }
         // Canonical worktree: on its `branch`, reset to the `pin` (plan/0029) — `-B`
         // creates-or-resets the branch, so the audited tree is the pin on a real branch.
         let canon_label = worktree_label(&s.name, &s.branch);
@@ -5731,6 +5737,15 @@ mod software_tests {
         assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
         // check passes (returns without process::exit on a matching pin)
         software_check(&host, &recipe);
+
+        // Re-materialize after the worktree is removed: `worktree prune` clears the
+        // stale admin entry, so the canonical is re-created rather than hard-failing
+        // with "missing but already registered" (plan/0029).
+        fs::remove_dir_all(&canon).unwrap();
+        assert!(!canon.is_dir());
+        software_materialize(&host, &recipe);
+        assert!(canon.is_dir(), "canonical re-created after removal + prune");
+        assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
 
         let _ = fs::remove_dir_all(&base);
     }
