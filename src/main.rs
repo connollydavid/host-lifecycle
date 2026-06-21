@@ -56,8 +56,9 @@ fn main() {
         Some("obligations") => obligations(&args[2..]),
         Some("manifest") => manifest(&args[2..]),
         Some("receipt") => receipt(&args[2..]),
+        Some("release") => release(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -75,6 +76,7 @@ fn main() {
             eprintln!("  obligations <spec.allium>     — every `allium plan` obligation is dispositioned in <stem>.obligations");
             eprintln!("  manifest --check <path>       — the lifecycle manifest is well-formed (orders unique, requires resolve)");
             eprintln!("  receipt --record <phase> ...  — append a phase receipt (done|skip); --list prints the current set");
+            eprintln!("  release <component> ...       — the gated, tool-carried release sequence (verify -> build -> tag -> receipt)");
             process::exit(2);
         }
     }
@@ -1250,6 +1252,35 @@ fn container_runtime() -> Option<&'static str> {
     })
 }
 
+/// Run a recorded `build` recipe inside the recorded `toolchain` container against
+/// `src` (mounted at `/src`), returning whether it succeeded. Shared by
+/// `--verify-build` and `release` so the docker incantation lives in one place. The
+/// container is root and writes root-owned output into the mount, so the recipe chowns
+/// `/src` back to the mount owner before exiting, keeping the worktree removable. An
+/// optional `HOST_LIFECYCLE_DOCKER_NETWORK` (e.g. `host`) covers environments whose
+/// default docker bridge lacks DNS.
+fn run_build_in_container(runtime: &str, image: &str, build: &str, src: &Path) -> bool {
+    let src_abs = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+    let wrapped =
+        format!("{build}; rc=$?; chown -R \"$(stat -c '%u:%g' /src)\" /src 2>/dev/null || true; exit $rc");
+    let mut cmd = process::Command::new(runtime);
+    cmd.arg("run").arg("--rm");
+    if let Ok(net) = env::var("HOST_LIFECYCLE_DOCKER_NETWORK") {
+        if !net.is_empty() {
+            cmd.arg("--network").arg(net);
+        }
+    }
+    cmd.arg("-v")
+        .arg(format!("{}:/src", src_abs.to_string_lossy()))
+        .arg("-w")
+        .arg("/src")
+        .arg(image)
+        .arg("sh")
+        .arg("-c")
+        .arg(&wrapped);
+    cmd.status().map(|st| st.success()).unwrap_or(false)
+}
+
 /// `--verify-build`: prove reproducibility (the heavy lane). For each component with a
 /// `build` recipe, materialize a clean throwaway worktree at the pin, run the recorded
 /// build **inside the recorded `toolchain` container** (host#14 — never the ambient
@@ -1321,30 +1352,8 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
                 bad += 1;
                 continue;
             }
-            // Run the recorded recipe inside the recorded image. The container is
-            // root and writes root-owned output into the mounted worktree, so the
-            // recipe chowns /src back to the mount owner before exiting, keeping the
-            // worktree removable. An optional HOST_LIFECYCLE_DOCKER_NETWORK (e.g.
-            // `host`) covers environments whose default docker bridge lacks DNS.
-            let work_abs = fs::canonicalize(&work).unwrap_or_else(|_| work.clone());
-            let wrapped =
-                format!("{build}; rc=$?; chown -R \"$(stat -c '%u:%g' /src)\" /src 2>/dev/null || true; exit $rc");
-            let mut cmd = process::Command::new(runtime);
-            cmd.arg("run").arg("--rm");
-            if let Ok(net) = env::var("HOST_LIFECYCLE_DOCKER_NETWORK") {
-                if !net.is_empty() {
-                    cmd.arg("--network").arg(net);
-                }
-            }
-            cmd.arg("-v")
-                .arg(format!("{}:/src", work_abs.to_string_lossy()))
-                .arg("-w")
-                .arg("/src")
-                .arg(image)
-                .arg("sh")
-                .arg("-c")
-                .arg(&wrapped);
-            let built = cmd.status().map(|st| st.success()).unwrap_or(false);
+            // Run the recorded recipe inside the recorded image, never the ambient rust.
+            let built = run_build_in_container(runtime, image, build, &work);
             if !built {
                 println!("ERROR    {tag} — build failed in {runtime} {image}: `{build}`");
                 bad += 1;
@@ -4260,6 +4269,407 @@ fn receipt_list(dir: Option<&String>) {
     }
 }
 
+// ---- Release orchestration (plan/0025) -------------------------------------
+//
+// `host-lifecycle release <component>` is the single agent-facing driver (Fen
+// fold-back #1: one command, the tool holds the sequence). It gates each step and
+// COMPUTES the version and artifact hash itself, so a weak agent never names a semver
+// level (fold-back #2) and never hand-derives a hash (the strong-agent near-miss this
+// milestone exists to prevent). The migrated escape prints and validates an exact
+// `call/NNNN` skip citation (fold-back #3). The outward `git push` is never run by the
+// tool — software-first ordering and the push-authorization rule keep it operator-run.
+
+/// The change class the agent answers — the ONE release decision Fen makes. Concrete
+/// (does this remove/rename a flag or change output? add one? neither?), never the
+/// semver level: the Fen de-risk had the 4B reason "breaking" yet answer `minor`, so
+/// the tool maps the class to a level and the agent never picks the level.
+enum ChangeClass {
+    Breaking,
+    Feature,
+    Fix,
+}
+
+const CHANGE_CLASSES: &str = "removes-flag|adds-flag|neither";
+
+fn parse_change_class(s: &str) -> Option<ChangeClass> {
+    match s {
+        "removes-flag" | "renames-flag" | "changes-output" | "breaking" => Some(ChangeClass::Breaking),
+        "adds-flag" | "feature" => Some(ChangeClass::Feature),
+        "neither" | "fix" => Some(ChangeClass::Fix),
+        _ => None,
+    }
+}
+
+/// Map a change class to the next version from the current `x.y.z`. Pre-1.0 (`0.y.z`)
+/// the minor is cargo's compat position, so a breaking change bumps it (never jumping
+/// 0.4.2 to 1.0.0); a feature also bumps the minor — the convention this tool family
+/// itself follows (each `host-lifecycle 0.N.0` was a feature) and the visibility a 0.x
+/// project wants — and only a fix is a patch. Post-1.0 it is textbook semver. The tool
+/// writes this; the agent never types a version.
+fn next_version(current: &str, class: &ChangeClass) -> Result<String, String> {
+    let parts: Vec<&str> = current.trim().trim_start_matches('v').split('.').collect();
+    if parts.len() != 3 {
+        return Err(format!("version `{current}` is not `x.y.z`"));
+    }
+    let mut n = [0u64; 3];
+    for (i, p) in parts.iter().enumerate() {
+        n[i] = p.parse().map_err(|_| format!("version `{current}` has a non-numeric component `{p}`"))?;
+    }
+    let (major, minor, patch) = (n[0], n[1], n[2]);
+    let (a, b, c) = if major == 0 {
+        match class {
+            ChangeClass::Breaking | ChangeClass::Feature => (0, minor + 1, 0),
+            ChangeClass::Fix => (0, minor, patch + 1),
+        }
+    } else {
+        match class {
+            ChangeClass::Breaking => (major + 1, 0, 0),
+            ChangeClass::Feature => (major, minor + 1, 0),
+            ChangeClass::Fix => (major, minor, patch + 1),
+        }
+    };
+    Ok(format!("{a}.{b}.{c}"))
+}
+
+/// Replace the `version = "…"` line in the `[package]` table of a Cargo.toml. Returns
+/// `None` if there is no `[package]` version line (a tool with no manifest never reaches
+/// this). Only the first `[package]` version is touched — dependency versions in other
+/// tables are left alone.
+fn set_cargo_version(text: &str, new: &str) -> Option<String> {
+    let mut in_package = false;
+    let mut done = false;
+    let mut out = String::with_capacity(text.len() + 16);
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+        }
+        if in_package && !done {
+            if let Some(rest) = t.strip_prefix("version") {
+                if rest.trim_start().starts_with('=') {
+                    out.push_str(&format!("version = \"{new}\"\n"));
+                    done = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    done.then_some(out)
+}
+
+/// A migrated-escape skip cites a bare `call/NNNN` — never a phase name or a
+/// `phase/NNNN` token. The Fen de-risk emitted `--skip reproducible-build/0031`,
+/// conflating the phase with the decision id, so `--record` rejects anything but
+/// `call/` + digits and `--next` prints the literal correct command to copy.
+fn valid_skip_citation(s: &str) -> bool {
+    matches!(s.strip_prefix("call/"), Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// An artifact-bearing component (a recorded `artifact` hash, e.g. host-lint) re-builds
+/// and re-hashes on release; a tool (skills/scripts, no artifact, e.g. host-prove) is a
+/// tag-only release. Read from the recipe, not guessed (plan/0025: "the orchestration
+/// reads the recipe; it is not one fixed procedure").
+fn is_artifact_bearing(s: &Software) -> bool {
+    s.builds_view().iter().any(|b| b.artifact.is_some())
+}
+
+/// A component's `repro-exempt` citation (migrated/foreign provenance), if any — the
+/// only components for which a `release --skip` is reachable (R3: never greenfield).
+fn repro_exempt_cite(s: &Software) -> Option<String> {
+    s.builds_view().iter().find_map(|b| b.repro_exempt.map(String::from))
+}
+
+fn release(args: &[String]) {
+    if args.first().map(String::as_str) == Some("--record") {
+        release_record_skip(&args[1..]);
+        return;
+    }
+    let (mut component, mut change_class, mut dir, mut preview) = (None, None, String::from("."), false);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--next" => { preview = true; i += 1; }
+            "--change-class" => { change_class = args.get(i + 1).cloned(); i += 2; }
+            s if s.starts_with("--") => { i += 1; }
+            s if component.is_none() => { component = Some(s.to_string()); i += 1; }
+            s => { dir = s.to_string(); i += 1; }
+        }
+    }
+    let Some(component) = component else {
+        eprintln!("usage: host-lifecycle release <component> [--change-class {CHANGE_CLASSES}] [<dir>]");
+        eprintln!("       host-lifecycle release --next <component> [<dir>]");
+        eprintln!("       host-lifecycle release --record <component> --skip call/NNNN [<dir>]");
+        process::exit(2);
+    };
+    run_release(Path::new(&dir), &component, change_class.as_deref(), preview);
+}
+
+/// Resolve the component's recipe + a live `release` phase, exiting with a clear
+/// message when either is missing (release is a manifest-driven phase).
+fn release_context<'a>(root: &Path, recipe: &'a [Software], component: &str) -> &'a Software {
+    let Some(s) = recipe.iter().find(|s| s.name == component) else {
+        eprintln!("host-lifecycle: no component `{component}` in {SOFTWARE}");
+        process::exit(2);
+    };
+    match load_project_manifest(root) {
+        ManifestState::Live(ps) if ps.iter().any(|p| p.name == "release") => {}
+        ManifestState::Live(_) => {
+            eprintln!("host-lifecycle: the lifecycle manifest declares no `release` phase (upgrade the template — plan/0025 spine)");
+            process::exit(2);
+        }
+        _ => {
+            eprintln!("host-lifecycle: release needs a {MANIFEST} with a `release` phase; the adopted template has none (adopt/upgrade — plan/0025 spine)");
+            process::exit(2);
+        }
+    }
+    s
+}
+
+/// The current version of a component: an artifact-bearing crate reads its worktree
+/// `Cargo.toml` `[package] version`; a tool reads its latest `v*` git tag.
+fn current_version(root: &Path, s: &Software) -> Result<String, String> {
+    let work = root.join(&s.name);
+    if is_artifact_bearing(s) {
+        let toml = fs::read_to_string(work.join("Cargo.toml")).map_err(|e| format!("cannot read {}/Cargo.toml: {e}", s.name))?;
+        cargo_version(&toml).ok_or_else(|| format!("{}/Cargo.toml has no [package] version", s.name))
+    } else {
+        let tag = git_out(&work, &["describe", "--tags", "--abbrev=0"]).ok_or_else(|| format!("{} has no version tag to release from", s.name))?;
+        Ok(tag.trim().trim_start_matches('v').to_string())
+    }
+}
+
+/// Read the `[package] version` from a Cargo.toml (the inverse of `set_cargo_version`).
+fn cargo_version(text: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+        }
+        if in_package {
+            if let Some(rest) = t.strip_prefix("version") {
+                if let Some(v) = rest.trim_start().strip_prefix('=') {
+                    return Some(v.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview: bool) {
+    let recipe = load_software(root);
+    let s = release_context(root, &recipe, component);
+    let work = root.join(&s.name);
+
+    // The migrated escape: a repro-exempt component cannot reproduce a foreign
+    // toolchain, so its release is a cited skip — the tool prints the LITERAL command
+    // with the real citation, so Fen copies an exact `call/NNNN` (fold-back #3).
+    if let Some(cite) = repro_exempt_cite(s) {
+        println!("release {component} is repro-exempt ({cite}) — record the migrated skip:");
+        println!("    host-lifecycle release --record {component} --skip {cite}");
+        return;
+    }
+
+    if preview {
+        match change_class {
+            None => {
+                println!("next: host-lifecycle release {component} --change-class <{CHANGE_CLASSES}>");
+                println!("  (the tool maps the change class to the version; you never name a semver level)");
+            }
+            Some(_) => println!("next: host-lifecycle release {component} --change-class {} (runs the gated sequence)", change_class.unwrap()),
+        }
+        return;
+    }
+
+    // Step 1 — verify. Run the manifest `verify` phase's closed recheck; red blocks.
+    if let Some(cmd) = verify_recheck(root) {
+        println!("release {component}: running the verify gate …");
+        if !run_verify(root, &cmd) {
+            eprintln!("host-lifecycle: verify is RED — release blocked. Fix the verify sweep, then re-run.");
+            process::exit(1);
+        }
+        println!("  verify: green");
+    }
+
+    // Step 2 — change class. The one decision the agent supplies; the tool maps it.
+    let Some(class_str) = change_class else {
+        println!("next: host-lifecycle release {component} --change-class <{CHANGE_CLASSES}>");
+        println!("  removes-flag = a removed/renamed public flag or changed output (breaking)");
+        println!("  adds-flag    = a new flag or behaviour (feature)");
+        println!("  neither      = a fix only");
+        return;
+    };
+    let Some(class) = parse_change_class(class_str) else {
+        eprintln!("host-lifecycle: unknown change class `{class_str}` — use one of {CHANGE_CLASSES}");
+        process::exit(2);
+    };
+    let cur = match current_version(root, s) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("host-lifecycle: {e}"); process::exit(2); }
+    };
+    let new = match next_version(&cur, &class) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("host-lifecycle: {e}"); process::exit(2); }
+    };
+    println!("  version: {cur} -> {new} (the tool computed this from the change class)");
+
+    if !is_artifact_bearing(s) {
+        // A tool: tag-only, no artifact to rebuild/re-hash.
+        println!("\nrelease {component} v{new} — tool (no artifact). Outward steps (operator-run):");
+        println!("    cd {} && git tag -a v{new} -m 'release v{new}' && git push origin v{new}", work.display());
+        println!("    host-lifecycle receipt --record release --component {component} --disposition done --evidence v{new}");
+        return;
+    }
+
+    // Step 3 — build in the recorded toolchain and COMPUTE the canonical hash. With no
+    // container runtime the release BLOCKS — the re-pin/re-hash hazard is never handed
+    // to a weak agent to do by hand (R5/R6).
+    let Some(view) = s.builds_view().into_iter().find(|b| b.artifact.is_some()) else {
+        eprintln!("host-lifecycle: {component} has no artifact build to release");
+        process::exit(2);
+    };
+    let (artifact_path, _old_hash) = view.artifact.expect("filtered to artifact-bearing");
+    let Some(image) = view.toolchain else {
+        eprintln!("host-lifecycle: {component} records an artifact but no `toolchain` image — cannot build the canonical hash in a pinned environment");
+        process::exit(1);
+    };
+    let Some(runtime) = container_runtime() else {
+        eprintln!("host-lifecycle: no container runtime (docker/podman) — release BLOCKS; the canonical hash must come from the recorded toolchain {image}, never an ambient build (R5/R6)");
+        process::exit(1);
+    };
+
+    // First, bump the worktree Cargo.toml — the tool writes the version (fold-back #2).
+    let toml_path = work.join("Cargo.toml");
+    let toml = match fs::read_to_string(&toml_path) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("host-lifecycle: cannot read {}: {e}", toml_path.display()); process::exit(2); }
+    };
+    if cargo_version(&toml).as_deref() != Some(&new) {
+        match set_cargo_version(&toml, &new) {
+            Some(updated) => {
+                if let Err(e) = fs::write(&toml_path, updated) {
+                    eprintln!("host-lifecycle: cannot write {}: {e}", toml_path.display());
+                    process::exit(2);
+                }
+                println!("  bumped {}/Cargo.toml to {new}", s.name);
+            }
+            None => { eprintln!("host-lifecycle: {}/Cargo.toml has no [package] version to bump", s.name); process::exit(2); }
+        }
+    }
+
+    // Build the bumped worktree in the recorded image and hash the artifact. The hash
+    // is computed from this verified build — the tool refuses to record any other.
+    println!("  building {component} in {image} to compute the canonical hash …");
+    if !run_build_in_container(runtime, image, view.build.unwrap_or("cargo build --release"), &work) {
+        eprintln!("host-lifecycle: build failed in {runtime} {image} — release blocked");
+        process::exit(1);
+    }
+    let Some(hash) = sha256_file(&work.join(artifact_path)) else {
+        eprintln!("host-lifecycle: built artifact {artifact_path} not found after the build");
+        process::exit(1);
+    };
+    println!("  canonical hash: {hash}");
+
+    // Step 4 — the operator-run outward sequence, with the tool-computed values filled
+    // in. The tool never pushes (software-first ordering + push authorization); it
+    // hands over the EXACT re-pin/re-hash so nothing is hand-derived.
+    println!("\nrelease {component} v{new} — verified build reproduces. Outward steps (operator-run):");
+    println!("    cd {} && git commit -am 'release v{new}' && git push", work.display());
+    println!("    git -C {} tag -a v{new} -m 'release v{new}' && git -C {0} push origin v{new}", work.display());
+    println!("  then re-pin {SOFTWARE} for [software \"{component}\"]:");
+    println!("    pin      = <the pushed commit SHA>");
+    println!("    artifact = {artifact_path} {hash}");
+    println!("    host-lifecycle receipt --record release --component {component} --disposition done --evidence v{new}@{hash}");
+}
+
+/// The `verify` phase's closed `recheck` command from the live manifest (the verify
+/// sweep the release gate runs). `None` when no manifest verify phase declares one.
+fn verify_recheck(root: &Path) -> Option<String> {
+    match load_project_manifest(root) {
+        ManifestState::Live(ps) => ps.into_iter().find(|p| p.name == "verify").and_then(|p| p.recheck),
+        _ => None,
+    }
+}
+
+/// `release --record <component> --skip call/NNNN`: the content-validated migrated
+/// escape (R3). The citation must be a bare `call/NNNN` (fold-back #3); the cited
+/// decision must exist, be accepted, and be scoped (not the methodology meta-decision);
+/// and the component must be repro-exempt (never greenfield-reachable).
+fn release_record_skip(args: &[String]) {
+    let (mut component, mut cite, mut dir) = (None, None, String::from("."));
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--skip" => { cite = args.get(i + 1).cloned(); i += 2; }
+            s if s.starts_with("--") => { i += 1; }
+            s if component.is_none() => { component = Some(s.to_string()); i += 1; }
+            s => { dir = s.to_string(); i += 1; }
+        }
+    }
+    let (Some(component), Some(cite)) = (component, cite) else {
+        eprintln!("usage: host-lifecycle release --record <component> --skip call/NNNN [<dir>]");
+        process::exit(2);
+    };
+    let root = Path::new(&dir);
+    if !valid_skip_citation(&cite) {
+        eprintln!("host-lifecycle: `--skip {cite}` is not a bare `call/NNNN` — cite the decision id, not a phase name");
+        process::exit(2);
+    }
+    let recipe = load_software(root);
+    let s = release_context(root, &recipe, &component);
+    if repro_exempt_cite(s).is_none() {
+        eprintln!("host-lifecycle: {component} is not repro-exempt — a release skip is only for migrated/foreign provenance, never a greenfield component (R3)");
+        process::exit(2);
+    }
+    if !cited_decision_exists(root, &cite) {
+        eprintln!("host-lifecycle: cited decision {cite} not found under call/");
+        process::exit(2);
+    }
+    let body = decision_body(root, &cite).unwrap_or_default();
+    if let Some(problem) = decision_scope_problem(&body) {
+        eprintln!("host-lifecycle: {cite} cannot authorize a skip: {problem}");
+        process::exit(2);
+    }
+    if decision_field(&body, "Status").map(|s| s.to_ascii_lowercase()).is_none_or(|st| !st.starts_with("accepted")) {
+        eprintln!("host-lifecycle: {cite} is not `Status: accepted` — only an accepted decision authorizes a skip");
+        process::exit(2);
+    }
+    let r = Receipt {
+        phase: "release".to_string(),
+        component: Some(component.clone()),
+        disposition: "skip".to_string(),
+        evidence: None,
+        reason: Some(cite.clone()),
+        tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
+        recorded: Some(today()),
+    };
+    if let Err(e) = append_receipt(root, &r) {
+        eprintln!("host-lifecycle: cannot write {RECEIPTS}: {e}");
+        process::exit(2);
+    }
+    println!("recorded receipt: phase release ({component}) = skip ({cite})");
+}
+
+/// Read a cited decision's markdown body (the first `call/<num>-*.md` matching the id).
+fn decision_body(root: &Path, cite: &str) -> Option<String> {
+    let num = cite.trim_start_matches("call/").split('-').next().unwrap_or("");
+    if num.is_empty() {
+        return None;
+    }
+    let pfx = format!("{num}-");
+    let rd = fs::read_dir(root.join("call")).ok()?;
+    for e in rd.filter_map(|e| e.ok()) {
+        let n = e.file_name().to_string_lossy().to_string();
+        if n.starts_with(&pfx) && n.ends_with(".md") {
+            return fs::read_to_string(e.path()).ok();
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod remap_tests {
     use super::*;
@@ -4425,6 +4835,54 @@ mod tests {
         let skip = parse_receipts("[receipt \"verify\"]\n    disposition = skip\n    reason = call/1\n");
         let vs = receipt_gate(&phases, &skip, false, &[]).into_iter().find(|l| l.label.contains("verify")).unwrap();
         assert!(!vs.ok && vs.note.contains("protected"));
+    }
+
+    #[test]
+    fn next_version_maps_class_pre_and_post_1_0() {
+        // pre-1.0: breaking AND feature bump the minor (this project's convention —
+        // every host-lifecycle 0.N.0 was a feature); only a fix is a patch.
+        assert_eq!(next_version("0.4.2", &ChangeClass::Breaking).unwrap(), "0.5.0");
+        assert_eq!(next_version("0.4.2", &ChangeClass::Feature).unwrap(), "0.5.0");
+        assert_eq!(next_version("0.4.2", &ChangeClass::Fix).unwrap(), "0.4.3");
+        // a leading `v` is tolerated (tool versions read from a `v*` tag).
+        assert_eq!(next_version("v0.18.1", &ChangeClass::Feature).unwrap(), "0.19.0");
+        // post-1.0: textbook semver.
+        assert_eq!(next_version("1.4.2", &ChangeClass::Breaking).unwrap(), "2.0.0");
+        assert_eq!(next_version("1.4.2", &ChangeClass::Feature).unwrap(), "1.5.0");
+        assert_eq!(next_version("1.4.2", &ChangeClass::Fix).unwrap(), "1.4.3");
+        // malformed input is an error, never a silent guess.
+        assert!(next_version("0.4", &ChangeClass::Fix).is_err());
+        assert!(next_version("0.4.x", &ChangeClass::Fix).is_err());
+    }
+
+    #[test]
+    fn change_class_is_concrete_not_a_semver_level() {
+        // the agent answers the concrete change, never `major|minor|patch`.
+        assert!(matches!(parse_change_class("removes-flag"), Some(ChangeClass::Breaking)));
+        assert!(matches!(parse_change_class("adds-flag"), Some(ChangeClass::Feature)));
+        assert!(matches!(parse_change_class("neither"), Some(ChangeClass::Fix)));
+        assert!(parse_change_class("minor").is_none(), "a semver level is not a change class (the Fen fumble)");
+    }
+
+    #[test]
+    fn cargo_version_round_trips_and_skips_other_tables() {
+        let toml = "[package]\nname = \"host-lint\"\nversion = \"0.4.2\"\n\n[dependencies]\nserde = { version = \"1.0\" }\n";
+        assert_eq!(cargo_version(toml).as_deref(), Some("0.4.2"));
+        let bumped = set_cargo_version(toml, "0.5.0").unwrap();
+        assert_eq!(cargo_version(&bumped).as_deref(), Some("0.5.0"));
+        // the dependency version in [dependencies] is untouched.
+        assert!(bumped.contains("serde = { version = \"1.0\" }"));
+        // no [package] version → None (a tool with no crate manifest).
+        assert!(set_cargo_version("[workspace]\nmembers = []\n", "1.0.0").is_none());
+    }
+
+    #[test]
+    fn skip_citation_must_be_bare_call_id() {
+        assert!(valid_skip_citation("call/0031"));
+        assert!(!valid_skip_citation("reproducible-build/0031"), "the Fen fumble: phase name, not a call id");
+        assert!(!valid_skip_citation("call/"));
+        assert!(!valid_skip_citation("call/12a"));
+        assert!(!valid_skip_citation("0031"));
     }
 
     #[test]
