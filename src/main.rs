@@ -801,7 +801,9 @@ fn collect_files(dir: &Path, root: &Path, subs: &[String], out: &mut Vec<PathBuf
                 .ok()
                 .map(|r| r.to_string_lossy().replace('\\', "/"));
             if let Some(rel) = &rel {
-                if subs.iter().any(|s| s == rel) {
+                // The materialized Where room (plan/0029): `software/<component>/…` holds
+                // every component's full source — never walked by the naming audit / remap.
+                if rel == "software" || subs.iter().any(|s| s == rel) {
                     continue;
                 }
             }
@@ -965,12 +967,16 @@ struct Software {
     name: String,
     url: String,
     pin: String,
-    /// Bare `worktrees = <dir> ...` form: branch derived from the dir suffix, tree
-    /// created at the component `pin`. Kept for back-compat.
+    /// The canonical worktree's branch (plan/0029): the pin is checked out at
+    /// `software/<name>/<branch>/` on this branch, reset to `pin`. Defaults to `main`.
+    branch: String,
+    /// Bare `worktrees = <branch> ...` form: a parallel line per branch, materialized
+    /// at `software/<name>/<branch>/` (the branch is the path key; plan/0029).
     worktrees: Vec<String>,
-    /// Explicit `worktree = <dir> <branch> <pin>` form: a parallel line on its own
-    /// branch at its own pin, faithfully reproducible by `--materialize` (the bare
-    /// form silently put a parallel line at the canonical pin — issue #6).
+    /// Explicit `worktree = <branch> <pin> [store=<path>] [host=<os>]` form: a parallel
+    /// line on its own branch at its own pin, faithfully reproducible by `--materialize`.
+    /// The path is derived from the branch (`software/<name>/<branch>/`); a `store=`
+    /// line lives off-tree with that path as the in-tree handle.
     lines: Vec<Worktree>,
     /// Reproducible-build provenance (issue #10), all optional:
     /// `build`/`toolchain` — the recorded deterministic recipe (run by `--verify-build`);
@@ -993,15 +999,15 @@ struct Software {
     builds: Vec<PlatformBuild>,
 }
 
-/// An explicit parallel worktree: a directory checked out on `branch` at `pin`.
-/// `dir` is always the in-structure handle (under the host root). When `store` is
-/// set the git worktree physically lives there — possibly off-tree / off-filesystem
-/// — and `dir` is materialized as a symlink/junction to it, so an agent editing
-/// `dir/…` writes the files under test (issue #2). `host`, when set, gates the line
-/// to one OS (`std::env::consts::OS`), mirroring a build's `attest_host`: off-platform
-/// the line is skipped by `--materialize`/`--check` rather than reported missing.
+/// An explicit parallel worktree: a tree checked out on `branch` at `pin`, located at
+/// `software/<name>/<branch>/` (the in-structure handle, under the host root). When
+/// `store` is set the git worktree physically lives there — possibly off-tree /
+/// off-filesystem — and the in-tree path is materialized as a symlink/junction to it,
+/// so an agent editing it writes the files under test (issue #2). `host`, when set,
+/// gates the line to one OS (`std::env::consts::OS`), mirroring a build's `attest_host`:
+/// off-platform the line is skipped by `--materialize`/`--check` rather than reported
+/// missing.
 struct Worktree {
-    dir: String,
     branch: String,
     pin: String,
     store: Option<String>,
@@ -1146,7 +1152,7 @@ fn install_hooks(root: &Path, recipe: &[Software]) -> (usize, usize) {
     let mut failed = 0;
     for s in recipe {
         let Some(hooks_rel) = &s.hooks else { continue };
-        let worktree = root.join(&s.name);
+        let worktree = worktree_dir(root, &s.name, &s.branch);
         let script = worktree.join(hooks_rel);
         if !script.is_file() {
             println!("MISSING  {}/{hooks_rel} (run --materialize)", s.name);
@@ -1291,7 +1297,7 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
     let mut bad = 0usize;
     let host = std::env::consts::OS;
     for s in recipe {
-        let bare = root.join(format!("{}.git", s.name));
+        let bare = store_dir(root, &s.name);
         for b in s.builds_view() {
             let tag = match b.platform {
                 Some(p) => format!("{} [{}]", s.name, p),
@@ -1337,14 +1343,14 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
                 continue;
             };
             if !bare.is_dir() {
-                println!("MISSING  {}.git (run --materialize)", s.name);
+                println!("MISSING  software/{}/.git (run --materialize)", s.name);
                 bad += 1;
                 continue;
             }
-            // A per-platform verify worktree, so concurrent platform builds of the
-            // same source pin do not collide on one tree.
+            // A per-platform verify worktree under the component dir, so concurrent
+            // platform builds of the same source pin do not collide on one tree.
             let suffix = b.platform.map(|p| format!("-{p}")).unwrap_or_default();
-            let work = root.join(format!(".host-verify-{}{suffix}", s.name));
+            let work = component_dir(root, &s.name).join(format!(".host-verify{suffix}"));
             let _ = fs::remove_dir_all(&work);
             let work_s = work.to_string_lossy().to_string();
             if !git_ok(&bare, &["worktree", "add", "--detach", &work_s, &s.pin]) {
@@ -1410,6 +1416,7 @@ fn parse_software(text: &str) -> Vec<Software> {
                 name: name.to_string(),
                 url: String::new(),
                 pin: String::new(),
+                branch: "main".to_string(),
                 worktrees: Vec::new(),
                 lines: Vec::new(),
                 build: None,
@@ -1481,22 +1488,24 @@ fn parse_software(text: &str) -> Vec<Software> {
         match key {
             "url" => cur.url = val.to_string(),
             "pin" => cur.pin = val.to_string(),
+            "branch" => cur.branch = val.to_string(),
             "worktrees" => cur.worktrees = val.split_whitespace().map(String::from).collect(),
             "worktree" => {
-                // `worktree = <dir> <branch> <pin> [store=<path>] [host=<os>]` — a
-                // parallel line, fully pinned; optional external store + OS gate.
+                // `worktree = <branch> <pin> [store=<path>] [host=<os>]` — a parallel
+                // line, fully pinned; the path is `software/<name>/<branch>/`; optional
+                // external store + OS gate (plan/0029 retired the leading <dir> token).
                 let f: Vec<&str> = val.split_whitespace().collect();
-                if f.len() < 3 {
+                if f.len() < 2 {
                     eprintln!(
-                        "host-lifecycle: {SOFTWARE}:{}: `worktree` needs `<dir> <branch> <pin> [store=<path>] [host=<os>]`",
+                        "host-lifecycle: {SOFTWARE}:{}: `worktree` needs `<branch> <pin> [store=<path>] [host=<os>]`",
                         i + 1
                     );
                     process::exit(2);
                 }
-                let (dir, branch, pin) = (f[0], f[1], f[2]);
+                let (branch, pin) = (f[0], f[1]);
                 let mut store = None;
                 let mut host = None;
-                for tok in &f[3..] {
+                for tok in &f[2..] {
                     if let Some(v) = tok.strip_prefix("store=") {
                         store = Some(v.to_string());
                     } else if let Some(v) = tok.strip_prefix("host=") {
@@ -1507,7 +1516,6 @@ fn parse_software(text: &str) -> Vec<Software> {
                     }
                 }
                 cur.lines.push(Worktree {
-                    dir: dir.to_string(),
                     branch: branch.to_string(),
                     pin: pin.to_string(),
                     store,
@@ -1565,6 +1573,35 @@ fn escapes_root(dir: &str) -> bool {
     false
 }
 
+/// The Where-room software root: every component materializes under `<root>/software/`
+/// (plan/0029), replacing the old root-scattered `<name>/`, `<name>.git/`, `<name>.<line>/`.
+fn software_dir(root: &Path) -> PathBuf {
+    root.join("software")
+}
+
+/// A component's directory: `<root>/software/<name>/`.
+fn component_dir(root: &Path, name: &str) -> PathBuf {
+    software_dir(root).join(name)
+}
+
+/// A component's bare object store: `<root>/software/<name>/.git/` (store-dir name
+/// fixed to `.git`; it sits beside the branch worktrees, never inside one).
+fn store_dir(root: &Path, name: &str) -> PathBuf {
+    component_dir(root, name).join(".git")
+}
+
+/// A component worktree, keyed by branch: `<root>/software/<name>/<branch>/`. The
+/// branch keeps its slashes (`feature/login` nests); the canonical worktree is the
+/// component's recorded `branch` (default `main`).
+fn worktree_dir(root: &Path, name: &str, branch: &str) -> PathBuf {
+    component_dir(root, name).join(branch)
+}
+
+/// A worktree's display label, e.g. `software/<name>/<branch>`.
+fn worktree_label(name: &str, branch: &str) -> String {
+    format!("software/{name}/{branch}")
+}
+
 /// Create the in-structure handle `link` → `target` for an external-store worktree:
 /// a symlink on unix, a directory junction on Windows (a junction needs no
 /// privilege, unlike a Windows symlink). The handle lives under the host root so an
@@ -1589,17 +1626,31 @@ fn make_handle(link: &Path, target: &Path) -> std::io::Result<()> {
 }
 
 /// A parallel line's filesystem location: the external `store` if set, else the
-/// in-tree `root/<dir>`.
-fn line_target(root: &Path, w: &Worktree) -> PathBuf {
+/// in-tree `software/<name>/<branch>/`.
+fn line_target(root: &Path, name: &str, w: &Worktree) -> PathBuf {
     match &w.store {
         Some(s) => PathBuf::from(s),
-        None => root.join(&w.dir),
+        None => worktree_dir(root, name, &w.branch),
     }
 }
 
 /// True when a host-gated line should be skipped on the current OS.
 fn off_platform(host: &Option<String>) -> bool {
     host.as_deref().is_some_and(|h| h != std::env::consts::OS)
+}
+
+/// Add a git worktree at `path` from the bare store `bare`, creating the parent dirs
+/// first (a nested branch like `feature/login` needs `…/feature/` to exist), and
+/// initializing submodules on success. Returns whether the add succeeded.
+fn add_worktree(bare: &Path, path: &Path, args: &[&str]) -> bool {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if !git_ok(bare, args) {
+        return false;
+    }
+    git_ok(path, &["submodule", "update", "--init", "--recursive"]);
+    true
 }
 
 /// `--materialize`: clone the bare store and add the worktrees, skipping any that
@@ -1609,83 +1660,86 @@ fn off_platform(host: &Option<String>) -> bool {
 fn software_materialize(root: &Path, recipe: &[Software]) {
     let mut made = 0usize;
     for s in recipe {
-        let bare_name = format!("{}.git", s.name);
-        let bare = root.join(&bare_name);
-        let canon = root.join(&s.name);
+        let bare = store_dir(root, &s.name);
+        let bare_rel = format!("software/{}/.git", s.name);
+        let canon = worktree_dir(root, &s.name, &s.branch);
         if bare.exists() {
-            println!("skip     {bare_name} (exists)");
+            println!("skip     {bare_rel} (exists)");
         } else {
-            if !git_ok(root, &["clone", "--bare", &s.url, &bare_name]) {
+            if !git_ok(root, &["clone", "--bare", &s.url, &bare_rel]) {
                 eprintln!("host-lifecycle: git clone --bare failed for {}", s.name);
                 process::exit(2);
             }
             git_ok(&bare, &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
             git_ok(&bare, &["fetch", "origin"]);
-            println!("clone    {bare_name}");
+            println!("clone    {bare_rel}");
             made += 1;
         }
+        // Canonical worktree: on its `branch`, reset to the `pin` (plan/0029) — `-B`
+        // creates-or-resets the branch, so the audited tree is the pin on a real branch.
+        let canon_label = worktree_label(&s.name, &s.branch);
         if canon.exists() {
-            println!("skip     {}/ (exists)", s.name);
+            println!("skip     {canon_label} (exists)");
+        } else if !add_worktree(&bare, &canon, &["worktree", "add", "-B", &s.branch, &canon.to_string_lossy(), &s.pin]) {
+            eprintln!("host-lifecycle: worktree add {canon_label} @ {} failed", short(&s.pin));
+            process::exit(2);
         } else {
-            let canon_s = canon.to_string_lossy();
-            if !git_ok(&bare, &["worktree", "add", &canon_s, &s.pin]) {
-                eprintln!("host-lifecycle: worktree add {}/ @ {} failed", s.name, short(&s.pin));
-                process::exit(2);
-            }
-            git_ok(&canon, &["submodule", "update", "--init", "--recursive"]);
-            println!("worktree {}/ @ {}", s.name, short(&s.pin));
+            println!("worktree {canon_label} @ {}", short(&s.pin));
             made += 1;
         }
-        for wt in &s.worktrees {
-            let wtp = root.join(wt);
+        // Bare `worktrees = <branch> …`: a parallel line per branch (existing branch at
+        // its tip, else created at the component pin), keyed by branch under the component.
+        for branch in &s.worktrees {
+            let wtp = worktree_dir(root, &s.name, branch);
+            let label = worktree_label(&s.name, branch);
             if wtp.exists() {
-                println!("skip     {wt}/ (exists)");
+                println!("skip     {label} (exists)");
                 continue;
             }
-            let branch = wt.strip_prefix(&format!("{}.", s.name)).unwrap_or(wt);
-            let wtp_s = wtp.to_string_lossy();
-            let ok = if git_ok(&bare, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]) {
-                git_ok(&bare, &["worktree", "add", &wtp_s, branch])
+            let wtp_s = wtp.to_string_lossy().to_string();
+            let exists = git_ok(&bare, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]);
+            let args: Vec<&str> = if exists {
+                vec!["worktree", "add", &wtp_s, branch]
             } else {
-                git_ok(&bare, &["worktree", "add", "-b", branch, &wtp_s, &s.pin])
+                vec!["worktree", "add", "-b", branch, &wtp_s, &s.pin]
             };
-            if !ok {
-                eprintln!("host-lifecycle: worktree add {wt}/ failed");
+            if !add_worktree(&bare, &wtp, &args) {
+                eprintln!("host-lifecycle: worktree add {label} failed");
                 process::exit(2);
             }
-            git_ok(&wtp, &["submodule", "update", "--init", "--recursive"]);
-            println!("worktree {wt}/ ({branch})");
+            println!("worktree {label} ({branch})");
             made += 1;
         }
+        // Explicit `worktree = <branch> <pin> …`: own branch at own pin, maybe off-tree.
         for w in &s.lines {
+            let label = worktree_label(&s.name, &w.branch);
             if off_platform(&w.host) {
-                println!("skip     {}/ (host {}, not {})", w.dir, w.host.as_deref().unwrap_or(""), std::env::consts::OS);
+                println!("skip     {label} (host {}, not {})", w.host.as_deref().unwrap_or(""), std::env::consts::OS);
                 continue;
             }
-            let handle = root.join(&w.dir);
-            let target = line_target(root, w);
+            let handle = worktree_dir(root, &s.name, &w.branch);
+            let target = line_target(root, &s.name, w);
             let target_s = target.to_string_lossy().to_string();
-            // The git worktree itself, at the external store or in-tree. `-B` creates
-            // or resets `branch` to the recorded `pin`, so a parallel line lands on its
-            // own branch at its own commit — not the canonical pin.
             if target.exists() {
                 println!("skip     {target_s} (exists)");
-            } else if !git_ok(&bare, &["worktree", "add", "-B", &w.branch, &target_s, &w.pin]) {
+            } else if !add_worktree(&bare, &target, &["worktree", "add", "-B", &w.branch, &target_s, &w.pin]) {
                 eprintln!("host-lifecycle: worktree add {target_s} @ {} failed", short(&w.pin));
                 process::exit(2);
             } else {
-                git_ok(&target, &["submodule", "update", "--init", "--recursive"]);
                 println!("worktree {target_s} ({} @ {})", w.branch, short(&w.pin));
                 made += 1;
             }
             // The in-structure handle: a symlink/junction so an external store still
             // surfaces under the host root (issue #2).
             if w.store.is_some() && fs::symlink_metadata(&handle).is_err() {
+                if let Some(parent) = handle.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
                 if let Err(e) = make_handle(&handle, &target) {
-                    eprintln!("host-lifecycle: handle {}/ -> {target_s} failed: {e}", w.dir);
+                    eprintln!("host-lifecycle: handle {label} -> {target_s} failed: {e}");
                     process::exit(2);
                 }
-                println!("handle   {}/ -> {target_s}", w.dir);
+                println!("handle   {label} -> {target_s}");
                 made += 1;
             }
         }
@@ -1744,43 +1798,44 @@ fn upgrade_claim_problems(root: &Path) -> usize {
 fn software_check(root: &Path, recipe: &[Software]) {
     let mut bad = 0usize;
     for s in recipe {
-        let bare = root.join(format!("{}.git", s.name));
-        let canon = root.join(&s.name);
-        // Where-room invariant (issue #2): every materialized worktree path must
-        // stay under the host root. A path that escapes — absolute or `..`-climbing
-        // — is the wrong-tree footgun; the sanctioned off-tree store is a `store=`
-        // line, whose `dir` is still an in-tree handle.
-        if escapes_root(&s.name) {
-            println!("HAZARD   {}/ escapes the host root", s.name);
+        let bare = store_dir(root, &s.name);
+        let canon = worktree_dir(root, &s.name, &s.branch);
+        let canon_label = worktree_label(&s.name, &s.branch);
+        // Where-room invariant (issue #2): every materialized worktree path must stay
+        // under the host root. A component name or branch that escapes — absolute or
+        // `..`-climbing — is the wrong-tree footgun; the sanctioned off-tree store is a
+        // `store=` line, whose in-tree handle stays under the root.
+        if escapes_root(&s.name) || escapes_root(&s.branch) {
+            println!("HAZARD   {canon_label} escapes the host root");
             bad += 1;
             continue;
         }
-        for wt in &s.worktrees {
-            if escapes_root(wt) {
-                println!("HAZARD   {wt}/ escapes the host root");
+        for branch in &s.worktrees {
+            if escapes_root(branch) {
+                println!("HAZARD   {} escapes the host root", worktree_label(&s.name, branch));
                 bad += 1;
             }
         }
         if !bare.is_dir() {
-            println!("MISSING  {}.git (run --materialize)", s.name);
+            println!("MISSING  software/{}/.git (run --materialize)", s.name);
             bad += 1;
             continue;
         }
         if !canon.is_dir() {
-            println!("MISSING  {}/ (run --materialize)", s.name);
+            println!("MISSING  {canon_label} (run --materialize)");
             bad += 1;
             continue;
         }
         let want = git_out(&bare, &["rev-parse", &s.pin]);
         let have = git_out(&canon, &["rev-parse", "HEAD"]);
         match (want, have) {
-            (Some(w), Some(h)) if w == h => println!("ok       {}/ @ {}", s.name, short(&s.pin)),
+            (Some(w), Some(h)) if w == h => println!("ok       {canon_label} @ {}", short(&s.pin)),
             (Some(w), Some(h)) => {
-                println!("DRIFT    {}/ at {} but pinned to {}", s.name, short(&h), short(&w));
+                println!("DRIFT    {canon_label} at {} but pinned to {}", short(&h), short(&w));
                 bad += 1;
             }
             _ => {
-                println!("ERROR    {}/ — cannot resolve HEAD or pin", s.name);
+                println!("ERROR    {canon_label} — cannot resolve HEAD or pin");
                 bad += 1;
             }
         }
@@ -1788,35 +1843,36 @@ fn software_check(root: &Path, recipe: &[Software]) {
         // optionally backed by an external store reached through an in-tree handle
         // (issue #2). The pin/branch check runs against the resolved store.
         for w in &s.lines {
+            let label = worktree_label(&s.name, &w.branch);
             if off_platform(&w.host) {
-                println!("skip     {}/ (host {}, not {})", w.dir, w.host.as_deref().unwrap_or(""), std::env::consts::OS);
+                println!("skip     {label} (host {}, not {})", w.host.as_deref().unwrap_or(""), std::env::consts::OS);
                 continue;
             }
-            if escapes_root(&w.dir) {
-                println!("HAZARD   {}/ escapes the host root (use store=<path> with an in-tree handle)", w.dir);
+            if escapes_root(&w.branch) {
+                println!("HAZARD   {label} escapes the host root (use store=<path> with an in-tree handle)");
                 bad += 1;
                 continue;
             }
-            let handle = root.join(&w.dir);
-            let wt = line_target(root, w);
+            let handle = worktree_dir(root, &s.name, &w.branch);
+            let wt = line_target(root, &s.name, w);
             // A store-backed line: the in-tree handle must resolve to the store.
             if w.store.is_some() {
                 match (fs::canonicalize(&handle), fs::canonicalize(&wt)) {
                     (Ok(h), Ok(t)) if h == t => {}
                     (Ok(h), Ok(t)) => {
-                        println!("HAZARD   {}/ resolves to {} not the store {}", w.dir, h.display(), t.display());
+                        println!("HAZARD   {label} resolves to {} not the store {}", h.display(), t.display());
                         bad += 1;
                         continue;
                     }
                     _ => {
-                        println!("HAZARD   {}/ has no in-structure handle to store {} (run --materialize)", w.dir, wt.to_string_lossy());
+                        println!("HAZARD   {label} has no in-structure handle to store {} (run --materialize)", wt.to_string_lossy());
                         bad += 1;
                         continue;
                     }
                 }
             }
             if !wt.is_dir() {
-                println!("MISSING  {}/ (run --materialize)", w.dir);
+                println!("MISSING  {label} (run --materialize)");
                 bad += 1;
                 continue;
             }
@@ -1825,21 +1881,21 @@ fn software_check(root: &Path, recipe: &[Software]) {
             let br = git_out(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
             match (want, have) {
                 (Some(want), Some(have)) if want == have => match br {
-                    Some(br) if br == w.branch => println!("ok       {}/ ({} @ {})", w.dir, w.branch, short(&w.pin)),
+                    Some(br) if br == w.branch => println!("ok       {label} ({} @ {})", w.branch, short(&w.pin)),
                     Some(br) => {
-                        println!("DRIFT    {}/ at {} but on branch {} not {}", w.dir, short(&w.pin), br, w.branch);
+                        println!("DRIFT    {label} at {} but on branch {} not {}", short(&w.pin), br, w.branch);
                         bad += 1;
                     }
                     None => {
-                        println!("ok       {}/ @ {}", w.dir, short(&w.pin));
+                        println!("ok       {label} @ {}", short(&w.pin));
                     }
                 },
                 (Some(want), Some(have)) => {
-                    println!("DRIFT    {}/ at {} but pinned to {}", w.dir, short(&have), short(&want));
+                    println!("DRIFT    {label} at {} but pinned to {}", short(&have), short(&want));
                     bad += 1;
                 }
                 _ => {
-                    println!("ERROR    {}/ — cannot resolve HEAD or pin", w.dir);
+                    println!("ERROR    {label} — cannot resolve HEAD or pin");
                     bad += 1;
                 }
             }
@@ -2048,7 +2104,7 @@ fn provenance_problems(root: &Path, s: &Software) -> usize {
         // The deployed line must be a recorded worktree (canonical or an explicit
         // line) — a static check, independent of the build host.
         if let Some(dep) = b.deploy {
-            if dep == s.name || s.lines.iter().any(|w| w.dir == dep) {
+            if dep == s.name || dep == s.branch || s.lines.iter().any(|w| w.branch == dep) {
                 println!("ok       {tag} deploy line `{dep}` is recorded");
             } else {
                 println!("DRIFT    {tag} deploy line `{dep}` is not a recorded worktree");
@@ -2086,7 +2142,7 @@ fn provenance_problems(root: &Path, s: &Software) -> usize {
         // worktree-at-pin gate is enforced by `software_check` above, and the
         // reproducibility *proof* is `--verify-build`, not this cheap pass.
         if let Some((path, sha)) = b.artifact {
-            let p = root.join(&s.name).join(path);
+            let p = worktree_dir(root, &s.name, &s.branch).join(path);
             if !p.exists() {
                 println!("skip     {tag} artifact {path} not present (not a deploy/build host)");
             } else if sha256_file(&p).as_deref() == Some(sha.as_str()) {
@@ -2105,7 +2161,7 @@ fn provenance_problems(root: &Path, s: &Software) -> usize {
 /// count of components with a present spec but a missing lane (a HAZARD). An
 /// un-materialized worktree is skipped (the specs cannot be seen).
 fn spec_lane_problems(root: &Path, s: &Software) -> usize {
-    let worktree = root.join(&s.name);
+    let worktree = worktree_dir(root, &s.name, &s.branch);
     if !worktree.is_dir() {
         return 0;
     }
@@ -3631,7 +3687,7 @@ anchor. Materialize the worktrees locally with:\n\n```\nhost-lifecycle software 
         s.push_str(&format!("## {}\n\n- url: {}\n- pin: `{}`\n", c.name, c.url, c.pin));
         let mut wts: Vec<String> = c.worktrees.clone();
         for w in &c.lines {
-            wts.push(format!("{} ({} @ {})", w.dir, w.branch, short(&w.pin)));
+            wts.push(format!("{} @ {}", w.branch, short(&w.pin)));
         }
         if wts.is_empty() {
             s.push_str("- worktrees: — (single canonical line)\n");
@@ -4430,7 +4486,7 @@ fn release_context<'a>(root: &Path, recipe: &'a [Software], component: &str) -> 
 /// The current version of a component: an artifact-bearing crate reads its worktree
 /// `Cargo.toml` `[package] version`; a tool reads its latest `v*` git tag.
 fn current_version(root: &Path, s: &Software) -> Result<String, String> {
-    let work = root.join(&s.name);
+    let work = worktree_dir(root, &s.name, &s.branch);
     if is_artifact_bearing(s) {
         let toml = fs::read_to_string(work.join("Cargo.toml")).map_err(|e| format!("cannot read {}/Cargo.toml: {e}", s.name))?;
         cargo_version(&toml).ok_or_else(|| format!("{}/Cargo.toml has no [package] version", s.name))
@@ -4462,7 +4518,7 @@ fn cargo_version(text: &str) -> Option<String> {
 fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview: bool) {
     let recipe = load_software(root);
     let s = release_context(root, &recipe, component);
-    let work = root.join(&s.name);
+    let work = worktree_dir(root, &s.name, &s.branch);
 
     // The migrated escape: a repro-exempt component cannot reproduce a foreign
     // toolchain, so its release is a cited skip — the tool prints the LITERAL command
@@ -5013,17 +5069,17 @@ mod software_tests {
     fn provenance_attestation_and_exemption() {
         let base = std::env::temp_dir().join(format!("hl-prov-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(base.join("ik/build/bin")).unwrap();
+        fs::create_dir_all(base.join("software/ik/main/build/bin")).unwrap();
         fs::create_dir_all(base.join("call")).unwrap();
-        fs::write(base.join("ik/build/bin/srv"), "BINARY").unwrap();
+        fs::write(base.join("software/ik/main/build/bin/srv"), "BINARY").unwrap();
         fs::write(base.join("call/0009-exempt.md"), "# x\n- Status: accepted\n- Scope: ik\n").unwrap();
-        let sha = sha256_file(&base.join("ik/build/bin/srv")).unwrap();
+        let sha = sha256_file(&base.join("software/ik/main/build/bin/srv")).unwrap();
 
         // A `toolchain` pin is present (host#14): the artifact-hash checks below test
         // the local-build *note* path, not the no-toolchain HAZARD path (tested after).
         let mk = |deploy: &str, art_sha: &str, exempt: Option<&str>| Software {
             name: "ik".into(), url: "u".into(), pin: "p".into(),
-            worktrees: vec![], lines: vec![],
+            branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: Some("gcc-13".into()),
             deploy: Some(deploy.into()),
             artifact: Some(("build/bin/srv".into(), art_sha.into())),
@@ -5042,7 +5098,7 @@ mod software_tests {
         // verifiable) — unless an exemption excuses it.
         let no_tc = |exempt: Option<&str>| Software {
             name: "ik".into(), url: "u".into(), pin: "p".into(),
-            worktrees: vec![], lines: vec![],
+            branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: None,
             deploy: Some("ik".into()),
             artifact: Some(("build/bin/srv".into(), sha.clone())),
@@ -5101,7 +5157,7 @@ mod software_tests {
         let other = if std::env::consts::OS == "linux" { "windows" } else { "linux" };
         let s = Software {
             name: "ik".into(), url: "u".into(), pin: "p".into(),
-            worktrees: vec![], lines: vec![],
+            branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: None, artifact: None,
             repro_exempt: None, hooks: None,
             builds: vec![PlatformBuild {
@@ -5122,12 +5178,12 @@ mod software_tests {
     fn spec_lane_gate_requires_a_lane_when_a_spec_is_present() {
         let base = std::env::temp_dir().join(format!("hl-lane-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
-        let wt = base.join("comp");
+        let wt = base.join("software").join("comp").join("main");
         fs::create_dir_all(wt.join(".github/workflows")).unwrap();
         fs::write(wt.join("thing.allium"), "-- allium: 3\n").unwrap();
         let mk = || Software {
             name: "comp".into(), url: "u".into(), pin: "p".into(),
-            worktrees: vec![], lines: vec![],
+            branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: None, artifact: None,
             repro_exempt: None, hooks: None, builds: vec![],
         };
@@ -5157,11 +5213,11 @@ mod software_tests {
     fn tier_lanes_are_opt_in_and_inert() {
         let base = std::env::temp_dir().join(format!("hl-tier-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
-        let wt = base.join("comp");
+        let wt = base.join("software").join("comp").join("main");
         fs::create_dir_all(wt.join(".github/workflows")).unwrap();
         let mk = || Software {
             name: "comp".into(), url: "u".into(), pin: "p".into(),
-            worktrees: vec![], lines: vec![],
+            branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: None, artifact: None,
             repro_exempt: None, hooks: None, builds: vec![],
         };
@@ -5374,7 +5430,7 @@ mod software_tests {
     fn install_hooks_copies_script_and_binary_at_pin() {
         let base = std::env::temp_dir().join(format!("hl-hooks-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
-        let wt = base.join("hl");
+        let wt = base.join("software").join("hl").join("main");
         fs::create_dir_all(wt.join("target/release")).unwrap();
         let git = |dir: &Path, args: &[&str]| process::Command::new("git")
             .arg("-C").arg(dir).args(args).status().map(|s| s.success()).unwrap_or(false);
@@ -5389,7 +5445,7 @@ mod software_tests {
 
         let mk = |pin: &str, art: &str| Software {
             name: "hl".into(), url: "u".into(), pin: pin.into(),
-            worktrees: vec![], lines: vec![],
+            branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: Some("host-lint".into()),
             artifact: Some(("target/release/host-lint".into(), art.into())),
             repro_exempt: None, hooks: Some("pre-commit".into()), builds: vec![],
@@ -5414,13 +5470,12 @@ mod software_tests {
 [software \"ik\"]
 \turl       = https://example.test/ik.git
 \tpin       = b217881
-\tworktree  = ik.256k perf/256k-single-context a0506f2
+\tworktree  = perf/256k-single-context a0506f2
 ";
         let s = parse_software(text);
         assert_eq!(s.len(), 1);
         assert!(s[0].worktrees.is_empty());
         assert_eq!(s[0].lines.len(), 1);
-        assert_eq!(s[0].lines[0].dir, "ik.256k");
         assert_eq!(s[0].lines[0].branch, "perf/256k-single-context");
         assert_eq!(s[0].lines[0].pin, "a0506f2");
     }
@@ -5456,9 +5511,9 @@ mod software_tests {
             name: "demo".to_string(),
             url: src.to_string_lossy().to_string(),
             pin: canon.clone(),
+            branch: "main".to_string(),
             worktrees: Vec::new(),
             lines: vec![Worktree {
-                dir: "demo.line".to_string(),
                 branch: "feature".to_string(),
                 pin: line_pin.clone(),
                 store: None,
@@ -5468,7 +5523,7 @@ mod software_tests {
         }];
         software_materialize(&host, &recipe);
 
-        let line = host.join("demo.line");
+        let line = host.join("software").join("demo").join("feature");
         assert!(line.is_dir(), "parallel worktree created");
         // at its OWN pin, not the canonical one
         assert_eq!(git_out(&line, &["rev-parse", "HEAD"]).unwrap(), line_pin);
@@ -5495,16 +5550,15 @@ mod software_tests {
     fn worktree_line_parses_store_and_host() {
         let s = parse_software(
             "[software \"x\"]\n  url = u\n  pin = p\n  \
-             worktree = ik.win windows/msvc abc123 store=/mnt/d/dev/ik host=linux\n",
+             worktree = windows/msvc abc123 store=/mnt/d/dev/ik host=linux\n",
         );
         let w = &s[0].lines[0];
-        assert_eq!(w.dir, "ik.win");
         assert_eq!(w.branch, "windows/msvc");
         assert_eq!(w.pin, "abc123");
         assert_eq!(w.store.as_deref(), Some("/mnt/d/dev/ik"));
         assert_eq!(w.host.as_deref(), Some("linux"));
-        // back-compat: a bare 3-token line carries no store/host
-        let b = parse_software("[software \"x\"]\n url=u\n pin=p\n worktree = d br pin\n");
+        // back-compat: a bare 2-token line carries no store/host
+        let b = parse_software("[software \"x\"]\n url=u\n pin=p\n worktree = br pin\n");
         assert!(b[0].lines[0].store.is_none() && b[0].lines[0].host.is_none());
     }
 
@@ -5540,9 +5594,9 @@ mod software_tests {
             name: "demo".to_string(),
             url: src.to_string_lossy().to_string(),
             pin: canon,
+            branch: "main".to_string(),
             worktrees: Vec::new(),
             lines: vec![Worktree {
-                dir: "demo.win".to_string(),
                 branch: "win".to_string(),
                 pin: line_pin.clone(),
                 store: Some(store.to_string_lossy().to_string()),
@@ -5552,7 +5606,7 @@ mod software_tests {
         }];
         software_materialize(&host, &recipe);
 
-        let handle = host.join("demo.win");
+        let handle = host.join("software").join("demo").join("win");
         // the in-tree handle exists and is a symlink to the external store
         assert!(fs::symlink_metadata(&handle).unwrap().file_type().is_symlink(), "handle is a symlink");
         assert_eq!(fs::canonicalize(&handle).unwrap(), fs::canonicalize(&store).unwrap());
@@ -5589,15 +5643,17 @@ mod software_tests {
             name: "demo".to_string(),
             url: src.to_string_lossy().to_string(),
             pin: pin.clone(),
+            branch: "main".to_string(),
             worktrees: Vec::new(),
             lines: Vec::new(),
             build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
         }];
         software_materialize(&host, &recipe);
 
-        assert!(host.join("demo.git").is_dir(), "bare store created");
-        assert!(host.join("demo").is_dir(), "canonical worktree created");
-        assert_eq!(git_out(&host.join("demo"), &["rev-parse", "HEAD"]).unwrap(), pin);
+        assert!(host.join("software").join("demo").join(".git").is_dir(), "bare store created");
+        let canon = host.join("software").join("demo").join("main");
+        assert!(canon.is_dir(), "canonical worktree created");
+        assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
         // check passes (returns without process::exit on a matching pin)
         software_check(&host, &recipe);
 
@@ -5889,9 +5945,9 @@ mod book_tests {
             name: "ik".to_string(),
             url: "https://example.test/ik.git".to_string(),
             pin: "b217881".to_string(),
+            branch: "main".to_string(),
             worktrees: Vec::new(),
             lines: vec![Worktree {
-                dir: "ik.256k".to_string(),
                 branch: "perf/256k".to_string(),
                 pin: "a0506f2deadbeef".to_string(),
                 store: None,
@@ -5903,7 +5959,7 @@ mod book_tests {
         assert!(s.contains("## ik"));
         assert!(s.contains("b217881"));
         assert!(s.contains("host-lifecycle software --materialize ."));
-        assert!(s.contains("ik.256k (perf/256k @ a0506f2deadb)"));
+        assert!(s.contains("perf/256k @ a0506f2deadb"));
     }
 
     #[test]
