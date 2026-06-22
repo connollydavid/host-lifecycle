@@ -31,6 +31,9 @@ rule-entity-creation.DetectUnreproducedArtifact.1 => test:provenance_attestation
 rule-success.DetectStaleReceipt                  => test:staleness_detects_an_input_change
 rule-failure.DetectStaleReceipt.1                => test:receipts_parse_and_latest_wins
 rule-entity-creation.DetectStaleReceipt.1        => test:staleness_detects_an_input_change
+rule-success.DetectDepsBundleDrift               => test:deps_bundle_drift_is_detected
+rule-failure.DetectDepsBundleDrift.1             => test:deps_bundle_drift_is_detected
+rule-entity-creation.DetectDepsBundleDrift.1     => test:deps_bundle_drift_is_detected
 
 # --- Verdict lifecycle (behavioural — clean/hazarded exit) ---
 transition-edge.Check.checking.clean    => test:materialize_then_check_roundtrip

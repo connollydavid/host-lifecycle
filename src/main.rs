@@ -993,6 +993,12 @@ struct Software {
     /// worktree) that `--install-hooks` copies into `.git/hooks` as both
     /// `pre-commit` and `commit-msg`, alongside the verified deploy artifact.
     hooks: Option<String>,
+    /// `deps-bundle = <url> <sha256>` (plan/0032) — a pinned, hash-verified vendored
+    /// dependency bundle. When set, `--verify-build`/`release` download it, verify the
+    /// sha (the provenance half of the hermeticity gate), stage it into the build tree,
+    /// and build under `--network none` (the egress half). The tarball ships `vendor/`
+    /// plus a `vendor-config.toml` source-replacement snippet.
+    deps_bundle: Option<(String, String)>,
     /// Explicit per-platform builds (issue #1): `[build "<name>" "<platform>"]`
     /// subsections, each a distinct toolchain/artifact of the *same* source `pin`.
     /// When non-empty, these replace the flat `build`/`artifact`/… fields above;
@@ -1309,20 +1315,85 @@ fn container_runtime() -> Option<&'static str> {
     })
 }
 
+/// Merge a `cargo vendor` `[source.*]` config snippet into an existing
+/// `.cargo/config.toml` body, preserving the existing content (e.g. the reproducible
+/// build-id rustflags). Pure so it is unit-testable; the staging step writes the result.
+fn merge_vendor_config(existing: &str, snippet: &str) -> String {
+    let mut out = existing.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(snippet.trim());
+    out.push('\n');
+    out
+}
+
+/// Stage a pinned dependency bundle into `work` for an offline build (plan/0032): the
+/// one controlled, pinned network fetch. Download the tarball, verify its sha256 against
+/// `want_sha` (the provenance half of the hermeticity gate — refuse a byte until it
+/// matches), extract it (it ships `vendor/` plus a `vendor-config.toml` source snippet),
+/// and merge the snippet into `work/.cargo/config.toml` preserving any existing rustflags.
+/// `--network none` at build time is the egress half. Returns Err with a message on any
+/// failure, so the caller can DRIFT/block rather than fall back to a networked build.
+fn stage_deps_bundle(work: &Path, url: &str, want_sha: &str) -> Result<(), String> {
+    let tarball = work.join(".host-deps-bundle.tar.gz");
+    let ok = process::Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "--retry-delay", "2", "-o"])
+        .arg(&tarball)
+        .arg(url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return Err(format!("could not download deps-bundle from {url}"));
+    }
+    match sha256_file(&tarball) {
+        Some(h) if h == want_sha => {}
+        Some(h) => return Err(format!("deps-bundle sha mismatch: built {h}, recorded {want_sha}")),
+        None => return Err("deps-bundle sha could not be computed".to_string()),
+    }
+    let ok = process::Command::new("tar")
+        .arg("xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(work)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = fs::remove_file(&tarball);
+    if !ok {
+        return Err("could not extract deps-bundle".to_string());
+    }
+    let snippet_path = work.join("vendor-config.toml");
+    let snippet = fs::read_to_string(&snippet_path)
+        .map_err(|e| format!("deps-bundle has no vendor-config.toml: {e}"))?;
+    let cfg_dir = work.join(".cargo");
+    let cfg = cfg_dir.join("config.toml");
+    let existing = fs::read_to_string(&cfg).unwrap_or_default();
+    fs::create_dir_all(&cfg_dir).map_err(|e| format!("cannot create {}: {e}", cfg_dir.display()))?;
+    fs::write(&cfg, merge_vendor_config(&existing, &snippet))
+        .map_err(|e| format!("cannot write {}: {e}", cfg.display()))?;
+    let _ = fs::remove_file(&snippet_path);
+    Ok(())
+}
+
 /// Run a recorded `build` recipe inside the recorded `toolchain` container against
 /// `src` (mounted at `/src`), returning whether it succeeded. Shared by
 /// `--verify-build` and `release` so the docker incantation lives in one place. The
 /// container is root and writes root-owned output into the mount, so the recipe chowns
-/// `/src` back to the mount owner before exiting, keeping the worktree removable. An
-/// optional `HOST_LIFECYCLE_DOCKER_NETWORK` (e.g. `host`) covers environments whose
-/// default docker bridge lacks DNS.
-fn run_build_in_container(runtime: &str, image: &str, build: &str, src: &Path) -> bool {
+/// `/src` back to the mount owner before exiting, keeping the worktree removable. When
+/// `offline` (a component pins a `deps-bundle`), the container runs `--network none` so
+/// the build is provably network-free; otherwise an optional `HOST_LIFECYCLE_DOCKER_NETWORK`
+/// (e.g. `host`) covers environments whose default docker bridge lacks DNS.
+fn run_build_in_container(runtime: &str, image: &str, build: &str, src: &Path, offline: bool) -> bool {
     let src_abs = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
     let wrapped =
         format!("{build}; rc=$?; chown -R \"$(stat -c '%u:%g' /src)\" /src 2>/dev/null || true; exit $rc");
     let mut cmd = process::Command::new(runtime);
     cmd.arg("run").arg("--rm");
-    if let Ok(net) = env::var("HOST_LIFECYCLE_DOCKER_NETWORK") {
+    if offline {
+        cmd.arg("--network").arg("none");
+    } else if let Ok(net) = env::var("HOST_LIFECYCLE_DOCKER_NETWORK") {
         if !net.is_empty() {
             cmd.arg("--network").arg(net);
         }
@@ -1409,8 +1480,22 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
                 bad += 1;
                 continue;
             }
+            // plan/0032: a pinned dependency bundle makes the build hermetic. Stage it
+            // into the throwaway worktree (download, verify the recorded sha, extract,
+            // merge the source config) and build under `--network none`. The sha check is
+            // the provenance half of the gate; the removed worktree needs no cleanup.
+            let offline = s.deps_bundle.is_some();
+            if let Some((url, want)) = &s.deps_bundle {
+                if let Err(e) = stage_deps_bundle(&work, url, want) {
+                    println!("DRIFT    {tag} deps-bundle: {e}");
+                    bad += 1;
+                    let _ = git_ok(&bare, &["worktree", "remove", "--force", &work_s]);
+                    let _ = fs::remove_dir_all(&work);
+                    continue;
+                }
+            }
             // Run the recorded recipe inside the recorded image, never the ambient rust.
-            let built = run_build_in_container(runtime, image, build, &work);
+            let built = run_build_in_container(runtime, image, build, &work, offline);
             if !built {
                 println!("ERROR    {tag} — build failed in {runtime} {image}: `{build}`");
                 bad += 1;
@@ -1476,6 +1561,7 @@ fn parse_software(text: &str) -> Vec<Software> {
                 artifact: None,
                 repro_exempt: None,
                 hooks: None,
+                deps_bundle: None,
                 builds: Vec::new(),
             });
             in_build = false;
@@ -1587,6 +1673,15 @@ fn parse_software(text: &str) -> Vec<Software> {
             }
             "repro-exempt" => cur.repro_exempt = Some(val.to_string()),
             "hooks" => cur.hooks = Some(val.to_string()),
+            "deps-bundle" => {
+                // `deps-bundle = <url> <sha256>` — a pinned vendored-dependency bundle.
+                let f: Vec<&str> = val.split_whitespace().collect();
+                let [url, sha] = f[..] else {
+                    eprintln!("host-lifecycle: {SOFTWARE}:{}: `deps-bundle` needs `<url> <sha256>`", i + 1);
+                    process::exit(2);
+                };
+                cur.deps_bundle = Some((url.to_string(), sha.to_string()));
+            }
             _ => {}
         }
     }
@@ -2237,6 +2332,25 @@ fn provenance_problems(root: &Path, s: &Software) -> usize {
             } else {
                 println!("note     {tag} artifact {path} is a local build (differs from canonical) — proven by --verify-build");
             }
+        }
+    }
+    // plan/0032 hermeticity gate: a component pinning a dependency bundle keeps a
+    // committed `deps-bundle.lock` in its worktree as the single source of truth; the
+    // recorded `.host-software` pin MUST equal it, or the producer and the orchestration
+    // have drifted. The build-offline-under-`--network none` proof is `--verify-build`.
+    if let Some((url, sha)) = &s.deps_bundle {
+        let lock = worktree_dir(root, &s.name, &s.branch).join("deps-bundle.lock");
+        match fs::read_to_string(&lock) {
+            Ok(text) => {
+                let f: Vec<&str> = text.split_whitespace().collect();
+                if f.len() >= 2 && f[0] == url && f[1] == sha {
+                    println!("ok       {} deps-bundle pin matches deps-bundle.lock @ {}", s.name, short(sha));
+                } else {
+                    println!("HAZARD   {} deps-bundle pin differs from deps-bundle.lock (producer drift)", s.name);
+                    bad += 1;
+                }
+            }
+            Err(_) => println!("note     {} deps-bundle pinned; deps-bundle.lock not yet in the worktree", s.name),
         }
     }
     bad
@@ -4778,10 +4892,36 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
         }
     }
 
+    // plan/0032: a pinned dependency bundle makes the release build hermetic. Stage it
+    // into the canonical worktree and build under `--network none`. Because this is the
+    // live worktree (not a throwaway), snapshot the `.cargo/config.toml` and remove the
+    // staged tree afterward, so the release commit carries only the version bump.
+    let offline = s.deps_bundle.is_some();
+    let cfg_path = work.join(".cargo/config.toml");
+    let cfg_backup = if offline { Some(fs::read_to_string(&cfg_path).ok()) } else { None };
+    if let Some((url, want)) = &s.deps_bundle {
+        println!("  staging deps-bundle (verifying recorded sha) …");
+        if let Err(e) = stage_deps_bundle(&work, url, want) {
+            eprintln!("host-lifecycle: {e} — release blocked");
+            process::exit(1);
+        }
+    }
+
     // Build the bumped worktree in the recorded image and hash the artifact. The hash
     // is computed from this verified build — the tool refuses to record any other.
     println!("  building {component} in {image} to compute the canonical hash …");
-    if !run_build_in_container(runtime, image, view.build.unwrap_or("cargo build --release"), &work) {
+    let build_ok = run_build_in_container(runtime, image, view.build.unwrap_or("cargo build --release"), &work, offline);
+
+    // Restore the worktree: drop the staged vendor dir and revert the config edit, so a
+    // following `git commit -am` carries only the version bump, never the source-replacement.
+    if let Some(orig) = cfg_backup {
+        let _ = fs::remove_dir_all(work.join("vendor"));
+        match orig {
+            Some(text) => { let _ = fs::write(&cfg_path, text); }
+            None => { let _ = fs::remove_file(&cfg_path); }
+        }
+    }
+    if !build_ok {
         eprintln!("host-lifecycle: build failed in {runtime} {image} — release blocked");
         process::exit(1);
     }
@@ -5245,7 +5385,7 @@ mod software_tests {
             build: None, toolchain: Some("gcc-13".into()),
             deploy: Some(deploy.into()),
             artifact: Some(("build/bin/srv".into(), art_sha.into())),
-            repro_exempt: exempt.map(String::from), hooks: None, builds: vec![],
+            repro_exempt: exempt.map(String::from), hooks: None, deps_bundle: None, builds: vec![],
         };
         // recorded deploy line + matching artifact hash + valid exemption → clean
         assert_eq!(provenance_problems(&base, &mk("ik", &sha, Some("call/0009"))), 0);
@@ -5264,7 +5404,7 @@ mod software_tests {
             build: None, toolchain: None,
             deploy: Some("ik".into()),
             artifact: Some(("build/bin/srv".into(), sha.clone())),
-            repro_exempt: exempt.map(String::from), hooks: None, builds: vec![],
+            repro_exempt: exempt.map(String::from), hooks: None, deps_bundle: None, builds: vec![],
         };
         assert_eq!(provenance_problems(&base, &no_tc(None)), 1);
         assert_eq!(provenance_problems(&base, &no_tc(Some("call/0009"))), 0);
@@ -5321,7 +5461,7 @@ mod software_tests {
             name: "ik".into(), url: "u".into(), pin: "p".into(),
             branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: None, artifact: None,
-            repro_exempt: None, hooks: None,
+            repro_exempt: None, hooks: None, deps_bundle: None,
             builds: vec![PlatformBuild {
                 platform: "foreign".into(),
                 build: None, toolchain: None, deploy: None,
@@ -5347,7 +5487,7 @@ mod software_tests {
             name: "comp".into(), url: "u".into(), pin: "p".into(),
             branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: None, artifact: None,
-            repro_exempt: None, hooks: None, builds: vec![],
+            repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         };
         // .allium present, no workflow + no manifest → 2 HAZARDs
         assert_eq!(spec_lane_problems(&base, &mk()), 2);
@@ -5381,7 +5521,7 @@ mod software_tests {
             name: "comp".into(), url: "u".into(), pin: "p".into(),
             branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: None, artifact: None,
-            repro_exempt: None, hooks: None, builds: vec![],
+            repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         };
         // inert: no spec, no tier declaration → no HAZARD
         assert_eq!(spec_lane_problems(&base, &mk()), 0);
@@ -5610,7 +5750,7 @@ mod software_tests {
             branch: "main".into(), worktrees: vec![], lines: vec![],
             build: None, toolchain: None, deploy: Some("host-lint".into()),
             artifact: Some(("target/release/host-lint".into(), art.into())),
-            repro_exempt: None, hooks: Some("pre-commit".into()), builds: vec![],
+            repro_exempt: None, hooks: Some("pre-commit".into()), deps_bundle: None, builds: vec![],
         };
         // worktree at pin + binary present → installs all three files
         assert_eq!(install_hooks(&base, &[mk(&pin, "deadbeef")]), (1, 0));
@@ -5681,7 +5821,7 @@ mod software_tests {
                 store: None,
                 host: None,
             }],
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
         software_materialize(&host, &recipe);
 
@@ -5788,7 +5928,7 @@ mod software_tests {
                 store: Some(store.to_string_lossy().to_string()),
                 host: None,
             }],
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
         software_materialize(&host, &recipe);
 
@@ -5832,7 +5972,7 @@ mod software_tests {
             branch: "main".to_string(),
             worktrees: Vec::new(),
             lines: Vec::new(),
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
         software_materialize(&host, &recipe);
 
@@ -6165,7 +6305,7 @@ mod book_tests {
                 store: None,
                 host: None,
             }],
-            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, builds: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
         let s = where_stub(&recipe);
         assert!(s.contains("## ik"));
@@ -6299,5 +6439,58 @@ mod book_tests {
         assert!(out.contains("name = \"memchr\"\nversion = \"2.8.2\""));
         // a crate not in the lock yields None (no spurious write)
         assert!(set_lock_version(lock, "absent", "9.9.9").is_none());
+    }
+
+    // plan/0032: `deps-bundle = <url> <sha256>` parses into the component, and a stanza
+    // without it leaves the field None (no bundle, networked build as before).
+    #[test]
+    fn parse_software_reads_deps_bundle() {
+        let with = parse_software(
+            "[software \"host-lint\"]\n url=u\n pin=p\n deps-bundle = https://x/vendor-v1.tar.gz abc123\n",
+        );
+        assert_eq!(
+            with[0].deps_bundle,
+            Some(("https://x/vendor-v1.tar.gz".to_string(), "abc123".to_string()))
+        );
+        let without = parse_software("[software \"host-prove\"]\n url=u\n pin=p\n");
+        assert!(without[0].deps_bundle.is_none());
+    }
+
+    // plan/0032: merging the vendored-sources snippet keeps the existing config (the
+    // reproducibility rustflags) and appends the source block, separated by a blank line.
+    #[test]
+    fn merge_vendor_config_preserves_existing_rustflags() {
+        let existing = "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-Wl,--build-id=none\"]\n";
+        let snippet = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"\n";
+        let merged = merge_vendor_config(existing, snippet);
+        assert!(merged.contains("--build-id=none"), "existing rustflags preserved");
+        assert!(merged.contains("[source.crates-io]"), "source block appended");
+        assert!(merged.contains("[source.vendored-sources]"));
+        assert!(merged.ends_with('\n'));
+        // an empty existing config yields just the snippet (no leading blank line)
+        let fresh = merge_vendor_config("", snippet);
+        assert!(fresh.starts_with("[source.crates-io]"));
+    }
+
+    // plan/0032 hermeticity gate (DetectDepsBundleDrift): a component pinning a bundle is
+    // clean when its committed deps-bundle.lock matches the recorded pin, and a HAZARD when
+    // the producer's lock has drifted from `.host-software`.
+    #[test]
+    fn deps_bundle_drift_is_detected() {
+        let base = std::env::temp_dir().join(format!("hl-bundle-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software").join("comp").join("main");
+        fs::create_dir_all(&wt).unwrap();
+        let mk = |url: &str, sha: &str| Software {
+            name: "comp".into(), url: "u".into(), pin: "p".into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None,
+            repro_exempt: None, hooks: None,
+            deps_bundle: Some((url.into(), sha.into())), builds: vec![],
+        };
+        fs::write(wt.join("deps-bundle.lock"), "https://x/v1.tgz abc\n").unwrap();
+        assert_eq!(provenance_problems(&base, &mk("https://x/v1.tgz", "abc")), 0, "matching lock is clean");
+        assert_eq!(provenance_problems(&base, &mk("https://x/v1.tgz", "DIFFERENT")), 1, "drift is a HAZARD");
+        let _ = fs::remove_dir_all(&base);
     }
 }

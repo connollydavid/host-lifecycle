@@ -28,7 +28,9 @@ entity Project {
 -- plan/0029 recipe-dispatch axes; `at_pin` is the anchor (canonical worktree HEAD equals
 -- the recorded pin); `has_toolchain`/`artifact_reproduces` are the reproducibility facts
 -- a `--verify-build` establishes; `repro_exempt` is a call/NNNN authorizing a
--- not-yet-reproducible migrated build.
+-- not-yet-reproducible migrated build. `declares_deps_bundle`/`bundle_pin_matches` are
+-- the plan/0032 hermeticity axes: a component pinning a dependency bundle keeps a
+-- committed `deps-bundle.lock` whose pin must equal the recorded one.
 entity Component {
     name: String
     declares_artifact: Boolean
@@ -37,6 +39,8 @@ entity Component {
     has_toolchain: Boolean
     artifact_reproduces: Boolean
     repro_exempt: Boolean
+    declares_deps_bundle: Boolean
+    bundle_pin_matches: Boolean
 }
 
 -- A recorded lifecycle receipt for one component and phase. Valid only when its evidence
@@ -112,6 +116,15 @@ rule DetectStaleReceipt {
     when: receipt: Receipt.created
     requires: not receipt.re_derived
     ensures: Finding.created(component: receipt.component, kind: "stale-receipt")
+}
+
+-- plan/0032 hermeticity gate: a component pinning a dependency bundle whose recorded pin
+-- no longer equals its committed `deps-bundle.lock` is producer drift, a corrupt claim
+-- that the shipped and certified bundle are the same.
+rule DetectDepsBundleDrift {
+    when: component: Component.created
+    requires: component.declares_deps_bundle and not component.bundle_pin_matches
+    ensures: Finding.created(component: component, kind: "deps-bundle-drift")
 }
 
 -- === Verdict lifecycle: findings drive the exit-code decision ===
