@@ -3,7 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # semver release tags only (consistent across the host-* tools)
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   pull_request:
     branches: [main]
 
