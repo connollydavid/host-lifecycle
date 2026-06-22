@@ -1,0 +1,164 @@
+-- allium: 3
+-- host-lifecycle: the `software --check` validation verdict over a project's Where-room
+-- components. A check run validates each declared component against its recorded recipe
+-- (the pin anchor, the reproducibility provenance, the receipt gate, generated-link
+-- integrity), emits a per-finding ok or HAZARD, and settles to exactly one terminal
+-- verdict that maps to an exit code: clean (0) or hazarded (non-zero, so CI gates on it).
+--
+-- Scope: the component-check verdict and the recipe dispatch (does a component declare an
+-- artifact?). Excludes (implementation or other subcommands): scaffolding generation
+-- (new/adopt/book), the upgrade applied-set ledger, `validate plan/ call/`, the
+-- materialize git mechanics, the per-platform build matrix, and exact CLI flags / output
+-- strings.
+
+-- The recurring-per-component lifecycle phases whose receipts the gate requires
+-- (plan/0025). `embed` brings a component into the Where room; `release` cuts a version.
+enum Phase {
+    embed
+    release
+}
+
+-- The project under check: the host repository. One check run is bounded by this.
+entity Project {
+    name: String
+}
+
+-- A Where-room software component, as declared in the recipe. The booleans are the
+-- check-relevant projection of the recipe: `declares_artifact`/`declares_build` are the
+-- plan/0029 recipe-dispatch axes; `at_pin` is the anchor (canonical worktree HEAD equals
+-- the recorded pin); `has_toolchain`/`artifact_reproduces` are the reproducibility facts
+-- a `--verify-build` establishes; `repro_exempt` is a call/NNNN authorizing a
+-- not-yet-reproducible migrated build.
+entity Component {
+    name: String
+    declares_artifact: Boolean
+    declares_build: Boolean
+    at_pin: Boolean
+    has_toolchain: Boolean
+    artifact_reproduces: Boolean
+    repro_exempt: Boolean
+}
+
+-- A recorded lifecycle receipt for one component and phase. Valid only when its evidence
+-- re-derives (call/0017, R1): a receipt is trusted because a fresh check reproduces it,
+-- never because it asserts itself. A non-re-deriving receipt is stale, a corrupt claim.
+entity Receipt {
+    component: Component
+    phase: Phase
+    re_derived: Boolean
+}
+
+-- A detected problem on a component: one HAZARD line. A clean component yields no Finding.
+entity Finding {
+    component: Component
+    kind: String
+}
+
+-- One `software --check` run. Starts checking; the findings it accumulates drive the
+-- terminal verdict. `saw_hazard` records whether any HAZARD fired.
+entity Check {
+    status: checking | clean | hazarded
+    saw_hazard: Boolean
+    transitions status {
+        checking -> clean
+        checking -> hazarded
+        terminal: clean, hazarded
+    }
+}
+
+given {
+    check: Check
+}
+
+surface SoftwareCheck {
+    facing project: Project
+    provides:
+        CheckStarts(project)
+        CheckCompletes(project)
+}
+
+-- === HAZARD rules: each fires on a structural defect of a component ===
+
+-- The pin is the reproducibility anchor: a canonical worktree off its recorded pin makes
+-- every downstream claim unverifiable.
+rule DetectOffPin {
+    when: component: Component.created
+    requires: not component.at_pin
+    ensures: Finding.created(component: component, kind: "off-pin")
+}
+
+-- host#14: an artifact recorded with no toolchain pin (or no build recipe) is not
+-- reproducibly verifiable. A repro-exempt component is the authorized escape.
+rule DetectArtifactNotReproducible {
+    when: component: Component.created
+    requires: component.declares_artifact and not component.repro_exempt
+              and (not component.has_toolchain or not component.declares_build)
+    ensures: Finding.created(component: component, kind: "artifact-without-repro-recipe")
+}
+
+-- An artifact-bearing component whose recorded sha256 does not rebuild from the pin in
+-- the recorded toolchain. A repro-exempt component is skipped.
+rule DetectUnreproducedArtifact {
+    when: component: Component.created
+    requires: component.declares_artifact and component.has_toolchain
+              and component.declares_build and not component.repro_exempt
+              and not component.artifact_reproduces
+    ensures: Finding.created(component: component, kind: "artifact-not-reproduced")
+}
+
+-- The receipt gate (R1): a recorded receipt whose evidence no longer re-derives is a
+-- corrupt claim, not a pass.
+rule DetectStaleReceipt {
+    when: receipt: Receipt.created
+    requires: not receipt.re_derived
+    ensures: Finding.created(component: receipt.component, kind: "stale-receipt")
+}
+
+-- === Verdict lifecycle: findings drive the exit-code decision ===
+
+rule StartCheck {
+    when: CheckStarts(project)
+    ensures: check.status = checking
+}
+
+rule RecordHazard {
+    when: finding: Finding.created
+    ensures: check.saw_hazard = true
+}
+
+rule VerdictHazarded {
+    when: CheckCompletes(project)
+    requires: check.status = checking and check.saw_hazard
+    ensures: check.status = hazarded
+}
+
+rule VerdictClean {
+    when: CheckCompletes(project)
+    requires: check.status = checking and not check.saw_hazard
+    ensures: check.status = clean
+}
+
+-- === Invariants ===
+
+-- Recipe dispatch (plan/0029): a component declaring an artifact, unless repro-exempt,
+-- records a toolchain — only then can `--verify-build` reproduce it (host#14). A
+-- component with no artifact (a repo-only / tag-only component, e.g. a library) carries
+-- no such obligation.
+invariant ArtifactImpliesToolchain {
+    for c in Components where c.declares_artifact and not c.repro_exempt:
+        c.has_toolchain
+}
+
+-- Evidence is re-derived, never self-asserted (call/0017, R1): every recorded receipt
+-- re-derives, or it is stale.
+invariant ReceiptsReDerive {
+    for r in Receipts:
+        r.re_derived
+}
+
+-- A check that saw any HAZARD never settles clean: the verdict is hazarded regardless,
+-- so a single defect gates the run.
+invariant HazardBlocksClean {
+    for c in Checks where c.saw_hazard and c.status != checking:
+        c.status = hazarded
+}

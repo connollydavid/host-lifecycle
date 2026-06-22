@@ -63,6 +63,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  allium:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install allium-cli (pinned 3.4.2)
+        run: cargo install allium-cli --version 3.4.2
+      - name: allium check
+        run: allium check host-lifecycle.allium
+      - name: allium analyse
+        run: allium analyse host-lifecycle.allium
+      - name: allium plan (test obligations)
+        run: allium plan host-lifecycle.allium
+      - name: Build host-lifecycle (drives its own obligations check, no self-install)
+        run: cargo build --release --locked
+      - name: Discharge obligations (every obligation dispositioned, test refs exist)
+        run: ./target/release/host-lifecycle obligations host-lifecycle.allium --tests src
+
   release:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
