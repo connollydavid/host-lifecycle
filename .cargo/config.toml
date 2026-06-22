@@ -1,0 +1,10 @@
+# Reproducible builds: drop the linker build-id note (.note.gnu.build-id), which
+# otherwise varies with the build host. With `strip = true` (Cargo.toml) this leaves
+# the release binary free of build-environment metadata.
+#
+# Scoped to Linux: `--build-id=none` is a GNU-ld option, and the reproducible-build
+# anchor is the Linux container build. macOS/Windows linkers reject the flag
+# ("ld: unknown options: --build-id=none"), so their release binaries build without
+# it — they are not the reproducibility anchor. The Linux artifact is unchanged.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--build-id=none"]
