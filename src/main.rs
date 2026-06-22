@@ -3426,7 +3426,7 @@ const PLACED_ROOT_MD: [&str; 7] = ["SUMMARY.md", "README.md", "MEMORY.md", "CLAU
 /// (Who → What/When → Where → Why → How → Memory). A section with no content page
 /// fails `book --check` (the stub-coverage gate).
 struct Section {
-    /// The SUMMARY part-title, e.g. "Cast — who".
+    /// The SUMMARY part-title, e.g. "Cast: who".
     title: String,
     /// The room this covers, named in a coverage failure.
     room: &'static str,
@@ -3498,10 +3498,10 @@ fn book(args: &[String]) {
 /// so `--check` and generation see the same plan.
 fn plan_book(root: &Path) -> Vec<Section> {
     segregate_records(vec![
-        flat_room(root, "cast", "Cast — who", "cast"),
+        flat_room(root, "cast", "Cast: who", "cast"),
         plan_plan(root),
         plan_software(root),
-        flat_room(root, "call", "Call — why", "call"),
+        flat_room(root, "call", "Call: why", "call"),
         plan_reference(root),
         plan_memory(root),
     ])
@@ -3609,7 +3609,7 @@ fn plan_plan(root: &Path) -> Section {
             dest: "plan-index.md".to_string(),
             label: "Plan".to_string(),
             depth: 0,
-            body: PageBody::Inline("# Plan — what & when\n\nMilestones in this project.\n".to_string()),
+            body: PageBody::Inline("# Plan: what & when\n\nMilestones in this project.\n".to_string()),
         });
     }
     for m in milestone_dirs(&root.join("plan")) {
@@ -3659,7 +3659,7 @@ fn plan_plan(root: &Path) -> Section {
             }
         }
     }
-    Section { title: "Plan — what & when".to_string(), room: "plan", required: true, pages }
+    Section { title: "Plan: what & when".to_string(), room: "plan", required: true, pages }
 }
 
 /// The Where room: a stub generated from `.host-software` — component name, url,
@@ -3679,7 +3679,7 @@ fn plan_software(root: &Path) -> Section {
             });
         }
     }
-    Section { title: "Software — where".to_string(), room: "software", required: !pages.is_empty(), pages }
+    Section { title: "Software: where".to_string(), room: "software", required: !pages.is_empty(), pages }
 }
 
 /// The How room: `CLAUDE.md` (the operating manual), then a `reference/` dir if
@@ -3716,7 +3716,7 @@ fn plan_reference(root: &Path) -> Section {
             body: PageBody::Copy(f),
         });
     }
-    Section { title: "Reference — how".to_string(), room: "reference", required: !pages.is_empty(), pages }
+    Section { title: "Reference: how".to_string(), room: "reference", required: !pages.is_empty(), pages }
 }
 
 /// The Memory room: the append-only `MEMORY.md` scratchpad.
@@ -3854,10 +3854,21 @@ fn home_page(root: &Path, name: &str, sections: &[Section]) -> Page {
     let mut s = format!("# {name}\n\nProject documentation, organized by the methodology's rooms.\n\n");
     for sec in sections {
         if let Some(p) = sec.pages.first() {
-            s.push_str(&format!("- [{}]({})\n", sec.title, p.dest));
+            s.push_str(&format!("- [{}]({})\n", sec.title, served_link(&p.dest)));
         }
     }
     Page { dest: "index.md".to_string(), label: name.to_string(), depth: 0, body: PageBody::Inline(s) }
+}
+
+/// The in-content link to a generated page. mdBook serves a `README.md` page at
+/// `index.html` (its README-to-index rule) but rewrites an in-content `README.md`
+/// link to `README.html`, which is never generated (a 404). Link the served
+/// `index.md` instead, so the generated home overview resolves (host#15).
+fn served_link(dest: &str) -> String {
+    match dest.strip_suffix("README.md") {
+        Some(prefix) => format!("{prefix}index.md"),
+        None => dest.to_string(),
+    }
 }
 
 /// Render `docs/SUMMARY.md`: the home page as a prefix chapter (mdBook's landing),
@@ -3880,8 +3891,8 @@ fn summary_text(home: &Page, sections: &[Section]) -> String {
 /// The Where stub markdown for a parsed `.host-software` recipe.
 fn where_stub(recipe: &[Software]) -> String {
     let mut s = String::from(
-        "# Software — where\n\nThe action this project produces. Each component is a bare object store \
-with worktrees — not committed into this repo; the recipe below is the reproducibility \
+        "# Software: where\n\nThe action this project produces. Each component is a bare object store \
+with worktrees, not committed into this repo; the recipe below is the reproducibility \
 anchor. Materialize the worktrees locally with:\n\n```\nhost-lifecycle software --materialize .\n```\n\n",
     );
     for c in recipe {
@@ -3891,7 +3902,7 @@ anchor. Materialize the worktrees locally with:\n\n```\nhost-lifecycle software 
             wts.push(format!("{} @ {}", w.branch, short(&w.pin)));
         }
         if wts.is_empty() {
-            s.push_str("- worktrees: — (single canonical line)\n");
+            s.push_str("- worktrees: none (single canonical line)\n");
         } else {
             s.push_str(&format!("- worktrees: {}\n", wts.join(", ")));
         }
@@ -6139,7 +6150,10 @@ mod book_tests {
         match &gen.body {
             PageBody::Inline(t) => {
                 assert!(t.starts_with("# proj\n"));
-                assert!(t.contains("](cast/README.md)"), "links the Cast landing");
+                // host#15: link the served index page, never `cast/README.md` (mdBook
+                // rewrites that in-content link to a non-existent `cast/README.html`).
+                assert!(t.contains("](cast/index.md)"), "links the served Cast index");
+                assert!(!t.contains("](cast/README.md)"), "must not link the 404 README path");
             }
             _ => panic!("expected a generated home page"),
         }
@@ -6148,6 +6162,30 @@ mod book_tests {
         match home_page(&base, "proj", &sections).body {
             PageBody::Copy(p) => assert_eq!(p, base.join("README.md")),
             _ => panic!("expected README.md to be used as home"),
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn served_link_maps_readme_landings_to_index() {
+        // host#15: mdBook serves a README.md page at index.html but rewrites an in-content
+        // README.md link to a dead README.html. A README landing links the served index.
+        assert_eq!(served_link("cast/README.md"), "cast/index.md");
+        assert_eq!(served_link("README.md"), "index.md");
+        // non-README destinations are unchanged.
+        assert_eq!(served_link("PLAN.md"), "PLAN.md");
+        assert_eq!(served_link("reference/CLAUDE.md"), "reference/CLAUDE.md");
+    }
+
+    #[test]
+    fn generated_nav_titles_carry_no_em_dash() {
+        // host#15: the prose-hygiene rule forbids decoration em-dashes; the generated nav
+        // separators use a colon, so the rendered sidebar obeys the rule.
+        let base = std::env::temp_dir().join(format!("hl-navtitle-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        for sec in plan_book(&base) {
+            assert!(!sec.title.contains('—'), "nav part-title carries an em-dash: {}", sec.title);
         }
         let _ = fs::remove_dir_all(&base);
     }
@@ -6372,9 +6410,9 @@ mod book_tests {
         // labelled with the project name (implicit landing), as a prefix chapter
         let home_at = summary.find("[proj](index.md)").expect("home prefix chapter");
         assert_eq!(home.label, "proj");
-        let cast_at = summary.find("# Cast — who").unwrap();
-        let call_at = summary.find("# Call — why").unwrap();
-        let where_at = summary.find("# Software — where").unwrap();
+        let cast_at = summary.find("# Cast: who").unwrap();
+        let call_at = summary.find("# Call: why").unwrap();
+        let where_at = summary.find("# Software: where").unwrap();
         assert!(home_at < cast_at, "home leads, not Cast");
         assert!(cast_at < where_at && where_at < call_at, "lifecycle order in SUMMARY");
 
