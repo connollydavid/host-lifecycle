@@ -7,7 +7,7 @@ license = "Unlicense"
 
 [dependencies]
 host-grammar = { git = "https://github.com/connollydavid/host-grammar", rev = "9d51468ab1f0a7e253cd2ee7d149d7325e65f47b" }
-host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "93a43fa111428503d922bdc06870362553dc3801" }
+host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "1386e9ae2d5cfcd645b968f4ec1fda28fc1f84b6" }
 
 # Reproducible builds: strip symbols and the .comment section (which embed the build
 # host's toolchain/distro). Combined with --build-id=none (.cargo/config.toml), the
