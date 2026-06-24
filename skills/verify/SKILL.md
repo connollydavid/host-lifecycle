@@ -21,6 +21,16 @@ the whole sweep is green, not one check.
 4. `host-lifecycle book --check <dir>` → every room renders a page.
 5. A throwaway commit with a tell in its message → the hook blocks it.
 
+## Reflect
+
+After the gates pass, run `host-lint gather` and reflect on the candidate
+tell-shapes it surfaces: a recurring word-then-numeral shape the lane does not yet
+catch, the residue the grammar misses. Triage each with the operator: propose it
+upstream to the shared grammar, declare it in the `LEXICON`, or leave it. The pass
+is advisory, so it informs the operator and does not block the gate. An agent
+seldom perceives its own register as a tell, so this reflection is prompted here
+rather than left to chance.
+
 ## Judgment
 
 Triage is the model-effort: a HAZARD or a flagged tell is a real defect to fix, not

@@ -21,6 +21,13 @@ template revision.
 2. `host-lifecycle adopt <dir> <revision>` — creates `cast/ plan/ call/`
    idempotently and writes the `.host` stamp (`template`, `revision`, `adopted`).
 
+## Reflect
+
+A migration puts the project's whole prior history in view, the richest sweep for
+emergent tells. Run `host-lint gather` and triage each candidate tell-shape with
+the operator: propose it upstream to the shared grammar, declare it in the
+`LEXICON`, or leave it. The lane's own grammar grows from what adoption surfaces.
+
 ## Judgment
 
 The case-(b) merge is the model-effort here; the scaffolding is mechanical. Do not
