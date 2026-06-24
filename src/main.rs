@@ -70,6 +70,7 @@ fn main() {
             eprintln!("  software --check <dir>        — verify each canonical worktree is at its recorded pin");
             eprintln!("  software --verify-build <dir> — rebuild from the pin and prove the artifact reproduces");
             eprintln!("  software --install-hooks <dir>— install each component's commit hooks + verified binary");
+            eprintln!("  software --teardown [--item <n>] <dir> — remove a component's worktrees + store (guards unsaved work; --force overrides)");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
             eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
@@ -1125,6 +1126,9 @@ fn software(args: &[String]) {
     // `--item <name>[@<branch>]` narrows the operation to one component (plan/0029);
     // a flag, not a positional, so it never collides with the `<dir>` positional.
     let mut item: Option<&str> = None;
+    // `--teardown` removes a component's materialized worktrees + bare store;
+    // `--force` overrides the unsaved-work guard (plan/0029).
+    let mut force = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1132,6 +1136,8 @@ fn software(args: &[String]) {
             "--check" => mode = Some("check"),
             "--verify-build" => mode = Some("verify-build"),
             "--install-hooks" => mode = Some("install-hooks"),
+            "--teardown" => mode = Some("teardown"),
+            "--force" => force = true,
             "--item" => {
                 let Some(v) = args.get(i + 1) else {
                     eprintln!("host-lifecycle: --item needs <name>[@<branch>]");
@@ -1145,11 +1151,11 @@ fn software(args: &[String]) {
         i += 1;
     }
     let Some(dir) = pos.first() else {
-        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks> [--item <name>[@<branch>]] <dir>");
+        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks|--teardown> [--item <name>[@<branch>]] [--force] <dir>");
         process::exit(2);
     };
     let Some(mode) = mode else {
-        eprintln!("host-lifecycle software needs --materialize, --check, --verify-build, or --install-hooks");
+        eprintln!("host-lifecycle software needs --materialize, --check, --verify-build, --install-hooks, or --teardown");
         process::exit(2);
     };
     let root = match fs::canonicalize(Path::new(dir.as_str())) {
@@ -1172,6 +1178,7 @@ fn software(args: &[String]) {
         "check" => software_check(&root, &recipe),
         "verify-build" => software_verify_build(&root, &recipe),
         "install-hooks" => software_install_hooks(&root, &recipe),
+        "teardown" => software_teardown(&root, &recipe, force),
         _ => unreachable!(),
     }
 }
@@ -1730,6 +1737,44 @@ fn component_dir(root: &Path, name: &str) -> PathBuf {
     software_dir(root).join(name)
 }
 
+/// The final path segment of a branch ref (`feature/login` -> `login`). git keys a
+/// worktree's admin entry by this leaf, so two branches sharing it collide.
+fn branch_leaf(branch: &str) -> &str {
+    branch.rsplit('/').next().unwrap_or(branch)
+}
+
+/// Branch names a component declares that collide once materialized (plan/0029):
+/// two differing only in case collide as a path on a case-folding filesystem
+/// (`/mnt/c`), and two sharing a ref leaf collide in git's worktree admin. Returns
+/// one HAZARD line per colliding pair; a clean recipe yields none.
+fn branch_collision_problems(s: &Software) -> Vec<String> {
+    let mut branches: Vec<String> = vec![s.branch.clone()];
+    branches.extend(s.worktrees.iter().cloned());
+    branches.extend(s.lines.iter().map(|w| w.branch.clone()));
+    let mut out = Vec::new();
+    for i in 0..branches.len() {
+        for j in (i + 1)..branches.len() {
+            let (a, b) = (&branches[i], &branches[j]);
+            if a == b {
+                continue; // an exact duplicate is a separate recipe error, not a collision
+            }
+            if a.eq_ignore_ascii_case(b) {
+                out.push(format!(
+                    "HAZARD   software/{}: branches {a:?} and {b:?} collide case-insensitively (a case-folding filesystem maps them to one path)",
+                    s.name
+                ));
+            } else if branch_leaf(a).eq_ignore_ascii_case(branch_leaf(b)) {
+                out.push(format!(
+                    "HAZARD   software/{}: branches {a:?} and {b:?} share the worktree-admin leaf {:?} (git keys worktree admin by the ref leaf)",
+                    s.name,
+                    branch_leaf(a)
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// A component's bare object store: `<root>/software/<name>/.git/` (store-dir name
 /// fixed to `.git`; it sits beside the branch worktrees, never inside one).
 fn store_dir(root: &Path, name: &str) -> PathBuf {
@@ -1899,6 +1944,92 @@ fn software_materialize(root: &Path, recipe: &[Software]) {
     println!("-- {made} item(s) materialized");
 }
 
+/// A reason a worktree must not be destroyed without `--force`: it holds uncommitted
+/// changes, or commits not reachable from any remote ref (unpushed work). `None` when
+/// the worktree is clean and fully pushed, so re-materializing from `url` + `pin`
+/// loses nothing (plan/0029).
+fn worktree_unsaved(wt: &Path) -> Option<String> {
+    if let Some(st) = git_out(wt, &["status", "--porcelain"]) {
+        if !st.is_empty() {
+            return Some("has uncommitted changes".to_string());
+        }
+    }
+    // Local-branch commits not reachable from any remote-tracking ref.
+    if let Some(unpushed) = git_out(wt, &["log", "--branches", "--not", "--remotes", "--oneline"]) {
+        if !unpushed.is_empty() {
+            return Some("has commits not pushed to a remote".to_string());
+        }
+    }
+    None
+}
+
+/// `--teardown [--item <name>[@<branch>]]`: remove each selected component's
+/// materialized worktrees and bare store (it re-materializes from `url` + `pin`).
+/// Refuses (exit 1) to destroy a worktree holding uncommitted changes or unpushed
+/// commits unless `--force`, so unsaved work is never silently lost (plan/0029). A
+/// component that is not materialized is skipped; the operation is idempotent.
+fn software_teardown(root: &Path, recipe: &[Software], force: bool) {
+    let mut removed = 0usize;
+    let mut bad = 0usize;
+    for s in recipe {
+        let comp = component_dir(root, &s.name);
+        let bare = store_dir(root, &s.name);
+        if !comp.exists() {
+            println!("skip     software/{} (not materialized)", s.name);
+            continue;
+        }
+        // Every worktree path this component could have materialized (canonical,
+        // bare `worktrees =` branches, and explicit `worktree =` lines incl. off-tree
+        // `store=` targets).
+        let mut worktrees: Vec<(String, PathBuf)> =
+            vec![(worktree_label(&s.name, &s.branch), worktree_dir(root, &s.name, &s.branch))];
+        for b in &s.worktrees {
+            worktrees.push((worktree_label(&s.name, b), worktree_dir(root, &s.name, b)));
+        }
+        for w in &s.lines {
+            worktrees.push((worktree_label(&s.name, &w.branch), line_target(root, &s.name, w)));
+        }
+        if !force {
+            let mut unsafe_work = false;
+            for (label, wt) in &worktrees {
+                if !wt.is_dir() {
+                    continue;
+                }
+                if let Some(reason) = worktree_unsaved(wt) {
+                    println!("UNSAFE   {label} {reason}");
+                    unsafe_work = true;
+                }
+            }
+            if unsafe_work {
+                println!("refuse   software/{} not torn down (commit and push, or pass --force)", s.name);
+                bad += 1;
+                continue;
+            }
+        }
+        // Remove worktrees through git (it owns the off-tree `store=` target too), prune
+        // the admin, then delete the in-tree component dir (store + branch dirs + handle).
+        for (_, wt) in &worktrees {
+            if wt.exists() {
+                git_ok(&bare, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
+            }
+        }
+        if bare.is_dir() {
+            git_ok(&bare, &["worktree", "prune"]);
+        }
+        if let Err(e) = fs::remove_dir_all(&comp) {
+            eprintln!("host-lifecycle: could not remove {}: {e}", comp.to_string_lossy());
+            bad += 1;
+            continue;
+        }
+        println!("teardown software/{}", s.name);
+        removed += 1;
+    }
+    println!("-- {removed} component(s) torn down");
+    if bad > 0 {
+        process::exit(1);
+    }
+}
+
 /// `--check`: each component's bare store and canonical worktree must exist, and
 /// the worktree must sit at the recorded `pin`. Exit 1 if any is missing or drifted.
 /// Re-check every recorded upgrade claim in `.host` against the ledger (plan/0022
@@ -1967,6 +2098,12 @@ fn software_check(root: &Path, recipe: &[Software]) {
                 println!("HAZARD   {} escapes the host root", worktree_label(&s.name, branch));
                 bad += 1;
             }
+        }
+        // Branch names that collide as a path (case-folding) or in git's worktree admin
+        // (shared ref leaf) are a recipe defect, detectable without materialization.
+        for line in branch_collision_problems(s) {
+            println!("{line}");
+            bad += 1;
         }
         if !bare.is_dir() {
             println!("MISSING  software/{}/.git (run --materialize)", s.name);
@@ -6004,6 +6141,100 @@ mod software_tests {
         assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0029: `--teardown` removes a clean, fully-pushed component (it re-materializes
+    // from url + pin), and the unsaved-work guard flags a worktree that holds work.
+    #[test]
+    fn teardown_removes_clean_component() {
+        let base = std::env::temp_dir().join(format!("hl-teardown-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let host = base.join("host");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        let g = |cwd: &Path, args: &[&str]| assert!(git_ok(cwd, args), "git {args:?} failed");
+        g(&src, &["init", "-q", "-b", "main"]);
+        g(&src, &["config", "user.email", "t@t"]);
+        g(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("readme.txt"), "seed").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "seed"]);
+        let pin = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+        let recipe = vec![Software {
+            name: "demo".to_string(),
+            url: src.to_string_lossy().to_string(),
+            pin,
+            branch: "main".to_string(),
+            worktrees: Vec::new(),
+            lines: Vec::new(),
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        }];
+        software_materialize(&host, &recipe);
+        let comp = host.join("software").join("demo");
+        assert!(comp.is_dir(), "materialized");
+        // canonical worktree is at the pin (== origin/main): clean and pushed
+        assert!(worktree_unsaved(&comp.join("main")).is_none(), "clean worktree is safe to remove");
+        software_teardown(&host, &recipe, false);
+        assert!(!comp.exists(), "component dir removed by teardown");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The guard: an uncommitted change makes a worktree unsafe to tear down.
+    #[test]
+    fn teardown_guard_flags_uncommitted_changes() {
+        let base = std::env::temp_dir().join(format!("hl-teardown-dirty-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let host = base.join("host");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        let g = |cwd: &Path, args: &[&str]| assert!(git_ok(cwd, args), "git {args:?} failed");
+        g(&src, &["init", "-q", "-b", "main"]);
+        g(&src, &["config", "user.email", "t@t"]);
+        g(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("readme.txt"), "seed").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "seed"]);
+        let pin = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+        let recipe = vec![Software {
+            name: "demo".to_string(),
+            url: src.to_string_lossy().to_string(),
+            pin,
+            branch: "main".to_string(),
+            worktrees: Vec::new(),
+            lines: Vec::new(),
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        }];
+        software_materialize(&host, &recipe);
+        let canon = host.join("software").join("demo").join("main");
+        fs::write(canon.join("scratch.txt"), "uncommitted").unwrap();
+        assert!(worktree_unsaved(&canon).is_some(), "uncommitted change makes teardown unsafe");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0029 robustness: branches colliding as a path (case-folding) or in git's
+    // worktree admin (shared ref leaf) are a recipe defect software --check HAZARDs.
+    #[test]
+    fn branch_collisions_are_detected() {
+        let mk = |worktrees: Vec<String>| Software {
+            name: "demo".to_string(),
+            url: "u".to_string(),
+            pin: "p".to_string(),
+            branch: "main".to_string(),
+            worktrees,
+            lines: Vec::new(),
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        };
+        // case-insensitive collision with the canonical `main`
+        assert_eq!(branch_collision_problems(&mk(vec!["Main".to_string()])).len(), 1);
+        // worktree-admin leaf collision
+        assert_eq!(
+            branch_collision_problems(&mk(vec!["feature/login".to_string(), "bugfix/login".to_string()])).len(),
+            1
+        );
+        // distinct branches: no collision
+        assert!(branch_collision_problems(&mk(vec!["dev".to_string(), "release/2.0".to_string()])).is_empty());
     }
 
     #[test]
