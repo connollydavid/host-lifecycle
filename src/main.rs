@@ -1363,6 +1363,15 @@ fn reconcile_scan(root: &Path, facts: &SpineFacts) -> Result<Vec<String>, String
         }
         let Ok(content) = fs::read_to_string(&path) else { continue };
         for (n, line) in content.lines().enumerate() {
+            let Some(mpos) = line.find(RECONCILE_MARK) else { continue };
+            // A marker inside an inline-code span is documentation of the syntax, not a
+            // live directive — the spine CLAUDE.md and UPGRADING.md, and so every
+            // case-(a) adopter that copies them, quote `<!-- host-reconcile: KIND -->`
+            // as an example. An odd backtick count before the marker means it opens
+            // inside a code span, so skip it.
+            if line[..mpos].matches('`').count() % 2 == 1 {
+                continue;
+            }
             let Some(kind) = reconcile_kind(line) else { continue };
             if let Some(problem) = reconcile_assertion(&kind, reconcile_visible(line), facts) {
                 hazards.push(format!("{rel}:{}: {problem}", n + 1));
@@ -6799,6 +6808,13 @@ mod software_tests {
         let hz = reconcile_scan(&base, &facts).unwrap();
         assert_eq!(hz.len(), 1, "exactly the drifted restatement flags: {hz:?}");
         assert!(hz[0].contains("drift.md:3") && hz[0].contains("host-prove"), "hazard names file:line and the omission: {hz:?}");
+        // a doc that QUOTES the marker in inline code is documentation, not a directive:
+        // the placeholder kind would be unknown, but the backtick span suppresses it (the
+        // spine and every case-(a) adopter carry this example in their CLAUDE.md).
+        fs::write(base.join("ok.md"), "Develops host-lint, host-lifecycle, host-prove, host-grammar. <!-- host-reconcile: family -->\nIt carries an inline `<!-- host-reconcile: KIND -->` annotation.\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "doc"]);
+        assert_eq!(reconcile_scan(&base, &facts).unwrap().len(), 1, "the backtick-quoted example adds no hazard; only the real drift remains");
         let _ = fs::remove_dir_all(&base);
     }
 
