@@ -1344,11 +1344,17 @@ fn reconcile_assertion(kind: &str, visible: &str, facts: &ProjectFacts) -> Optio
     }
 }
 
-/// Walk tracked markdown (the prose-audit walk: `git ls-files`, honoring
-/// `.host-lintignore`, skipping symlinks and non-markdown) and check every
-/// `host-reconcile` annotation. Returns one HAZARD per failing restatement (with
-/// `file:line`), or an error if the repo cannot be walked.
-fn reconcile_scan(root: &Path, facts: &ProjectFacts) -> Result<Vec<String>, String> {
+/// The concept vocabulary (plan/0039): the methodology concepts a project defines once
+/// (a home heading carrying `{#id}`) and points at everywhere else (`[text](FILE#id)`)
+/// instead of restating. The vocabulary is spine-universal (here); the values are
+/// project-local (`.host-software`). `verifiers`/`software-root`/`spec-home` read the
+/// former inline kinds `verification`/`where-root`/`spec-path` in plain words.
+const CONCEPT_IDS: [&str; 4] = ["components", "verifiers", "software-root", "spec-home"];
+
+/// Gather tracked markdown as `(relative-path, content)`: `git ls-files`, honoring
+/// `.host-lintignore`, skipping symlinks and non-markdown. The one walk the reconcile
+/// checks share.
+fn tracked_markdown(root: &Path) -> Result<Vec<(String, String)>, String> {
     let ignore = load_lintignore(root);
     let out = process::Command::new("git")
         .arg("-C")
@@ -1360,29 +1366,191 @@ fn reconcile_scan(root: &Path, facts: &ProjectFacts) -> Result<Vec<String>, Stri
         return Err("git ls-files failed (reconcile needs a git repository)".to_string());
     }
     let listing = String::from_utf8_lossy(&out.stdout);
-    let mut hazards = Vec::new();
+    let mut docs = Vec::new();
     for rel in listing.split('\0').filter(|s| !s.is_empty()) {
-        if !rel.to_ascii_lowercase().ends_with(".md") {
-            continue;
-        }
-        if path_ignored(rel, &ignore) {
+        if !rel.to_ascii_lowercase().ends_with(".md") || path_ignored(rel, &ignore) {
             continue;
         }
         let path = root.join(rel);
-        if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) || !path.is_file() {
             continue;
         }
-        if !path.is_file() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            docs.push((rel.to_string(), content));
+        }
+    }
+    Ok(docs)
+}
+
+/// Collapse `.`/`..` in a relative path lexically, so two spellings of one target
+/// compare equal. A `..` that would climb above the start is dropped.
+fn normalize_rel(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when the relative `link_file`, written inside `doc_rel` and resolved against the
+/// doc's directory, names `home_file` (a path from the repo root). Case-sensitive, as
+/// mdBook's output is: a lowercased `structure.md` for `STRUCTURE.md` fails here, and
+/// link-integrity surfaces the exact fix.
+fn link_resolves_to(doc_rel: &str, link_file: &str, home_file: &str) -> bool {
+    let doc_dir = Path::new(doc_rel).parent().unwrap_or_else(|| Path::new(""));
+    normalize_rel(&doc_dir.join(link_file)) == normalize_rel(Path::new(home_file))
+}
+
+/// The concept homes: `id -> [(file, line)]` for every heading carrying `{#id}` with
+/// `id` in the vocabulary. A `{#id}` inside an inline-code span is the syntax quoted,
+/// not a home, and is skipped.
+fn scan_concept_anchors(docs: &[(String, String)]) -> std::collections::BTreeMap<String, Vec<(String, usize)>> {
+    let mut anchors: std::collections::BTreeMap<String, Vec<(String, usize)>> = std::collections::BTreeMap::new();
+    for (rel, content) in docs {
+        for (n, line) in content.lines().enumerate() {
+            for id in CONCEPT_IDS {
+                let needle = format!("{{#{id}}}");
+                if let Some(pos) = line.find(&needle) {
+                    if line[..pos].matches('`').count() % 2 == 0 {
+                        anchors.entry(id.to_string()).or_default().push((rel.clone(), n + 1));
+                    }
+                }
+            }
+        }
+    }
+    anchors
+}
+
+/// The concept links on a line: each markdown `[text](target)` whose `target` ends in
+/// `#<id>` for a concept id. Returns `(file-part, id)`, file-part empty for a same-file
+/// `#id`. A `](` inside an inline-code span is the documented syntax, not a live link.
+fn concept_links_on(line: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = line[i..].find("](") {
+        let open = i + rel;
+        if line[..open].matches('`').count() % 2 == 1 {
+            i = open + 2;
             continue;
         }
-        let Ok(content) = fs::read_to_string(&path) else { continue };
+        let start = open + 2;
+        let Some(close) = line[start..].find(')') else { break };
+        let target = &line[start..start + close];
+        if let Some((file, frag)) = target.rsplit_once('#') {
+            if CONCEPT_IDS.contains(&frag) {
+                out.push((file.to_string(), frag.to_string()));
+            }
+        }
+        i = start + close + 1;
+    }
+    out
+}
+
+/// The text of a concept's home section in `content`: the heading line carrying the
+/// anchor (1-based `home_line`) through the line before the next markdown heading. The
+/// coverage check looks for each member in this span.
+fn home_section(content: &str, home_line: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = home_line.saturating_sub(1);
+    let mut end = lines.len();
+    for (k, l) in lines.iter().enumerate().skip(start + 1) {
+        if l.trim_start().starts_with('#') {
+            end = k;
+            break;
+        }
+    }
+    lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default()
+}
+
+/// The concept-as-URI checks (plan/0039). **declared-anchor**: every concept link points
+/// at a real concept that has a home. **link-integrity**: the link names the file holding
+/// that home (case-sensitive). **coverage**: each project-local list concept's home names
+/// every `.host-software` member — the bite the inline annotation carried. Plus a one-home
+/// rule (a concept defined twice is ambiguous). One HAZARD per problem.
+fn concept_checks(docs: &[(String, String)], facts: &ProjectFacts) -> Vec<String> {
+    let mut hazards = Vec::new();
+    let anchors = scan_concept_anchors(docs);
+    for (id, homes) in &anchors {
+        if homes.len() > 1 {
+            let at: Vec<String> = homes.iter().map(|(f, l)| format!("{f}:{l}")).collect();
+            hazards.push(format!("concept `{id}` is defined in more than one place ({}) — define it once and point at it", at.join(", ")));
+        }
+    }
+    for (rel, content) in docs {
+        for (n, line) in content.lines().enumerate() {
+            for (file, id) in concept_links_on(line) {
+                match anchors.get(&id) {
+                    None => hazards.push(format!("{rel}:{}: link to `#{id}` but no doc defines that concept (`{{#{id}}}`)", n + 1)),
+                    Some(homes) => {
+                        let ok = homes.iter().any(|(home_file, _)| {
+                            if file.is_empty() {
+                                home_file == rel
+                            } else {
+                                link_resolves_to(rel, &file, home_file)
+                            }
+                        });
+                        if !ok {
+                            let at: Vec<&str> = homes.iter().map(|(f, _)| f.as_str()).collect();
+                            hazards.push(format!("{rel}:{}: concept link `{file}#{id}` does not resolve to the `{id}` home ({})", n + 1, at.join(", ")));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // coverage — the bite: a project-local list concept's home names every member.
+    let by_rel: std::collections::HashMap<&str, &str> = docs.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
+    let mut cover = |id: &str, members: &[String]| {
+        if members.is_empty() {
+            return;
+        }
+        let Some((file, line)) = anchors.get(id).and_then(|h| h.first()) else {
+            return;
+        };
+        let Some(content) = by_rel.get(file.as_str()) else {
+            return;
+        };
+        let section = home_section(content, *line);
+        let missing: Vec<&str> = members.iter().map(String::as_str).filter(|m| !section.contains(*m)).collect();
+        if !missing.is_empty() {
+            hazards.push(format!("{file}:{line}: the `{id}` home omits {} (the project's {id}: {})", missing.join(", "), members.join(", ")));
+        }
+    };
+    cover("components", &facts.components);
+    cover("verifiers", &facts.drivers);
+    hazards
+}
+
+/// Count lines carrying a live (not code-spanned) inline `<!-- host-reconcile -->`
+/// annotation — the deprecated form (plan/0039), surfaced as a migration note.
+fn count_inline_annotations(docs: &[(String, String)]) -> usize {
+    docs.iter()
+        .flat_map(|(_, content)| content.lines())
+        .filter(|line| match line.find(RECONCILE_MARK) {
+            Some(pos) => line[..pos].matches('`').count() % 2 == 0,
+            None => false,
+        })
+        .count()
+}
+
+/// The inline-annotation scan (plan/0036, deprecated by plan/0039): check every live
+/// `host-reconcile` annotation against the project's facts. Kept checking during the
+/// transition so its bite holds until the form is retired. One HAZARD per failing
+/// restatement (with `file:line`).
+fn reconcile_scan(docs: &[(String, String)], facts: &ProjectFacts) -> Vec<String> {
+    let mut hazards = Vec::new();
+    for (rel, content) in docs {
         for (n, line) in content.lines().enumerate() {
             let Some(mpos) = line.find(RECONCILE_MARK) else { continue };
             // A marker inside an inline-code span is documentation of the syntax, not a
-            // live directive — the spine CLAUDE.md and UPGRADING.md, and so every
-            // case-(a) adopter that copies them, quote `<!-- host-reconcile: KIND -->`
-            // as an example. An odd backtick count before the marker means it opens
-            // inside a code span, so skip it.
+            // live directive (the spine and adopters quote it as an example). An odd
+            // backtick count before the marker means it opens inside a code span.
             if line[..mpos].matches('`').count() % 2 == 1 {
                 continue;
             }
@@ -1392,7 +1560,7 @@ fn reconcile_scan(root: &Path, facts: &ProjectFacts) -> Result<Vec<String>, Stri
             }
         }
     }
-    Ok(hazards)
+    hazards
 }
 
 /// `reconcile <dir>` — the reconcile arm. After a spine move stales a project's own
@@ -1413,21 +1581,29 @@ fn reconcile(args: &[String]) {
         Ok(text) => parse_project_facts(&text),
         Err(_) => ProjectFacts { components: Vec::new(), drivers: Vec::new() },
     };
-    let hazards = match reconcile_scan(&root, &facts) {
-        Ok(h) => h,
+    let docs = match tracked_markdown(&root) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("host-lifecycle: reconcile: {e}");
             process::exit(2);
         }
     };
+    let mut hazards = concept_checks(&docs, &facts);
+    // The inline annotation form is deprecated (plan/0039) but still checked during the
+    // transition, so its bite holds until it is retired; warn on any survivor.
+    hazards.extend(reconcile_scan(&docs, &facts));
+    let inline = count_inline_annotations(&docs);
+    if inline > 0 {
+        eprintln!("host-lifecycle: reconcile: note — {inline} inline `<!-- host-reconcile -->` annotation(s) are deprecated (plan/0039); migrate each restatement to a concept pointer `[text](STRUCTURE.md#id)`");
+    }
     if hazards.is_empty() {
-        println!("reconcile: clean (every annotated restatement matches the spine)");
+        println!("reconcile: clean (every concept link resolves to its home; each home covers its .host-software set)");
         return;
     }
     for h in &hazards {
         println!("HAZARD   {h}");
     }
-    eprintln!("host-lifecycle: reconcile — {} restatement(s) drifted from the spine", hazards.len());
+    eprintln!("host-lifecycle: reconcile — {} concept drift(s)", hazards.len());
     process::exit(1);
 }
 
@@ -6852,12 +7028,12 @@ mod software_tests {
         fs::write(base.join("ok.md"), "Develops host-lint, host-lifecycle, host-prove, host-grammar. <!-- host-reconcile: components -->\n").unwrap();
         g(&["add", "-A"]);
         g(&["commit", "-qm", "ok"]);
-        assert!(reconcile_scan(&base, &facts).unwrap().is_empty(), "a clean annotated doc yields no hazard");
+        assert!(reconcile_scan(&tracked_markdown(&base).unwrap(), &facts).is_empty(), "a clean annotated doc yields no hazard");
         // a drifted restatement (omits host-prove): one hazard at the annotated line
         fs::write(base.join("drift.md"), "# T\n\nThe host-* tooling (host-grammar, host-lint, host-lifecycle). <!-- host-reconcile: components -->\n").unwrap();
         g(&["add", "-A"]);
         g(&["commit", "-qm", "drift"]);
-        let hz = reconcile_scan(&base, &facts).unwrap();
+        let hz = reconcile_scan(&tracked_markdown(&base).unwrap(), &facts);
         assert_eq!(hz.len(), 1, "exactly the drifted restatement flags: {hz:?}");
         assert!(hz[0].contains("drift.md:3") && hz[0].contains("host-prove"), "hazard names file:line and the omission: {hz:?}");
         // a doc that QUOTES the marker in inline code is documentation, not a directive:
@@ -6866,8 +7042,46 @@ mod software_tests {
         fs::write(base.join("ok.md"), "Develops host-lint, host-lifecycle, host-prove, host-grammar. <!-- host-reconcile: components -->\nIt carries an inline `<!-- host-reconcile: KIND -->` annotation.\n").unwrap();
         g(&["add", "-A"]);
         g(&["commit", "-qm", "doc"]);
-        assert_eq!(reconcile_scan(&base, &facts).unwrap().len(), 1, "the backtick-quoted example adds no hazard; only the real drift remains");
+        assert_eq!(reconcile_scan(&tracked_markdown(&base).unwrap(), &facts).len(), 1, "the backtick-quoted example adds no hazard; only the real drift remains");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0039: the concept-as-URI checks. Definitions live at `{#id}` anchors in an
+    // authored doc; pointers link to them; coverage holds each project-local home to its
+    // full `.host-software` set. (Pure over in-memory docs — no temp git repo needed.)
+    #[test]
+    fn concept_checks_cover_links_homes_and_membership() {
+        let facts = ProjectFacts {
+            components: vec!["host-lint".into(), "host-lifecycle".into(), "host-prove".into(), "host-grammar".into()],
+            drivers: vec!["host-lint".into(), "allium".into(), "specula".into(), "host-prove".into()],
+        };
+        let structure = |components_line: &str| {
+            format!("## Components {{#components}}\n{components_line}\n\n## Verifiers {{#verifiers}}\nhost-lint, allium, specula, host-prove.\n")
+        };
+        // clean: each home names its full set; the pointers resolve (caps file part).
+        let clean = vec![
+            ("STRUCTURE.md".to_string(), structure("host-lint, host-lifecycle, host-prove, host-grammar.")),
+            ("README.md".to_string(), "Built on the [components](STRUCTURE.md#components) and [verifiers](STRUCTURE.md#verifiers).\n".to_string()),
+        ];
+        assert!(concept_checks(&clean, &facts).is_empty(), "a clean repo yields no hazard: {:?}", concept_checks(&clean, &facts));
+        // coverage bite: the components home drops host-prove.
+        let drift = vec![("STRUCTURE.md".to_string(), structure("host-lint, host-lifecycle, host-grammar."))];
+        assert!(concept_checks(&drift, &facts).iter().any(|m| m.contains("omits") && m.contains("host-prove")), "coverage flags the dropped member");
+        // declared-anchor: a pointer to a concept with no home anywhere.
+        let nohome = vec![("README.md".to_string(), "See the [components](STRUCTURE.md#components).\n".to_string())];
+        assert!(concept_checks(&nohome, &facts).iter().any(|m| m.contains("no doc defines that concept")), "missing home flags");
+        // link-integrity: a lowercased file part does not resolve to the caps home.
+        let badcase = vec![
+            ("STRUCTURE.md".to_string(), structure("host-lint, host-lifecycle, host-prove, host-grammar.")),
+            ("README.md".to_string(), "See the [components](structure.md#components).\n".to_string()),
+        ];
+        assert!(concept_checks(&badcase, &facts).iter().any(|m| m.contains("does not resolve")), "wrong-case file part flags");
+        // one-home rule: the same concept defined twice is ambiguous.
+        let dup = vec![
+            ("STRUCTURE.md".to_string(), structure("host-lint, host-lifecycle, host-prove, host-grammar.")),
+            ("OTHER.md".to_string(), "## Components {#components}\nx.\n".to_string()),
+        ];
+        assert!(concept_checks(&dup, &facts).iter().any(|m| m.contains("more than one place")), "ambiguous home flags");
     }
 
     // plan/0037: migrate-receipts moves the applied-set into .host-receipts and splits the
