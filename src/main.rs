@@ -27,6 +27,10 @@ const MANIFEST: &str = "lifecycle.manifest";
 /// stanza per recorded phase outcome. `software --check` re-verifies each by the
 /// manifest's closed `recheck =` mechanism, never the receipt's own assertion.
 const RECEIPTS: &str = ".host-receipts";
+/// Operational lifecycle receipts (embed/release/verify/publish/classify/remap), split
+/// out of `.host-receipts` (plan/0037). `.host-receipts` keeps the methodology-version
+/// trail (adopt/upgrade) plus the applied-set; this file holds what host-lifecycle did.
+const LIFECYCLE_RECEIPTS: &str = ".host-lifecycle-receipts";
 /// The rooms `adopt` scaffolds (Where = the software submodule, added by hand).
 const ROOMS: [&str; 3] = ["cast", "plan", "call"];
 
@@ -58,8 +62,9 @@ fn main() {
         Some("receipt") => receipt(&args[2..]),
         Some("release") => release(&args[2..]),
         Some("prose") => prose(&args[2..]),
+        Some("migrate-receipts") => migrate_receipts(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|migrate-receipts> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -73,6 +78,7 @@ fn main() {
             eprintln!("  software --install-hooks <dir>— install each component's commit hooks + verified binary");
             eprintln!("  software --teardown [--item <n>] <dir> — remove a component's worktrees + store (guards unsaved work; --force overrides)");
             eprintln!("  prose <dir>                   — audit authored markdown for prose tropes in-process (host-lint --docs; the verify recheck)");
+            eprintln!("  migrate-receipts <dir>        — re-home the receipts family: applied-set to .host-receipts, operational receipts to .host-lifecycle-receipts (plan/0037)");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
             eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
@@ -300,7 +306,7 @@ fn version(dir: Option<&String>) {
     // hide an `applied` set and mislead about what is actually adopted (plan/0022).
     if let Some(b) = baseline_field(&stamp) {
         println!("baseline {b}");
-        let applied = applied_ids(&stamp);
+        let applied = read_applied_ids(Path::new(dir));
         if !applied.is_empty() {
             println!("applied {}: {}", applied.len(), applied.join(" "));
         }
@@ -401,6 +407,7 @@ fn stamp_field(text: &str, key: &str) -> Option<String> {
 
 /// The applied entry ids: the first token of each `applied = …` line (the rest of
 /// the line is provenance — `recorded=… via=…` — written by `--record`).
+#[cfg(test)]
 fn applied_ids(text: &str) -> Vec<String> {
     stamp_values(text, "applied")
 }
@@ -2144,7 +2151,7 @@ fn upgrade_claim_problems(root: &Path) -> usize {
         return 0;
     }
     let ledger_ids: Vec<String> = entries.iter().map(|e| e.revision.clone()).collect();
-    let applied = applied_ids(&stamp);
+    let applied = read_applied_ids(root);
     let baseline = baseline_field(&stamp)
         .or_else(|| parse_revision(&stamp).and_then(|r| derive_baseline(&template, &ledger_ids, &r)));
     let base = baseline.as_deref();
@@ -2330,7 +2337,7 @@ fn receipt_gate_problems(root: &Path, recipe: &[Software]) -> usize {
         ManifestState::NotAdopted => return 0,
         ManifestState::Live(ps) => ps,
         ManifestState::Absent => {
-            let has_receipts = !parse_receipts(&fs::read_to_string(root.join(RECEIPTS)).unwrap_or_default()).is_empty();
+            let has_receipts = !read_all_receipts(root).is_empty();
             if has_receipts {
                 println!("HAZARD   {RECEIPTS} present but the adopted template has no {MANIFEST} to re-check them");
                 return 1;
@@ -2338,7 +2345,7 @@ fn receipt_gate_problems(root: &Path, recipe: &[Software]) -> usize {
             return 0;
         }
     };
-    let receipts = parse_receipts(&fs::read_to_string(root.join(RECEIPTS)).unwrap_or_default());
+    let receipts = read_all_receipts(root);
     let components: Vec<String> = recipe.iter().map(|s| s.name.clone()).collect();
     let mut bad = 0;
     for line in receipt_gate(&phases, &receipts, !recipe.is_empty(), &components) {
@@ -3355,7 +3362,7 @@ fn upgrade(args: &[String]) {
         process::exit(1);
     }
     let ledger_ids: Vec<String> = entries.iter().map(|e| e.revision.clone()).collect();
-    let applied = applied_ids(&stamp);
+    let applied = read_applied_ids(&root);
 
     // Determine the baseline; migrate a legacy single-`revision` stamp once.
     let baseline = match baseline_field(&stamp) {
@@ -3438,11 +3445,14 @@ fn upgrade(args: &[String]) {
             }
             cite.to_string()
         };
-        // Append-only provenance on the current (possibly just-migrated) stamp.
-        let cur = fs::read_to_string(root.join(STAMP)).unwrap_or_else(|_| stamp.clone());
+        // Append-only provenance, written to wherever the applied-set lives (plan/0037):
+        // `.host-receipts` once migrated (or for a fresh adoption), the legacy `.host` until
+        // then, so the set never fragments across the two files.
+        let af = applied_file(&root);
+        let cur = fs::read_to_string(root.join(af)).unwrap_or_default();
         let new = append_stamp_line(&cur, &format!("applied = {} recorded={} via={}", id, today(), via));
-        if let Err(e) = write_atomic(&root.join(STAMP), &new) {
-            eprintln!("host-lifecycle: cannot write {STAMP}: {e}");
+        if let Err(e) = write_atomic(&root.join(af), &new) {
+            eprintln!("host-lifecycle: cannot write {af}: {e}");
             process::exit(2);
         }
         let remaining = entries.iter().filter(|e| e.revision != id && !is_applied(&e.revision)).count();
@@ -3478,12 +3488,24 @@ fn upgrade(args: &[String]) {
             .filter(|a| matches!(pos(a), Some(i) if i <= new_pos))
             .cloned()
             .collect();
+        // Baseline advances in the stamp; the absorbed `applied` lines are removed from
+        // wherever they live (plan/0037), so this works on a legacy `.host`, a migrated
+        // `.host-receipts`, or a transitional split across both.
         let cur_stamp = fs::read_to_string(root.join(STAMP)).unwrap_or_else(|_| stamp.clone());
         let s = set_stamp_field(&cur_stamp, "baseline", &new_baseline);
         let s = remove_applied_lines(&s, &absorbed);
         if let Err(e) = write_atomic(&root.join(STAMP), &s) {
             eprintln!("host-lifecycle: cannot write {STAMP}: {e}");
             process::exit(2);
+        }
+        if let Ok(rc) = fs::read_to_string(root.join(RECEIPTS)) {
+            let rc2 = remove_applied_lines(&rc, &absorbed);
+            if rc2 != rc {
+                if let Err(e) = write_atomic(&root.join(RECEIPTS), &rc2) {
+                    eprintln!("host-lifecycle: cannot write {RECEIPTS}: {e}");
+                    process::exit(2);
+                }
+            }
         }
         println!("advanced baseline {} -> {}; absorbed {} applied id(s)", short(&baseline), short(&new_baseline), absorbed.len());
         return;
@@ -4559,8 +4581,56 @@ fn receipt_stanza(r: &Receipt) -> String {
 
 /// Append a receipt to `.host-receipts` atomically (append-only; a blank line
 /// separates stanzas). The tool is the only writer — Fen never hand-edits it.
+/// A lifecycle phase whose receipt is a methodology-version event, the act of moving the
+/// project to a template revision: `adopt` (sets the baseline) and `upgrade` (advances
+/// it). These live in `.host-receipts`; every other phase host-lifecycle runs is
+/// operational and lives in `.host-lifecycle-receipts` (plan/0037).
+fn is_methodology_phase(phase: &str) -> bool {
+    phase == "adopt" || phase == "upgrade"
+}
+
+/// The applied-set ids from BOTH layouts (plan/0037): the legacy `applied =` lines in
+/// `.host` and the migrated ones in `.host-receipts`, unioned in first-seen order. The
+/// gate reads an un-migrated, migrated, or transitional project alike.
+fn read_applied_ids(root: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for f in [STAMP, RECEIPTS] {
+        for id in stamp_values(&fs::read_to_string(root.join(f)).unwrap_or_default(), "applied") {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// The file the applied-set lives in: `.host` while a legacy `applied =` line is still in
+/// the stamp, else `.host-receipts` (migrated, or a fresh adoption on this binary). New
+/// applied lines and `--advance` compaction target it, so the set never fragments.
+fn applied_file(root: &Path) -> &'static str {
+    if stamp_values(&fs::read_to_string(root.join(STAMP)).unwrap_or_default(), "applied").is_empty() {
+        RECEIPTS
+    } else {
+        STAMP
+    }
+}
+
+/// Every lifecycle receipt from BOTH layouts (plan/0037): the methodology-version receipts
+/// in `.host-receipts` and the operational ones in `.host-lifecycle-receipts`. The gate
+/// unions them, so it re-checks an un-migrated, migrated, or transitional project.
+fn read_all_receipts(root: &Path) -> Vec<Receipt> {
+    let mut text = fs::read_to_string(root.join(RECEIPTS)).unwrap_or_default();
+    if let Ok(op) = fs::read_to_string(root.join(LIFECYCLE_RECEIPTS)) {
+        text.push('\n');
+        text.push_str(&op);
+    }
+    parse_receipts(&text)
+}
+
 fn append_receipt(root: &Path, r: &Receipt) -> std::io::Result<()> {
-    let path = root.join(RECEIPTS);
+    // Route by ontology (plan/0037): a methodology-version receipt (adopt/upgrade) to
+    // `.host-receipts`, every operational receipt to `.host-lifecycle-receipts`.
+    let path = root.join(if is_methodology_phase(&r.phase) { RECEIPTS } else { LIFECYCLE_RECEIPTS });
     let mut cur = fs::read_to_string(&path).unwrap_or_default();
     if !cur.is_empty() {
         if !cur.ends_with('\n') {
@@ -4680,6 +4750,77 @@ fn receipt_gate(phases: &[Phase], receipts: &[Receipt], has_where: bool, compone
     out
 }
 
+/// `migrate-receipts <dir>`: the tool-driven, idempotent re-homing (plan/0037). Move the
+/// applied-set out of `.host` into `.host-receipts`, split the operational receipts out of
+/// `.host-receipts` into `.host-lifecycle-receipts`, and leave the adopt/upgrade receipts in
+/// `.host-receipts`. Writes atomically and reports what moved; a project already on the new
+/// layout is a no-op. The agent runs one command and never hand-edits the files.
+fn migrate_receipts(args: &[String]) {
+    let dir = args.iter().find(|a| !a.starts_with("--")).map(String::as_str).unwrap_or(".");
+    let root = match fs::canonicalize(Path::new(dir)) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("host-lifecycle: not a directory: {dir}");
+            process::exit(2);
+        }
+    };
+    let is_applied_line = |l: &str| l.trim_start().strip_prefix("applied").is_some_and(|r| r.trim_start().starts_with('='));
+    let stamp = fs::read_to_string(root.join(STAMP)).unwrap_or_default();
+    let rc_text = fs::read_to_string(root.join(RECEIPTS)).unwrap_or_default();
+
+    let receipts = parse_receipts(&rc_text);
+    let has_operational = receipts.iter().any(|r| !is_methodology_phase(&r.phase));
+    let stamp_has_applied = stamp.lines().any(&is_applied_line);
+    if !stamp_has_applied && !has_operational {
+        println!("migrate-receipts: already on the new layout; nothing to move");
+        return;
+    }
+
+    // The full `applied =` lines (with recorded/via), from both files (transitional-safe).
+    let applied_lines: Vec<String> = stamp.lines().chain(rc_text.lines()).filter(|l| is_applied_line(l)).map(|l| l.trim().to_string()).collect();
+
+    // `.host`: the stamp minus the applied lines.
+    let mut new_stamp: String = stamp.lines().filter(|l| !is_applied_line(l)).collect::<Vec<_>>().join("\n");
+    if !new_stamp.ends_with('\n') {
+        new_stamp.push('\n');
+    }
+
+    // `.host-receipts`: the applied-set block, then the methodology-version receipts.
+    let methodology: Vec<&Receipt> = receipts.iter().filter(|r| is_methodology_phase(&r.phase)).collect();
+    let mut new_rc = String::new();
+    if !applied_lines.is_empty() {
+        new_rc.push_str(&applied_lines.join("\n"));
+        new_rc.push('\n');
+    }
+    for r in &methodology {
+        if !new_rc.is_empty() {
+            new_rc.push('\n');
+        }
+        new_rc.push_str(&receipt_stanza(r));
+    }
+
+    // `.host-lifecycle-receipts`: existing content, then the operational receipts moved here.
+    let operational: Vec<&Receipt> = receipts.iter().filter(|r| !is_methodology_phase(&r.phase)).collect();
+    let mut new_op = fs::read_to_string(root.join(LIFECYCLE_RECEIPTS)).unwrap_or_default();
+    for r in &operational {
+        if !new_op.is_empty() {
+            if !new_op.ends_with('\n') {
+                new_op.push('\n');
+            }
+            new_op.push('\n');
+        }
+        new_op.push_str(&receipt_stanza(r));
+    }
+
+    for (name, content) in [(STAMP, &new_stamp), (RECEIPTS, &new_rc), (LIFECYCLE_RECEIPTS, &new_op)] {
+        if let Err(e) = write_atomic(&root.join(name), content) {
+            eprintln!("host-lifecycle: cannot write {name}: {e}");
+            process::exit(2);
+        }
+    }
+    println!("migrate-receipts: moved {} applied line(s) into {RECEIPTS}; split {} operational receipt(s) to {LIFECYCLE_RECEIPTS}; kept {} methodology receipt(s) in {RECEIPTS}", applied_lines.len(), operational.len(), methodology.len());
+}
+
 fn receipt(args: &[String]) {
     match args.first().map(String::as_str) {
         Some("--record") => receipt_record(&args[1..]),
@@ -4747,7 +4888,7 @@ fn receipt_record(args: &[String]) {
 
 fn receipt_list(dir: Option<&String>) {
     let root = Path::new(dir.map_or(".", |s| s.as_str()));
-    let receipts = parse_receipts(&fs::read_to_string(root.join(RECEIPTS)).unwrap_or_default());
+    let receipts = read_all_receipts(root);
     if receipts.is_empty() {
         println!("no receipts recorded");
         return;
@@ -6362,6 +6503,64 @@ mod software_tests {
             dirty.iter().any(|m| m.severity == Severity::Warn || m.severity == Severity::Flag),
             "a decoration trope is detected as warn/flag"
         );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0037: migrate-receipts moves the applied-set into .host-receipts and splits the
+    // operational receipts into .host-lifecycle-receipts, the dual-format reads still see
+    // everything, and a second run is a no-op.
+    #[test]
+    fn migrate_receipts_moves_applied_and_splits_operational() {
+        let base = std::env::temp_dir().join(format!("hl-migrate-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join(".host"),
+            "template = \"x\"\nrevision = \"a5fef9d\"\nbaseline = \"a22704e\"\napplied = 897ce0d recorded=2026-06-20 via=verify\napplied = da000aa recorded=2026-06-20 via=verify\n",
+        ).unwrap();
+        fs::write(
+            base.join(".host-receipts"),
+            "[receipt \"adopt\"]\n    disposition = done\n    evidence = a5fef9d\n\n[receipt \"embed\" \"host-lint\"]\n    disposition = done\n    evidence = pin abc\n\n[receipt \"release\" \"host-lint\"]\n    disposition = done\n    evidence = v1@h\n\n[receipt \"upgrade\"]\n    disposition = done\n    evidence = ledger\n",
+        ).unwrap();
+        let arg = base.to_string_lossy().to_string();
+        migrate_receipts(std::slice::from_ref(&arg));
+        let canon = fs::canonicalize(&base).unwrap();
+
+        let stamp = fs::read_to_string(canon.join(".host")).unwrap();
+        assert!(!stamp.contains("applied ="), ".host no longer holds the applied-set");
+        assert!(stamp.contains("baseline = \"a22704e\""), "baseline stays in .host");
+        let rc = fs::read_to_string(canon.join(".host-receipts")).unwrap();
+        assert!(rc.contains("applied = 897ce0d") && rc.contains("applied = da000aa"), "applied-set moved into .host-receipts");
+        assert!(rc.contains("[receipt \"adopt\"]") && rc.contains("[receipt \"upgrade\"]"), "methodology receipts stay");
+        assert!(!rc.contains("[receipt \"embed\"") && !rc.contains("[receipt \"release\""), "operational receipts left .host-receipts");
+        let op = fs::read_to_string(canon.join(".host-lifecycle-receipts")).unwrap();
+        assert!(op.contains("[receipt \"embed\" \"host-lint\"]") && op.contains("[receipt \"release\" \"host-lint\"]"), "operational receipts moved here");
+
+        // dual-format reads see the whole picture
+        let ids = read_applied_ids(&canon);
+        assert!(ids.contains(&"897ce0d".to_string()) && ids.contains(&"da000aa".to_string()), "applied ids read from the new layout");
+        let all = read_all_receipts(&canon);
+        assert!(all.iter().any(|r| r.phase == "adopt") && all.iter().any(|r| r.phase == "embed") && all.iter().any(|r| r.phase == "release"), "gate unions both receipt files");
+
+        // idempotent
+        migrate_receipts(std::slice::from_ref(&arg));
+        let rc2 = fs::read_to_string(canon.join(".host-receipts")).unwrap();
+        assert!(rc2.contains("applied = 897ce0d") && !rc2.contains("[receipt \"embed\""), "second run is a no-op");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0037: a legacy layout (applied-set in .host, a single .host-receipts, no
+    // .host-lifecycle-receipts) is read correctly without migrating (auto-migrate on read).
+    #[test]
+    fn reads_legacy_layout_without_migrating() {
+        let base = std::env::temp_dir().join(format!("hl-legacy-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join(".host"), "baseline = \"a22704e\"\napplied = 897ce0d recorded=2026-06-20 via=verify\n").unwrap();
+        fs::write(base.join(".host-receipts"), "[receipt \"embed\" \"host-lint\"]\n    disposition = done\n    evidence = pin abc\n").unwrap();
+        let canon = fs::canonicalize(&base).unwrap();
+        assert_eq!(read_applied_ids(&canon), vec!["897ce0d".to_string()], "applied read from legacy .host");
+        assert!(read_all_receipts(&canon).iter().any(|r| r.phase == "embed"), "receipts read with no .host-lifecycle-receipts present");
         let _ = fs::remove_dir_all(&base);
     }
 
