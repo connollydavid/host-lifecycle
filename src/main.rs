@@ -1407,16 +1407,40 @@ fn link_resolves_to(doc_rel: &str, link_file: &str, home_file: &str) -> bool {
     normalize_rel(&doc_dir.join(link_file)) == normalize_rel(Path::new(home_file))
 }
 
-/// The concept homes: `id -> [(file, line)]` for every heading carrying `{#id}` with
-/// `id` in the vocabulary. A `{#id}` inside an inline-code span is the syntax quoted,
-/// not a home, and is skipped.
+/// The ATX heading level of `line` (1..=6), or 0 if it is not a heading. mdBook honors
+/// a `{#id}` attribute only on such a heading (`#` to `######` followed by a space), at
+/// its end.
+fn heading_level(line: &str) -> usize {
+    let t = line.trim_start();
+    let hashes = t.len() - t.trim_start_matches('#').len();
+    if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
+        hashes
+    } else {
+        0
+    }
+}
+
+/// Whether `line` is an ATX heading.
+fn is_heading(line: &str) -> bool {
+    heading_level(line) != 0
+}
+
+/// The concept homes: `id -> [(file, line)]` for every **heading ending in `{#id}`** with
+/// `id` in the vocabulary. mdBook honors `{#id}` only as a heading attribute at the *end*
+/// of the heading: a `{#id}` on a non-heading line, or one at the *start* of a heading
+/// (`## {#id} Title`), renders a different id or none, so a pointer to it would 404. One
+/// inside an inline-code span is the syntax quoted, not a home.
 fn scan_concept_anchors(docs: &[(String, String)]) -> std::collections::BTreeMap<String, Vec<(String, usize)>> {
     let mut anchors: std::collections::BTreeMap<String, Vec<(String, usize)>> = std::collections::BTreeMap::new();
     for (rel, content) in docs {
         for (n, line) in content.lines().enumerate() {
+            if !is_heading(line) {
+                continue;
+            }
             for id in CONCEPT_IDS {
                 let needle = format!("{{#{id}}}");
-                if let Some(pos) = line.find(&needle) {
+                if line.trim_end().ends_with(&needle) {
+                    let pos = line.find(&needle).unwrap_or(0);
                     if line[..pos].matches('`').count() % 2 == 0 {
                         anchors.entry(id.to_string()).or_default().push((rel.clone(), n + 1));
                     }
@@ -1453,14 +1477,17 @@ fn concept_links_on(line: &str) -> Vec<(String, String)> {
 }
 
 /// The text of a concept's home section in `content`: the heading line carrying the
-/// anchor (1-based `home_line`) through the line before the next markdown heading. The
-/// coverage check looks for each member in this span.
+/// anchor (1-based `home_line`) through the line before the next heading of the **same or
+/// higher** level. A concept defined with deeper sub-headings (`## Components` then a
+/// `### each-tool`) keeps every member inside its section, so coverage counts them all.
 fn home_section(content: &str, home_line: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let start = home_line.saturating_sub(1);
+    let home_level = lines.get(start).map(|l| heading_level(l)).unwrap_or(0);
     let mut end = lines.len();
     for (k, l) in lines.iter().enumerate().skip(start + 1) {
-        if l.trim_start().starts_with('#') {
+        let lvl = heading_level(l);
+        if lvl != 0 && lvl <= home_level {
             end = k;
             break;
         }
@@ -7082,6 +7109,27 @@ mod software_tests {
             ("OTHER.md".to_string(), "## Components {#components}\nx.\n".to_string()),
         ];
         assert!(concept_checks(&dup, &facts).iter().any(|m| m.contains("more than one place")), "ambiguous home flags");
+        // a {#id} on a non-heading line is not a home (mdBook renders no anchor there),
+        // so a pointer to it fails declared-anchor rather than passing falsely.
+        let nonheading = vec![
+            ("STRUCTURE.md".to_string(), "Components {#components}: host-lint, host-lifecycle, host-prove, host-grammar.\n".to_string()),
+            ("README.md".to_string(), "See the [components](STRUCTURE.md#components).\n".to_string()),
+        ];
+        assert!(concept_checks(&nonheading, &facts).iter().any(|m| m.contains("no doc defines that concept")), "a non-heading anchor is not a home");
+        // a {#id} at the START of a heading (`## {#id} Title`) is slugified by mdBook to a
+        // different id, so it is not a home either; a pointer to it fails declared-anchor.
+        let startplaced = vec![
+            ("STRUCTURE.md".to_string(), "## {#components} Components\nhost-lint, host-lifecycle, host-prove, host-grammar.\n".to_string()),
+            ("README.md".to_string(), "See the [components](STRUCTURE.md#components).\n".to_string()),
+        ];
+        assert!(concept_checks(&startplaced, &facts).iter().any(|m| m.contains("no doc defines that concept")), "a start-placed anchor is not a home");
+        // a home whose members live in deeper sub-headings (## Components / ### each-tool)
+        // still covers: the section runs to the next same-or-higher heading.
+        let subheaded = vec![(
+            "STRUCTURE.md".to_string(),
+            "## Components {#components}\n\n### host-lint\nx\n\n### host-lifecycle\nx\n\n### host-prove\nx\n\n### host-grammar\nx\n\n## Next section\nunrelated\n".to_string(),
+        )];
+        assert!(concept_checks(&subheaded, &facts).is_empty(), "a sub-headed home covers all members: {:?}", concept_checks(&subheaded, &facts));
     }
 
     // plan/0037: migrate-receipts moves the applied-set into .host-receipts and splits the
