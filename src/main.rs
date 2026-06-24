@@ -62,9 +62,10 @@ fn main() {
         Some("receipt") => receipt(&args[2..]),
         Some("release") => release(&args[2..]),
         Some("prose") => prose(&args[2..]),
+        Some("reconcile") => reconcile(&args[2..]),
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|migrate-receipts> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|migrate-receipts> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -78,6 +79,7 @@ fn main() {
             eprintln!("  software --install-hooks <dir>— install each component's commit hooks + verified binary");
             eprintln!("  software --teardown [--item <n>] <dir> — remove a component's worktrees + store (guards unsaved work; --force overrides)");
             eprintln!("  prose <dir>                   — audit authored markdown for prose tropes in-process (host-lint --docs; the verify recheck)");
+            eprintln!("  reconcile <dir>               — re-check each `host-reconcile`-annotated restatement against the spine truth (the reflective-practice reconcile arm)");
             eprintln!("  migrate-receipts <dir>        — re-home the receipts family: applied-set to .host-receipts, operational receipts to .host-lifecycle-receipts (plan/0037)");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
@@ -512,7 +514,10 @@ fn decision_field(text: &str, key: &str) -> Option<String> {
 }
 
 /// Anti-ouroboros gate: a live (accepted) decision needs a `Scope:` and must not be
-/// methodology. Retired decisions (superseded/deprecated/rejected/proposed) pass.
+/// methodology. Retired decisions (superseded/deprecated/rejected/proposed) pass. A
+/// `Scope:` that names `host-template` is also flagged (plan/0036, the reconcile arm's
+/// sibling): the decision authored a rule that now lives in the spine, so it must be
+/// superseded there rather than left `accepted` (the `call/0017` decision-status drift).
 fn decision_scope_problem(text: &str) -> Option<&'static str> {
     let status = decision_field(text, "Status").unwrap_or_default();
     if !status.to_ascii_lowercase().starts_with("accepted") {
@@ -522,6 +527,9 @@ fn decision_scope_problem(text: &str) -> Option<&'static str> {
         None => Some("accepted decision is missing a `Scope:` header"),
         Some(s) if s.eq_ignore_ascii_case("methodology") => {
             Some("accepted decision is `Scope: methodology` — methodology belongs in the template spine; supersede it there")
+        }
+        Some(s) if s.to_ascii_lowercase().contains("host-template") => {
+            Some("accepted decision names `host-template` in its `Scope:` — its rule is now spine-resident; set `Status: superseded by the spine`")
         }
         Some(_) => None,
     }
@@ -1221,6 +1229,183 @@ fn prose(args: &[String]) {
     }
     eprintln!("host-lifecycle: prose regression — {flags} flag(s), {warns} warn(s) in authored docs");
     process::exit(if flags > 0 { 1 } else { 3 });
+}
+
+// ---- Reconcile (plan/0036) -------------------------------------------------
+//
+// The second arm of the "grows by reflective practice" doctrine. The first arm
+// (gather) catches emergent tells the lane misses; reconcile catches a project's
+// own restatement of methodology that a spine move staled. Scope is the annotated
+// set, not a judgment: a restatement that must stay carries an inline
+// `<!-- host-reconcile: KIND -->` annotation declaring an assertion the tool checks
+// against a source of truth (the spine's `[family]`/`[verification]` data and the
+// fixed layout), so the check is operable at the weak-agent bar. The one-time
+// discovery of the drift is a human audit; the annotation makes recurrence mechanical.
+
+/// The reconcile-assertion kinds: the machine-checkable restatement shapes the
+/// reconcile arm verifies. A doc annotation `<!-- host-reconcile: KIND -->` and an
+/// `UPGRADING` `restates =` field both name a kind from this set.
+const RECONCILE_KINDS: [&str; 4] = ["family", "verification", "where-root", "spec-path"];
+
+/// The inline annotation marker; the kind follows up to the closing `-->`.
+const RECONCILE_MARK: &str = "<!-- host-reconcile:";
+
+/// The spine's machine-readable truth data (seeded in `lifecycle.manifest` after the
+/// phase stanzas): the canonical host-* family and the verification ladder's
+/// rung-drivers. Empty when the adopted template predates the data — then the
+/// family/verification assertions are unverifiable and skipped, never a false HAZARD.
+struct SpineFacts {
+    family: Vec<String>,
+    drivers: Vec<String>,
+}
+
+/// Parse the `[family]`/`[verification]` stanzas from a `lifecycle.manifest` (same
+/// git-config style as the phase stanzas, which `parse_manifest` reads and these
+/// ignore). Unknown sections and keys are ignored (forward-compatible).
+fn parse_spine_facts(text: &str) -> SpineFacts {
+    let split = |v: &str| v.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+    let (mut family, mut drivers) = (Vec::new(), Vec::new());
+    let mut section = "";
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with('[') {
+            section = match t {
+                "[family]" => "family",
+                "[verification]" => "verification",
+                _ => "",
+            };
+            continue;
+        }
+        let Some((key, val)) = t.split_once('=') else { continue };
+        match (section, key.trim()) {
+            ("family", "tools") => family = split(val.trim()),
+            ("verification", "drivers") => drivers = split(val.trim()),
+            _ => {}
+        }
+    }
+    SpineFacts { family, drivers }
+}
+
+/// The kind named in a line's `<!-- host-reconcile: KIND -->` annotation, if any.
+fn reconcile_kind(line: &str) -> Option<String> {
+    let rest = &line[line.find(RECONCILE_MARK)? + RECONCILE_MARK.len()..];
+    let kind = rest[..rest.find("-->")?].trim();
+    (!kind.is_empty()).then(|| kind.to_string())
+}
+
+/// The visible text of an annotated line — the source line with the trailing
+/// annotation comment removed, so the marker's own tokens never pollute the assertion.
+fn reconcile_visible(line: &str) -> &str {
+    match line.find(RECONCILE_MARK) {
+        Some(i) => &line[..i],
+        None => line,
+    }
+}
+
+/// Check one annotated restatement against the spine truth and the fixed layout.
+/// Returns a HAZARD message, or None when the restatement still matches.
+fn reconcile_assertion(kind: &str, visible: &str, facts: &SpineFacts) -> Option<String> {
+    let low = visible.to_ascii_lowercase();
+    match kind {
+        // The named set must still cover the declared family / rung-drivers; report
+        // the omissions (a missing member is the drift, e.g. a README that drops
+        // host-prove). An empty datum means a pre-data template — unverifiable, skip.
+        "family" if !facts.family.is_empty() => {
+            let missing: Vec<&str> = facts.family.iter().map(String::as_str).filter(|t| !visible.contains(*t)).collect();
+            (!missing.is_empty()).then(|| format!("family restatement omits {} (declared host-* family: {})", missing.join(", "), facts.family.join(", ")))
+        }
+        "verification" if !facts.drivers.is_empty() => {
+            let missing: Vec<&str> = facts.drivers.iter().map(String::as_str).filter(|d| !low.contains(&d.to_ascii_lowercase())).collect();
+            (!missing.is_empty()).then(|| format!("verification-model restatement omits rung-driver {} (declared drivers: {})", missing.join(", "), facts.drivers.join(", ")))
+        }
+        "family" | "verification" => None,
+        "where-root" => (!visible.contains("software/"))
+            .then(|| "Where-root restatement does not name `software/` (the recorded Where layout)".to_string()),
+        "spec-path" => (low.contains("plan/") && low.contains("spec"))
+            .then(|| "spec-path restatement places specs under `plan/` — specs co-locate with their software (plan/0012)".to_string()),
+        other => Some(format!("unknown host-reconcile kind `{other}` (known: {})", RECONCILE_KINDS.join(", "))),
+    }
+}
+
+/// Walk tracked markdown (the prose-audit walk: `git ls-files`, honoring
+/// `.host-lintignore`, skipping symlinks and non-markdown) and check every
+/// `host-reconcile` annotation. Returns one HAZARD per failing restatement (with
+/// `file:line`), or an error if the repo cannot be walked.
+fn reconcile_scan(root: &Path, facts: &SpineFacts) -> Result<Vec<String>, String> {
+    let ignore = load_lintignore(root);
+    let out = process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|e| format!("git ls-files: {e}"))?;
+    if !out.status.success() {
+        return Err("git ls-files failed (reconcile needs a git repository)".to_string());
+    }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let mut hazards = Vec::new();
+    for rel in listing.split('\0').filter(|s| !s.is_empty()) {
+        if !rel.to_ascii_lowercase().ends_with(".md") {
+            continue;
+        }
+        if path_ignored(rel, &ignore) {
+            continue;
+        }
+        let path = root.join(rel);
+        if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else { continue };
+        for (n, line) in content.lines().enumerate() {
+            let Some(kind) = reconcile_kind(line) else { continue };
+            if let Some(problem) = reconcile_assertion(&kind, reconcile_visible(line), facts) {
+                hazards.push(format!("{rel}:{}: {problem}", n + 1));
+            }
+        }
+    }
+    Ok(hazards)
+}
+
+/// `reconcile <dir>` — the reconcile arm. After a spine move stales a project's own
+/// restatement of methodology, re-check each annotated restatement against the spine
+/// truth (`[family]`/`[verification]` in the adopted `lifecycle.manifest`) and the
+/// fixed layout, and HAZARD a restatement that drifted. A `Flag` exits 1, so chaining
+/// it into the verify recheck re-opens the gate when a restatement regresses.
+fn reconcile(args: &[String]) {
+    let dir = args.iter().find(|a| !a.starts_with("--")).map(String::as_str).unwrap_or(".");
+    let root = match fs::canonicalize(Path::new(dir)) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("host-lifecycle: not a directory: {dir}");
+            process::exit(2);
+        }
+    };
+    let facts = match find_template_dir(&root).and_then(|t| fs::read_to_string(t.join(MANIFEST)).ok()) {
+        Some(text) => parse_spine_facts(&text),
+        None => SpineFacts { family: Vec::new(), drivers: Vec::new() },
+    };
+    let hazards = match reconcile_scan(&root, &facts) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("host-lifecycle: reconcile: {e}");
+            process::exit(2);
+        }
+    };
+    if hazards.is_empty() {
+        println!("reconcile: clean (every annotated restatement matches the spine)");
+        return;
+    }
+    for h in &hazards {
+        println!("HAZARD   {h}");
+    }
+    eprintln!("host-lifecycle: reconcile — {} restatement(s) drifted from the spine", hazards.len());
+    process::exit(1);
 }
 
 fn software(args: &[String]) {
@@ -3230,6 +3415,12 @@ struct Upgrade {
     /// refuses the record). Empty when the action has none — then recording
     /// requires an explicit `--unverified call/NNNN` citation.
     verify: String,
+    /// `restates = <kind> …` (plan/0036) — the reconcile-assertion kinds this entry's
+    /// spine move stales in a project's own restatements (a `RECONCILE_KINDS` subset).
+    /// A non-empty `restates` marks a drift-capable entry: the reconcile arm re-reads
+    /// the named restatement kinds after the entry is applied. Empty for an entry that
+    /// moves no mirrorable concept.
+    restates: Vec<String>,
 }
 
 /// `upgrade <dir>` — list the template `UPGRADING.md` actions newer than the repo's
@@ -3570,6 +3761,7 @@ fn parse_upgrading(text: &str) -> Vec<Upgrade> {
                 independent: false,
                 depends: Vec::new(),
                 verify: String::new(),
+                restates: Vec::new(),
             });
             continue;
         }
@@ -3587,6 +3779,7 @@ fn parse_upgrading(text: &str) -> Vec<Upgrade> {
             "independent" => cur.independent = val.eq_ignore_ascii_case("true"),
             "depends" => cur.depends = val.split_whitespace().map(String::from).collect(),
             "verify" => cur.verify = val.to_string(),
+            "restates" => cur.restates = val.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
             _ => {}
         }
     }
@@ -3602,6 +3795,11 @@ fn validate_ledger(entries: &[Upgrade]) -> Vec<String> {
     for e in entries {
         if e.independent && !e.depends.is_empty() {
             problems.push(format!("{}: both `independent` and `depends`", short(&e.revision)));
+        }
+        for k in &e.restates {
+            if !RECONCILE_KINDS.contains(&k.as_str()) {
+                problems.push(format!("{}: restates unknown kind `{k}` (known: {})", short(&e.revision), RECONCILE_KINDS.join(", ")));
+            }
         }
         for d in &e.depends {
             if d == &e.revision {
@@ -5690,6 +5888,18 @@ mod tests {
         // superseded: not in force, passes regardless of scope
         assert!(decision_scope_problem("- Status: superseded by the spine\n").is_none());
     }
+
+    // plan/0036: an accepted decision whose Scope names host-template authored a rule
+    // now resident in the spine, so it must be superseded there (the call/0017 class).
+    #[test]
+    fn scope_gate_flags_host_template_scope() {
+        // accepted + a Scope that names host-template (alongside a tool): fails
+        assert!(decision_scope_problem("- Status: accepted\n- Scope: host-lifecycle, host-template (the spine)\n").is_some());
+        // accepted + a tool-only scope that happens to start with host-: still ok
+        assert!(decision_scope_problem("- Status: accepted\n- Scope: host-lint, host-prove\n").is_none());
+        // superseded: the status short-circuit wins regardless of host-template scope
+        assert!(decision_scope_problem("- Status: superseded by the spine\n- Scope: host-template\n").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -6506,6 +6716,92 @@ mod software_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    // plan/0036: the reconcile arm. The spine truth parses out of the manifest stanzas;
+    // an annotation names a kind; an assertion flags a drifted restatement and clears a
+    // matching one; the ledger `restates` field parses and gates its kinds.
+    #[test]
+    fn parse_spine_facts_reads_family_and_drivers() {
+        let text = "\
+[phase \"verify\"]\n\torder = 5\n\n[family]\n\ttools = host-lint host-lifecycle host-prove host-grammar\n\n[verification]\n\tdrivers = host-lint allium specula host-prove\n";
+        let f = parse_spine_facts(text);
+        assert_eq!(f.family, vec!["host-lint", "host-lifecycle", "host-prove", "host-grammar"]);
+        assert_eq!(f.drivers, vec!["host-lint", "allium", "specula", "host-prove"]);
+        // and the phase parser still ignores the new stanzas (no phantom phases)
+        assert_eq!(parse_manifest(text).len(), 1);
+    }
+
+    #[test]
+    fn reconcile_kind_extracts_the_annotation() {
+        assert_eq!(reconcile_kind("text here <!-- host-reconcile: family -->").as_deref(), Some("family"));
+        assert_eq!(reconcile_kind("| Where | software/ | <!-- host-reconcile: where-root -->").as_deref(), Some("where-root"));
+        assert_eq!(reconcile_kind("plain line, no annotation"), None);
+        assert_eq!(reconcile_kind("<!-- host-reconcile:  -->"), None);
+    }
+
+    #[test]
+    fn reconcile_assertion_flags_drift_and_clears_clean() {
+        let facts = SpineFacts {
+            family: vec!["host-lint".into(), "host-lifecycle".into(), "host-prove".into(), "host-grammar".into()],
+            drivers: vec!["host-lint".into(), "allium".into(), "specula".into(), "host-prove".into()],
+        };
+        // family: a line that omits host-prove flags; the full set clears.
+        assert!(reconcile_assertion("family", "the host-* family (host-grammar, host-lint, host-lifecycle)", &facts).is_some());
+        assert!(reconcile_assertion("family", "host-lint, host-lifecycle, host-prove, host-grammar", &facts).is_none());
+        // verification: "three lanes" dropping host-prove flags (case-insensitive).
+        assert!(reconcile_assertion("verification", "three lanes: host-lint, allium, Specula", &facts).is_some());
+        assert!(reconcile_assertion("verification", "host-lint, allium, specula, and host-prove", &facts).is_none());
+        // where-root: a stale root flags; naming software/ clears.
+        assert!(reconcile_assertion("where-root", "Where at host-lint/", &facts).is_some());
+        assert!(reconcile_assertion("where-root", "Where at software/<name>/main/", &facts).is_none());
+        // spec-path: specs placed under plan/ flags; co-located clears.
+        assert!(reconcile_assertion("spec-path", "specifications at plan/<NNNN>/spec/", &facts).is_some());
+        assert!(reconcile_assertion("spec-path", "specs co-locate with the software in its repo", &facts).is_none());
+        // an unknown kind is itself a HAZARD (guards an annotation typo).
+        assert!(reconcile_assertion("bogus", "anything", &facts).is_some());
+        // empty datum (pre-data template): family/verification unverifiable, skipped.
+        let bare = SpineFacts { family: vec![], drivers: vec![] };
+        assert!(reconcile_assertion("family", "host-lint only", &bare).is_none());
+    }
+
+    #[test]
+    fn parse_upgrading_reads_restates_and_ledger_gates_kinds() {
+        let text = "[upgrade \"abc1234\"]\n\ttitle = t\n\trestates = family verification\n\n[upgrade \"def5678\"]\n\ttitle = t2\n\trestates = bogus-kind\n";
+        let entries = parse_upgrading(text);
+        assert_eq!(entries[0].restates, vec!["family", "verification"]);
+        let problems = validate_ledger(&entries);
+        let restate_problems: Vec<&String> = problems.iter().filter(|p| p.contains("restates unknown kind")).collect();
+        assert_eq!(restate_problems.len(), 1, "only the bogus kind is flagged: {problems:?}");
+        assert!(restate_problems[0].contains("`bogus-kind`"), "the flagged kind is bogus-kind: {restate_problems:?}");
+    }
+
+    #[test]
+    fn reconcile_scan_flags_an_annotated_drift_and_clears_a_clean_doc() {
+        let base = std::env::temp_dir().join(format!("hl-reconcile-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let g = |args: &[&str]| assert!(git_ok(&base, args), "git {args:?} failed");
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        let facts = SpineFacts {
+            family: vec!["host-lint".into(), "host-lifecycle".into(), "host-prove".into(), "host-grammar".into()],
+            drivers: vec!["host-lint".into(), "allium".into(), "specula".into(), "host-prove".into()],
+        };
+        // a clean annotated restatement: no hazard
+        fs::write(base.join("ok.md"), "Develops host-lint, host-lifecycle, host-prove, host-grammar. <!-- host-reconcile: family -->\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "ok"]);
+        assert!(reconcile_scan(&base, &facts).unwrap().is_empty(), "a clean annotated doc yields no hazard");
+        // a drifted restatement (omits host-prove): one hazard at the annotated line
+        fs::write(base.join("drift.md"), "# T\n\nThe host-* tooling (host-grammar, host-lint, host-lifecycle). <!-- host-reconcile: family -->\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "drift"]);
+        let hz = reconcile_scan(&base, &facts).unwrap();
+        assert_eq!(hz.len(), 1, "exactly the drifted restatement flags: {hz:?}");
+        assert!(hz[0].contains("drift.md:3") && hz[0].contains("host-prove"), "hazard names file:line and the omission: {hz:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // plan/0037: migrate-receipts moves the applied-set into .host-receipts and splits the
     // operational receipts into .host-lifecycle-receipts, the dual-format reads still see
     // everything, and a second run is a no-op.
@@ -6822,6 +7118,7 @@ mod book_tests {
         let mk = |rev: &str, indep: bool, deps: &[&str]| Upgrade {
             revision: rev.into(), title: String::new(), action: String::new(), requires: String::new(),
             independent: indep, depends: deps.iter().map(|s| s.to_string()).collect(), verify: String::new(),
+            restates: Vec::new(),
         };
         // clean: A independent, B depends on A
         assert!(validate_ledger(&[mk("A", true, &[]), mk("B", false, &["A"])]).is_empty());
