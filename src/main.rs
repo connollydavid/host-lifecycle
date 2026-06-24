@@ -13,7 +13,7 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use host_grammar::{format_number, is_valid_name};
-use host_lint::{is_ci_file, is_scannable, path_ignored, scan_text_with_allow, Match, Severity};
+use host_lint::{is_ci_file, is_scannable, path_ignored, scan_prose_text, scan_text_with_allow, Match, Severity};
 
 /// The canonical template a project adopts from; recorded in the stamp.
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/host-template";
@@ -57,8 +57,9 @@ fn main() {
         Some("manifest") => manifest(&args[2..]),
         Some("receipt") => receipt(&args[2..]),
         Some("release") => release(&args[2..]),
+        Some("prose") => prose(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -71,6 +72,7 @@ fn main() {
             eprintln!("  software --verify-build <dir> — rebuild from the pin and prove the artifact reproduces");
             eprintln!("  software --install-hooks <dir>— install each component's commit hooks + verified binary");
             eprintln!("  software --teardown [--item <n>] <dir> — remove a component's worktrees + store (guards unsaved work; --force overrides)");
+            eprintln!("  prose <dir>                   — audit authored markdown for prose tropes in-process (host-lint --docs; the verify recheck)");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
             eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
@@ -1120,6 +1122,100 @@ fn filter_item(recipe: Vec<Software>, spec: &str) -> Vec<Software> {
 /// it skips what already exists. `--check` verifies each canonical worktree is at
 /// its recorded pin: the audit that replaces a submodule gitlink's `git submodule
 /// status`.
+/// `.host-lintignore` patterns (gitignore-lite: one per line, `#`/blank skipped) — the
+/// same exclusion file host-lint's `--docs`/`--all` walk honors (e.g. the append-only
+/// `MEMORY.md`).
+fn load_lintignore(root: &Path) -> Vec<String> {
+    match fs::read_to_string(root.join(".host-lintignore")) {
+        Ok(c) => c
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The prose-hygiene audit (plan/0030 D4): mirror host-lint's `--docs` walk in-process via
+/// the linked `host_lint` engine. Walk tracked markdown (`git ls-files`, honoring
+/// `.host-lintignore`, skipping symlinks and non-markdown) and scan each with the shared
+/// `scan_prose_text`, so the result is byte-identical to `host-lint --docs` without needing
+/// host-lint on PATH (this host's host-lint is embedded Where software). Returns the
+/// accumulated matches, or an error if the repo cannot be walked.
+fn prose_audit(root: &Path) -> Result<Vec<Match>, String> {
+    let ignore = load_lintignore(root);
+    let out = process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|e| format!("git ls-files: {e}"))?;
+    if !out.status.success() {
+        return Err("git ls-files failed (prose needs a git repository)".to_string());
+    }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let mut matches: Vec<Match> = Vec::new();
+    for rel in listing.split('\0').filter(|s| !s.is_empty()) {
+        if !rel.to_ascii_lowercase().ends_with(".md") {
+            continue;
+        }
+        if path_ignored(rel, &ignore) {
+            continue;
+        }
+        let path = root.join(rel);
+        if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        if let Ok(content) = fs::read_to_string(&path) {
+            scan_prose_text(&content, rel, &mut matches);
+        }
+    }
+    Ok(matches)
+}
+
+/// `prose <dir>`: the repo-wide prose-hygiene recheck (plan/0030 D4), the portable form of
+/// `host-lint --docs`. It exits with host-lint's own verdict — a `Flag` exits 1, a `Warn`
+/// exits 3, else 0 — so chaining it after `validate` in the `verify` phase `recheck =`
+/// re-opens the verify receipt as a HAZARD when a doc regresses to prose slop (the spine's
+/// standing prose rule, now enforced by the gate). Advisory `Note`-tier diagnoses do not
+/// block, exactly as the `--docs` clean-to-zero bar terminates.
+fn prose(args: &[String]) {
+    let dir = args.iter().find(|a| !a.starts_with("--")).map(String::as_str).unwrap_or(".");
+    let root = match fs::canonicalize(Path::new(dir)) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("host-lifecycle: not a directory: {dir}");
+            process::exit(2);
+        }
+    };
+    let matches = match prose_audit(&root) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("host-lifecycle: prose: {e}");
+            process::exit(2);
+        }
+    };
+    let flags = matches.iter().filter(|m| m.severity == Severity::Flag).count();
+    let warns = matches.iter().filter(|m| m.severity == Severity::Warn).count();
+    if flags + warns == 0 {
+        println!("prose: clean (authored markdown carries no flagging or warning tropes)");
+        return;
+    }
+    for m in &matches {
+        match m.severity {
+            Severity::Flag => println!("{}:{}: {} ({})", m.file, m.line, m.text, m.term),
+            Severity::Warn => println!("{}:{}: warning: {} ({})", m.file, m.line, m.text, m.term),
+            Severity::Note => {}
+        }
+    }
+    eprintln!("host-lifecycle: prose regression — {flags} flag(s), {warns} warn(s) in authored docs");
+    process::exit(if flags > 0 { 1 } else { 3 });
+}
+
 fn software(args: &[String]) {
     let mut mode: Option<&str> = None;
     let mut pos: Vec<&String> = Vec::new();
@@ -4795,7 +4891,7 @@ fn release(args: &[String]) {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--next" => { preview = true; i += 1; }
+            "--next" | "--preview" => { preview = true; i += 1; }
             "--change-class" => { change_class = args.get(i + 1).cloned(); i += 2; }
             s if s.starts_with("--") => { i += 1; }
             s if component.is_none() => { component = Some(s.to_string()); i += 1; }
@@ -6235,6 +6331,38 @@ mod software_tests {
         );
         // distinct branches: no collision
         assert!(branch_collision_problems(&mk(vec!["dev".to_string(), "release/2.0".to_string()])).is_empty());
+    }
+
+    // plan/0030 D4: the in-process prose audit mirrors host-lint --docs via the shared
+    // scan_prose_text engine — a clean doc yields no warn/flag, and a decoration trope (an
+    // em dash) yields a Warn the verify recheck treats as a regression.
+    #[test]
+    fn prose_audit_flags_a_trope_and_clears_clean_docs() {
+        let base = std::env::temp_dir().join(format!("hl-prose-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let g = |args: &[&str]| assert!(git_ok(&base, args), "git {args:?} failed");
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        fs::write(base.join("clean.md"), "# Title\n\nThis document is plain authored prose.\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "clean"]);
+        let clean = prose_audit(&base).unwrap();
+        assert!(
+            !clean.iter().any(|m| m.severity == Severity::Warn || m.severity == Severity::Flag),
+            "a clean doc yields no warn/flag prose tropes"
+        );
+        // A decoration trope (an em dash used as a dramatic pause).
+        fs::write(base.join("bad.md"), "# Title\n\nWe shipped the feature \u{2014} and it works.\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "bad"]);
+        let dirty = prose_audit(&base).unwrap();
+        assert!(
+            dirty.iter().any(|m| m.severity == Severity::Warn || m.severity == Severity::Flag),
+            "a decoration trope is detected as warn/flag"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
