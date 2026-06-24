@@ -36,6 +36,15 @@ spine changes **and** the structural migrations the span introduced.
    upgrade in `call/` and `MEMORY.md`.
 6. Run the `verify` sweep (`software --check` re-checks every recorded claim).
 
+## Reflect
+
+A spine move can stale the project's own restatement of methodology — the reconcile
+arm of the living-grammar doctrine. When a ledger entry you applied carries a
+`restates =` field (it names the reconcile kinds the move stales), run
+`host-lifecycle reconcile <dir>` and re-read those restatements: reword a drifted one
+to match the spine, box a frozen citation, or forward-correct an immutable record. A
+reconcile fix stays local and never propagates upstream (unlike a gathered tell).
+
 ## Judgment
 
 A doc diff shows the prose but not the actions — the ledger is the source of truth

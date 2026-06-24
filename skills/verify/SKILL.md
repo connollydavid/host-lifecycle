@@ -23,13 +23,23 @@ the whole sweep is green, not one check.
 
 ## Reflect
 
-After the gates pass, run `host-lint gather` and reflect on the candidate
-tell-shapes it surfaces: a recurring word-then-numeral shape the lane does not yet
-catch, the residue the grammar misses. Triage each with the operator: propose it
-upstream to the shared grammar, declare it in the `LEXICON`, or leave it. The pass
-is advisory, so it informs the operator and does not block the gate. An agent
-seldom perceives its own register as a tell, so this reflection is prompted here
-rather than left to chance.
+An agent perceives neither the register it emits nor the restatements its own change
+stales, so both are re-examined on purpose — the two arms of the living-grammar
+doctrine, prompted here rather than left to chance.
+
+- **gather** (advisory): run `host-lint gather` and triage the candidate tell-shapes it
+  surfaces — a recurring word-then-numeral shape the lane does not yet catch, the
+  residue the grammar misses. Propose a confirmed tell upstream to the shared grammar,
+  declare it in the `LEXICON`, or leave it. The pass informs the operator; it does not
+  block the gate.
+- **reconcile** (binding here): run `host-lifecycle reconcile <dir>` to re-check each
+  `host-reconcile`-annotated restatement of methodology against the spine truth. On a
+  development host that authors its own spine changes, the verify gate is the binding
+  trigger — `software --check` runs reconcile in its recheck, so a drifted restatement
+  is a HAZARD, not advisory. Reword a live restatement to match the spine; box a frozen
+  citation; forward-correct an immutable record (a `call/` body, a `Status: done` doc,
+  `MEMORY.md`). A reconcile fix stays local and never propagates; a gathered tell
+  graduates upstream.
 
 ## Judgment
 

@@ -23,10 +23,18 @@ template revision.
 
 ## Reflect
 
-A migration puts the project's whole prior history in view, the richest sweep for
-emergent tells. Run `host-lint gather` and triage each candidate tell-shape with
-the operator: propose it upstream to the shared grammar, declare it in the
-`LEXICON`, or leave it. The lane's own grammar grows from what adoption surfaces.
+A migration puts the whole project in view — both arms of the living-grammar doctrine
+fire here.
+
+- **gather**: a migration is the richest sweep for emergent tells. Run `host-lint
+  gather` and triage each candidate tell-shape with the operator: propose it upstream
+  to the shared grammar, declare it in the `LEXICON`, or leave it. The lane's grammar
+  grows from what adoption surfaces.
+- **reconcile**: adoption runs the full reconcile once — `host-lifecycle reconcile
+  <dir>` re-checks every `host-reconcile`-annotated restatement of methodology against
+  the freshly adopted spine. Reword a drifted restatement to match the spine; box a
+  frozen citation; forward-correct an immutable record. Prefer pointing at the spine
+  over restating it — a restatement is a reconciliation liability you choose to carry.
 
 ## Judgment
 
