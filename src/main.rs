@@ -1910,8 +1910,16 @@ fn plan_anchor_tokens(line: &str) -> Vec<String> {
 fn task_reference_problems(docs: &[(String, String)], keys: &std::collections::HashSet<String>) -> Vec<String> {
     let mut problems = Vec::new();
     for (rel, content) in docs {
+        let mut in_fence = false;
         for (n, line) in content.lines().enumerate() {
-            if line.trim_start().starts_with("- depends:") {
+            let trimmed = line.trim_start();
+            // A fenced code block holds illustrative references (the grammar examples, a ledger
+            // stanza), not live ones; toggle on its fence and skip its body.
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence || trimmed.starts_with("- depends:") {
                 continue;
             }
             for tok in plan_anchor_tokens(line) {
@@ -2093,18 +2101,50 @@ fn task_verdict(root: &Path, t: &Task, r: &TaskReceipt) -> (bool, String) {
 /// The per-task gate: every declared task needs a receipt the verdict accepts, and a receipt
 /// whose anchor no longer names a task is an orphan (a renamed or removed task left a stale
 /// receipt, the reverse-drift check). One `GateLine` each.
-fn task_gate(root: &Path, tasks: &[Task], receipts: &[TaskReceipt]) -> Vec<GateLine> {
+/// Whether a milestone is marked complete, read from its README `## Status` section: the
+/// first non-empty line begins with a completion word (the repo's Status convention, for
+/// example "complete, landed …" or "done (…)"). An open milestone's tasks may be pending; a
+/// complete one owes a done or skip receipt per task.
+fn milestone_complete(content: &str) -> bool {
+    let mut in_status = false;
+    for line in content.lines() {
+        if heading_level(line) == 2 {
+            in_status = line.trim_start().trim_start_matches('#').trim().eq_ignore_ascii_case("Status");
+            continue;
+        }
+        if in_status {
+            let t = line.trim_start_matches(['*', ' ', '\t']).to_ascii_lowercase();
+            if t.is_empty() {
+                continue;
+            }
+            return t.starts_with("complete") || t.starts_with("done") || t.starts_with("landed");
+        }
+    }
+    false
+}
+
+fn task_gate(root: &Path, tasks: &[Task], receipts: &[TaskReceipt], complete_plans: &std::collections::HashSet<String>) -> Vec<GateLine> {
     let mut out = Vec::new();
     let task_keys: std::collections::HashSet<&str> = tasks.iter().map(|t| t.key.as_str()).collect();
     for t in tasks {
         let label = format!("task {}", t.key);
+        let plan = t.key.split('#').next().unwrap_or("");
         let line = match latest_task_receipt(receipts, &t.key) {
-            None => GateLine {
+            // No receipt: a task in a milestone marked complete owes one; in an open milestone
+            // it is simply pending future work, so it does not gate.
+            None if complete_plans.contains(plan) => GateLine {
                 label,
                 ok: false,
-                note: "no receipt".into(),
+                note: "no receipt (its milestone is marked complete)".into(),
                 recheck: None,
-                remedy: Some(format!("host-lifecycle task --record {} --disposition done --evidence <...>", t.key)),
+                remedy: Some(format!("host-lifecycle tasks --record {} --disposition done --evidence <...>", t.key)),
+            },
+            None => GateLine {
+                label,
+                ok: true,
+                note: "pending (no receipt; milestone open)".into(),
+                recheck: None,
+                remedy: None,
             },
             Some(r) => {
                 let (ok, note) = task_verdict(root, t, r);
@@ -2155,7 +2195,11 @@ fn task_check_problems(root: &Path) -> usize {
     if tasks.is_empty() && receipts.is_empty() {
         return bad;
     }
-    for line in task_gate(root, &tasks, &receipts) {
+    let complete_plans: std::collections::HashSet<String> = docs
+        .iter()
+        .filter_map(|(rel, content)| plan_id_of(rel).filter(|_| milestone_complete(content)))
+        .collect();
+    for line in task_gate(root, &tasks, &receipts, &complete_plans) {
         if line.ok {
             println!("ok       {} — {}", line.label, line.note);
         } else {
@@ -2495,17 +2539,32 @@ mod task_gate_tests {
         assert!(!task_verdict(&base, a, &tr("plan/0042#a", "skip", None, None, None, Some("call/9999"))).0);
         assert!(!task_verdict(&base, a, &tr("plan/0042#a", "skip", None, None, None, None)).0);
 
-        // gate: only a is receipted → b is "no receipt"; a stray receipt → orphan
+        // gate: only a is receipted. With plan/0042 OPEN, b is pending-ok; when complete it owes one.
         let receipts = vec![
             tr("plan/0042#a", "done", Some("attested call/0024"), None, None, None),
             tr("plan/0099#gone", "done", Some("attested operator"), None, None, None),
         ];
-        let lines = task_gate(&base, &tasks, &receipts);
-        assert!(lines.iter().any(|l| l.label == "task plan/0042#b" && !l.ok && l.note == "no receipt"));
+        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let lines = task_gate(&base, &tasks, &receipts, &none);
+        assert!(lines.iter().any(|l| l.label == "task plan/0042#b" && l.ok && l.note.contains("pending")), "b pending while open");
+        let complete: std::collections::HashSet<String> = ["plan/0042".to_string()].into_iter().collect();
+        let lines = task_gate(&base, &tasks, &receipts, &complete);
+        assert!(lines.iter().any(|l| l.label == "task plan/0042#b" && !l.ok && l.note.contains("no receipt")), "b owes a receipt when complete");
         assert!(lines.iter().any(|l| l.label == "task plan/0042#a" && l.ok));
+        // an orphan receipt is always a hazard, regardless of completion
         assert!(lines.iter().any(|l| l.label == "task plan/0099#gone" && !l.ok && l.note.contains("orphan")));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn milestone_complete_reads_the_status_section() {
+        assert!(milestone_complete("## Status\n\ncomplete, landed 2026-06-24\n"));
+        assert!(milestone_complete("## Status\n\n**DONE** (shipped)\n"));
+        assert!(milestone_complete("# t\n## Status\nlanded\n"));
+        assert!(!milestone_complete("## Status\n\nOpen, design phase.\n"));
+        assert!(!milestone_complete("## Build sequence\n\ncomplete\n")); // not the Status section
+        assert!(!milestone_complete("no status section here"));
     }
 }
 
@@ -2626,6 +2685,15 @@ mod task_tests {
         let probs = task_reference_problems(&docs, &keys);
         assert_eq!(probs.len(), 1, "{probs:?}");
         assert!(probs[0].contains("plan/0090#ghost"));
+
+        // a reference inside a fenced code block is illustrative, not flagged
+        let fenced = vec![doc(
+            "plan/0091-x/README.md",
+            "## Build sequence\n\n### A {#a}\n- verify: a\n\n## Notes\n\n```\nexample: plan/0091#made-up\n```\n",
+        )];
+        let (tasks, _) = parse_tasks(&fenced);
+        let keys: std::collections::HashSet<String> = tasks.iter().map(|t| t.key.clone()).collect();
+        assert!(task_reference_problems(&fenced, &keys).is_empty(), "fenced example must not flag");
     }
 }
 
