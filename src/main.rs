@@ -63,10 +63,11 @@ fn main() {
         Some("release") => release(&args[2..]),
         Some("prose") => prose(&args[2..]),
         Some("reconcile") => reconcile(&args[2..]),
+        Some("front-door") => front_door(&args[2..]),
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|migrate-receipts|tasks> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|front-door|migrate-receipts|tasks> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -81,6 +82,7 @@ fn main() {
             eprintln!("  software --teardown [--item <n>] <dir> — remove a component's worktrees + store (guards unsaved work; --force overrides)");
             eprintln!("  prose <dir>                   — audit authored markdown for prose tropes in-process (host-lint --docs; the verify recheck)");
             eprintln!("  reconcile <dir>               — re-check each `host-reconcile`-annotated restatement against the spine truth (the reflective-practice reconcile arm)");
+            eprintln!("  front-door [--check] <dir>    — hold the single-file front door to the spine: cover the phases + wired tools, generate the .host stamp block (plan/0040)");
             eprintln!("  migrate-receipts <dir>        — re-home the receipts family: applied-set to .host-receipts, operational receipts to .host-lifecycle-receipts (plan/0037)");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
@@ -1312,6 +1314,9 @@ const RECONCILE_MARK: &str = "<!-- host-reconcile:";
 struct ProjectFacts {
     components: Vec<String>,
     drivers: Vec<String>,
+    /// The `[software "<name>"]` member marked `front-door = true`, if any (the
+    /// single-file front door, the target of the `front-door` check, plan/0040).
+    front_door: Option<String>,
 }
 
 /// Parse `.host-software` for a project's concept facts. `components` = every
@@ -1350,8 +1355,9 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
             _ => {}
         }
     }
+    let front_door = members.iter().find(|(_, fd)| *fd).map(|(n, _)| n.clone());
     let components = members.into_iter().filter(|(_, fd)| !fd).map(|(n, _)| n).collect();
-    ProjectFacts { components, drivers }
+    ProjectFacts { components, drivers, front_door }
 }
 
 /// The kind named in a line's `<!-- host-reconcile: KIND -->` annotation, if any.
@@ -1657,7 +1663,7 @@ fn reconcile(args: &[String]) {
     };
     let facts = match fs::read_to_string(root.join(SOFTWARE)) {
         Ok(text) => parse_project_facts(&text),
-        Err(_) => ProjectFacts { components: Vec::new(), drivers: Vec::new() },
+        Err(_) => ProjectFacts { components: Vec::new(), drivers: Vec::new(), front_door: None },
     };
     let docs = match tracked_markdown(&root) {
         Ok(d) => d,
@@ -1683,6 +1689,196 @@ fn reconcile(args: &[String]) {
     }
     eprintln!("host-lifecycle: reconcile — {} concept drift(s)", hazards.len());
     process::exit(1);
+}
+
+// --- plan/0040: the front-door check ---
+//
+// The single-file front door (the `.host-software` member marked `front-door = true`) is a
+// published README in its own repo, outside any host's verify gate, so its restatements of
+// the spine stale silently (plan/0040). It must stay self-contained, so it cannot point at
+// the spine with a link the way an in-host doc does (the reconcile arm); it restates. This
+// holds the restatement to the spine's structured facts: coverage of the lifecycle phases
+// (the manifest) and the wired tools (the `.host-software` verifier drivers plus the
+// lifecycle engine), and byte-exact generation of the `.host` stamp block. The version pins,
+// the lanes rule, and the tool prose have no structured home and stay authored (the design
+// review settled this; a structured pin home is a named follow-up).
+
+/// The canonical `.host` stamp block the front door shows, with placeholder values — the
+/// same format `adopt` writes (`stamp_body`), so the front door cannot restate it wrong.
+fn front_door_stamp() -> String {
+    stamp_body("<sha-or-tag>", "YYYY-MM-DD")
+}
+
+/// The body of the first fenced code block after the `## The stamp` heading (the `.host`
+/// stamp block the front door shows), or None when the heading or a following fence is
+/// absent (a new `## ` section before a fence ends the search).
+fn front_door_stamp_block(content: &str) -> Option<String> {
+    let mut lines = content.lines();
+    for line in lines.by_ref() {
+        if line.trim_start().starts_with("## The stamp") {
+            break;
+        }
+    }
+    let mut in_block = false;
+    let mut block = String::new();
+    for line in lines {
+        let t = line.trim_start();
+        if !in_block {
+            if t.starts_with("```") {
+                in_block = true;
+            } else if t.starts_with("## ") {
+                return None;
+            }
+            continue;
+        }
+        if t.starts_with("```") {
+            return Some(block);
+        }
+        block.push_str(line);
+        block.push('\n');
+    }
+    None
+}
+
+/// The front-door coverage and stamp problems: a lifecycle phase or a wired tool the README
+/// does not name, and a `.host` stamp block that drifted from the canonical format. A phase
+/// is checked as a backtick token (`` `release` ``), since a bare word like "release" recurs
+/// in prose ("GitHub releases"); a tool name is distinctive, so a plain mention suffices.
+fn front_door_problems(content: &str, phases: &[String], tools: &[String]) -> Vec<String> {
+    let low = content.to_ascii_lowercase();
+    let mut problems = Vec::new();
+    for p in phases {
+        if !content.contains(&format!("`{p}`")) {
+            problems.push(format!("the front door omits the `{p}` lifecycle phase (the manifest declares it)"));
+        }
+    }
+    for t in tools {
+        if !low.contains(&t.to_ascii_lowercase()) {
+            problems.push(format!("the front door omits the wired tool `{t}` (declared in {SOFTWARE})"));
+        }
+    }
+    match front_door_stamp_block(content) {
+        None => problems.push("the front door has no `.host` stamp code block under `## The stamp`".into()),
+        Some(block) if block.trim() != front_door_stamp().trim() => {
+            problems.push("the `.host` stamp block drifted from the canonical format; regenerate with `front-door`".into());
+        }
+        Some(_) => {}
+    }
+    problems
+}
+
+/// Rewrite the `.host` stamp block under `## The stamp` to the canonical format, returning
+/// the updated document, or None when the heading or its fence is absent.
+fn front_door_regenerate_stamp(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let h = lines.iter().position(|l| l.trim_start().starts_with("## The stamp"))?;
+    let open = (h + 1..lines.len()).find(|&i| lines[i].trim_start().starts_with("```"))?;
+    if (h + 1..open).any(|i| lines[i].trim_start().starts_with("## ")) {
+        return None;
+    }
+    let close = (open + 1..lines.len()).find(|&i| lines[i].trim_start().starts_with("```"))?;
+    let mut out: Vec<String> = lines[..=open].iter().map(|s| s.to_string()).collect();
+    out.extend(front_door_stamp().lines().map(str::to_string));
+    out.extend(lines[close..].iter().map(|s| s.to_string()));
+    let mut s = out.join("\n");
+    if content.ends_with('\n') {
+        s.push('\n');
+    }
+    Some(s)
+}
+
+/// The lifecycle phase names (the manifest) and the wired tool names (the `.host-software`
+/// verifier drivers plus the lifecycle engine `host-lifecycle`) the front door must name.
+fn front_door_spine_facts(root: &Path, facts: &ProjectFacts) -> Result<(Vec<String>, Vec<String>), String> {
+    let phases = match load_project_manifest(root) {
+        ManifestState::Live(ps) => ps.iter().map(|p| p.name.clone()).collect(),
+        _ => return Err(format!("the lifecycle manifest is unavailable (a {STAMP} stamp and host-template are needed)")),
+    };
+    let mut tools = facts.drivers.clone();
+    if !tools.iter().any(|t| t == "host-lifecycle") {
+        tools.push("host-lifecycle".to_string());
+    }
+    Ok((phases, tools))
+}
+
+/// Resolve the front door's README path and its content from `.host-software` (the member
+/// marked `front-door = true`, materialized at `software/<name>/<branch>/README.md`).
+fn front_door_readme(root: &Path, facts: &ProjectFacts) -> Result<(PathBuf, String), String> {
+    let name = facts.front_door.clone().ok_or_else(|| format!("no {SOFTWARE} member marked `front-door = true`"))?;
+    let branch = load_software(root).into_iter().find(|s| s.name == name).map(|s| s.branch).unwrap_or_else(|| "main".to_string());
+    let path = worktree_dir(root, &name, &branch).join("README.md");
+    let content = fs::read_to_string(&path).map_err(|e| format!("cannot read the front door {}: {e} (materialize the `{name}` worktree)", path.display()))?;
+    Ok((path, content))
+}
+
+/// `front-door [--check] [<dir>]`: hold the single-file front door to the spine's structured
+/// facts (plan/0040). Without `--check`, regenerate the `.host` stamp block in place and
+/// report any coverage gap; with `--check`, exit non-zero on any gap or stamp drift.
+fn front_door(args: &[String]) {
+    let mut check = false;
+    let mut dir = String::from(".");
+    for a in args {
+        match a.as_str() {
+            "--check" => check = true,
+            s if s.starts_with("--") => {}
+            s => dir = s.to_string(),
+        }
+    }
+    let root = Path::new(&dir);
+    let facts = match fs::read_to_string(root.join(SOFTWARE)) {
+        Ok(t) => parse_project_facts(&t),
+        Err(e) => {
+            eprintln!("host-lifecycle: front-door needs {SOFTWARE}: {e}");
+            process::exit(2);
+        }
+    };
+    let (readme, content) = match front_door_readme(root, &facts) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("host-lifecycle: {e}");
+            process::exit(2);
+        }
+    };
+    let (phases, tools) = match front_door_spine_facts(root, &facts) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("host-lifecycle: front-door: {e}");
+            process::exit(2);
+        }
+    };
+
+    if check {
+        let problems = front_door_problems(&content, &phases, &tools);
+        if problems.is_empty() {
+            println!("front-door: clean (every phase and wired tool is named; the stamp block matches the canonical format)");
+            return;
+        }
+        for p in &problems {
+            println!("HAZARD   {p}");
+        }
+        eprintln!("host-lifecycle: front-door — {} drift(s) in {}", problems.len(), readme.display());
+        process::exit(1);
+    }
+
+    // Write mode: regenerate the one generated block (the stamp); a coverage gap is prose the
+    // author fills, so report it rather than rewrite.
+    match front_door_regenerate_stamp(&content) {
+        Some(updated) if updated != content => {
+            if let Err(e) = fs::write(&readme, updated) {
+                eprintln!("host-lifecycle: cannot write {}: {e}", readme.display());
+                process::exit(2);
+            }
+            println!("front-door: regenerated the `.host` stamp block in {}", readme.display());
+        }
+        Some(_) => println!("front-door: the `.host` stamp block is already canonical"),
+        None => {
+            eprintln!("host-lifecycle: no `.host` stamp code block under `## The stamp` in {}", readme.display());
+            process::exit(2);
+        }
+    }
+    for g in front_door_problems(&content, &phases, &tools).into_iter().filter(|p| !p.contains("stamp")) {
+        println!("note: {g}");
+    }
 }
 
 // --- plan/0042: the receipted task graph ---
@@ -7097,6 +7293,30 @@ mod tests {
     }
 
     #[test]
+    fn front_door_covers_phases_tools_and_stamp() {
+        let phases = vec!["classify".to_string(), "release".to_string()];
+        let tools = vec!["host-lint".to_string(), "host-lifecycle".to_string()];
+        let stamp = front_door_stamp();
+        // Names both phases (as backtick tokens), both tools, and a canonical stamp: clean.
+        let good = format!("# Front door\n\nRun `classify` then `release`. Wire host-lint and host-lifecycle.\n\n## The stamp: `.host`\n\n```\n{stamp}```\n\n## Next\n");
+        assert!(front_door_problems(&good, &phases, &tools).is_empty(), "{:?}", front_door_problems(&good, &phases, &tools));
+        // Omitting the `release` phase token flags, even though the bare word recurs in prose.
+        let drift = format!("# Front door\n\nRun `classify`. See the GitHub releases. Wire host-lint and host-lifecycle.\n\n## The stamp: `.host`\n\n```\n{stamp}```\n");
+        let probs = front_door_problems(&drift, &phases, &tools);
+        assert_eq!(probs.len(), 1, "{probs:?}");
+        assert!(probs[0].contains("release"));
+        // Omitting a wired tool flags.
+        let notool = format!("# Front door\n\n`classify` `release`. Wire host-lifecycle.\n\n## The stamp: `.host`\n\n```\n{stamp}```\n");
+        assert!(front_door_problems(&notool, &phases, &tools).iter().any(|p| p.contains("host-lint")));
+        // A drifted stamp flags, and regenerate restores the canonical block.
+        let badstamp = "# F\n\n`classify` `release` host-lint host-lifecycle.\n\n## The stamp: `.host`\n\n```\nrevision = \"x\"\n```\n";
+        assert!(front_door_problems(badstamp, &phases, &tools).iter().any(|p| p.contains("stamp")));
+        let fixed = front_door_regenerate_stamp(badstamp).unwrap();
+        assert_eq!(front_door_stamp_block(&fixed).unwrap().trim(), stamp.trim());
+        assert!(front_door_problems(&fixed, &phases, &tools).is_empty(), "{:?}", front_door_problems(&fixed, &phases, &tools));
+    }
+
+    #[test]
     fn parse_revision_handles_missing_and_blank() {
         assert_eq!(parse_revision("template = \"x\"\n"), None);
         assert_eq!(parse_revision("revision = \"\"\n"), None);
@@ -8185,6 +8405,7 @@ mod software_tests {
         let facts = ProjectFacts {
             components: vec!["host-lint".into(), "host-lifecycle".into(), "host-prove".into(), "host-grammar".into()],
             drivers: vec!["host-lint".into(), "allium".into(), "specula".into(), "host-prove".into()],
+            front_door: None,
         };
         // components: a line that omits host-prove flags; the full set clears.
         assert!(reconcile_assertion("components", "the host-* components (host-grammar, host-lint, host-lifecycle)", &facts).is_some());
@@ -8201,7 +8422,7 @@ mod software_tests {
         // an unknown kind is itself a HAZARD (guards an annotation typo).
         assert!(reconcile_assertion("bogus", "anything", &facts).is_some());
         // empty datum (pre-data template): components/verification unverifiable, skipped.
-        let bare = ProjectFacts { components: vec![], drivers: vec![] };
+        let bare = ProjectFacts { components: vec![], drivers: vec![], front_door: None };
         assert!(reconcile_assertion("components", "host-lint only", &bare).is_none());
     }
 
@@ -8228,6 +8449,7 @@ mod software_tests {
         let facts = ProjectFacts {
             components: vec!["host-lint".into(), "host-lifecycle".into(), "host-prove".into(), "host-grammar".into()],
             drivers: vec!["host-lint".into(), "allium".into(), "specula".into(), "host-prove".into()],
+            front_door: None,
         };
         // a clean annotated restatement: no hazard
         fs::write(base.join("ok.md"), "Develops host-lint, host-lifecycle, host-prove, host-grammar. <!-- host-reconcile: components -->\n").unwrap();
@@ -8259,6 +8481,7 @@ mod software_tests {
         let facts = ProjectFacts {
             components: vec!["host-lint".into(), "host-lifecycle".into(), "host-prove".into(), "host-grammar".into()],
             drivers: vec!["host-lint".into(), "allium".into(), "specula".into(), "host-prove".into()],
+            front_door: None,
         };
         let structure = |components_line: &str| {
             format!("## Components {{#components}}\n{components_line}\n\n## Verifiers {{#verifiers}}\nhost-lint, allium, specula, host-prove.\n")
