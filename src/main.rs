@@ -45,6 +45,12 @@ const TOOL_SUBMODULES: [(&str, &str); 4] = [
     ("specula", "https://github.com/specula-org/Specula"),
 ];
 
+// Exit-code convention: 0 is clean or success; 1 is the red outcome a command exists to
+// surface (a drift, a HAZARD, a failed gate); 2 is a command that cannot proceed on the input
+// it was given (a usage error, or a missing, unreadable, or malformed input the user named: a
+// directory, a file, the `.host-software`, the manifest). `next` returns 2 on a directory with
+// no numbered entries (plan/0041), the same cannot-proceed class. The split (issues-found
+// versus cannot-proceed) was validated with Qwen-3.5-4B in plan/0043 gather-data.
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -1303,64 +1309,176 @@ const RECONCILE_KINDS: [&str; 4] = ["components", "verification", "where-root", 
 /// The inline annotation marker; the kind follows up to the closing `-->`.
 const RECONCILE_MARK: &str = "<!-- host-reconcile:";
 
-/// A project's own concept facts (plan/0039), read from its `.host-software` — never
-/// the spine. `components` are the project's `[software "<name>"]` members minus the
-/// entrance (the member marked `entrance = true`, the methodology's single-file
-/// entry point, set apart from the host-* tools); `drivers` are the verifiers, the
-/// `[verification] drivers = ...` list. Empty when `.host-software` is absent or carries
-/// no such data — then the matching assertions are unverifiable and skipped, never a
-/// false HAZARD. Project-local by design: the spine manifest is phases only
-/// (`manifest --check`), so no adopter inherits another project's facts.
+/// The concepts an entrance can be held complete against, each with a structured home the
+/// tool reads: `phases` (the manifest), `tools` (the `.host-software` drivers plus the
+/// lifecycle engine), and `stamp` (the `.host` stamp format). A closed vocabulary, so an
+/// unknown concept in a `restates` value is a loud parse error rather than a silent skip
+/// (plan/0043). `tools` corresponds to reconcile's verifiers.
+const ENTRANCE_CONCEPTS: [&str; 3] = ["phases", "tools", "stamp"];
+
+/// Which concepts an entrance keeps complete. `All` is the `restates = true` sentinel (the
+/// front-door case, every concept), so a full front door never types an enumeration; `Set`
+/// is a validated subset of `ENTRANCE_CONCEPTS`.
+#[derive(Clone)]
+enum Restates {
+    All,
+    Set(Vec<String>),
+}
+
+impl Restates {
+    /// Whether the entrance is held complete against `concept`.
+    fn checks(&self, concept: &str) -> bool {
+        match self {
+            Restates::All => true,
+            Restates::Set(s) => s.iter().any(|c| c == concept),
+        }
+    }
+}
+
+/// The single-file entrance (plan/0043): the one document held to the spine, declared in a
+/// global-singleton `[entrance]` stanza. `member` is the `.host-software` member it belongs
+/// to (set apart from `components`); `document` is the file within that member's worktree
+/// (default `README.md`, so a `SKILL.md` or a landing page is reached by path); `restates`
+/// is the concept set it keeps complete.
+#[derive(Clone)]
+struct Entrance {
+    member: String,
+    document: String,
+    restates: Restates,
+}
+
+/// A project's own concept facts (plan/0039), read from its `.host-software`, never the
+/// spine. `components` are the project's `[software "<name>"]` members minus the entrance
+/// member (set apart from the host-* tools); `drivers` are the verifiers, the
+/// `[verification] drivers = ...` list; `entrance` is the declared `[entrance]` stanza, if
+/// any; `problems` are the entrance-stanza parse errors (a second stanza, an unknown concept,
+/// a member that is not declared). Empty when `.host-software` is absent or carries no such
+/// data, so the matching assertions are unverifiable and skipped, never a false HAZARD.
+/// Project-local by design: the spine manifest is phases only (`manifest --check`), so no
+/// adopter inherits another project's facts.
+#[derive(Default)]
 struct ProjectFacts {
     components: Vec<String>,
     drivers: Vec<String>,
-    /// The `[software "<name>"]` member marked `entrance = true`, if any (the
-    /// single-file entrance, the target of the `entrance` check, plan/0040).
-    entrance: Option<String>,
+    entrance: Option<Entrance>,
+    problems: Vec<String>,
 }
 
 /// Parse `.host-software` for a project's concept facts. `components` = every
-/// `[software "<name>"]` member except one marked `entrance = true`; `drivers` =
-/// the `[verification] drivers = ...` list. Mirrors `parse_software`'s git-config
-/// style; unknown sections and keys are ignored (forward-compatible). A member that
-/// forgets the `entrance` marker is counted a component — fail-safe: coverage then
-/// over-reports (asks the docs to name it) rather than hiding it.
+/// `[software "<name>"]` member except the entrance member; `drivers` = the
+/// `[verification] drivers = ...` list; `entrance` = the `[entrance]` stanza, a global
+/// singleton naming `member`, an optional `document` (default `README.md`), and a `restates`
+/// concept set (default every concept). A legacy per-member `entrance = true` (or the
+/// deprecated `front-door = true`) is accepted as the front-door entrance, the migration
+/// shim. Mirrors `parse_software`'s git-config style; unknown sections and keys are ignored
+/// (forward-compatible). A member that forgets every marker is counted a component, the
+/// fail-safe: coverage then over-reports rather than hiding it. `problems` records a second
+/// stanza, an unknown concept, or a named member that is not declared (plan/0043).
 fn parse_project_facts(text: &str) -> ProjectFacts {
-    let split = |v: &str| v.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
-    let mut members: Vec<(String, bool)> = Vec::new(); // (name, is_entrance)
+    let split = |v: &str| -> Vec<String> { v.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect() };
+    let mut members: Vec<String> = Vec::new();
     let mut drivers: Vec<String> = Vec::new();
-    let mut section = ""; // "software" | "verification" | ""
+    let mut legacy_member: Option<String> = None;
+    let mut stanza_count = 0usize;
+    let (mut e_member, mut e_document, mut e_restates) = (None::<String>, None::<String>, None::<String>);
+    let mut section = ""; // "software" | "verification" | "entrance" | ""
+    let mut current_member = String::new();
+    let mut problems: Vec<String> = Vec::new();
     for line in text.lines() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
         if let Some(name) = t.strip_prefix("[software \"").and_then(|r| r.strip_suffix("\"]")) {
-            members.push((name.to_string(), false));
+            members.push(name.to_string());
+            current_member = name.to_string();
             section = "software";
             continue;
         }
         if t.starts_with('[') {
-            section = if t == "[verification]" { "verification" } else { "" };
+            section = if t == "[entrance]" {
+                stanza_count += 1;
+                "entrance"
+            } else if t.strip_prefix("[entrance").is_some_and(|r| r.starts_with(' ') || r.starts_with('"')) {
+                // a sub-named `[entrance "x"]` is the wrong form (the stanza is anonymous);
+                // parse it anyway so its keys are read, but flag it loudly.
+                stanza_count += 1;
+                problems.push(format!("the entrance stanza is `[entrance]`, not a sub-named section like `{t}`"));
+                "entrance"
+            } else if t == "[verification]" {
+                "verification"
+            } else {
+                ""
+            };
             continue;
         }
         let Some((key, val)) = t.split_once('=') else { continue };
-        match (section, key.trim()) {
-            // the entrance marker; `front-door` is the deprecated spelling, accepted so a
-            // pre-rename .host-software is not silently demoted to a component. It is the
-            // migration shim, slated for removal; entrance() warns and names the rename.
-            ("software", "entrance" | "front-door") if val.trim() == "true" => {
-                if let Some(m) = members.last_mut() {
-                    m.1 = true;
+        let (key, val) = (key.trim(), val.trim());
+        match (section, key) {
+            // the legacy per-member marker (`front-door` is the older spelling), accepted as
+            // the front-door entrance so a pre-stanza .host-software still works; the shim,
+            // slated for removal. entrance() warns and names the stanza form. Case-insensitive
+            // so a `True` does not silently un-mark the member (a call/0027-class demotion).
+            ("software", "entrance" | "front-door") if val.eq_ignore_ascii_case("true") => legacy_member = Some(current_member.clone()),
+            ("verification", "drivers") => drivers = split(val),
+            ("entrance", "member") => {
+                if e_member.is_some() {
+                    problems.push("the `[entrance]` stanza names `member` more than once".into());
                 }
+                e_member = Some(val.to_string());
             }
-            ("verification", "drivers") => drivers = split(val.trim()),
+            ("entrance", "document") => e_document = Some(val.to_string()),
+            ("entrance", "restates") => e_restates = Some(val.to_string()),
             _ => {}
         }
     }
-    let entrance = members.iter().find(|(_, fd)| *fd).map(|(n, _)| n.clone());
-    let components = members.into_iter().filter(|(_, fd)| !fd).map(|(n, _)| n).collect();
-    ProjectFacts { components, drivers, entrance }
+
+    let entrance = if stanza_count > 0 {
+        if stanza_count > 1 {
+            problems.push(format!("more than one `[entrance]` stanza ({stanza_count}); the entrance is a global singleton"));
+        }
+        if legacy_member.is_some() {
+            problems.push("both an `[entrance]` stanza and a legacy per-member marker; remove the legacy marker".into());
+        }
+        let restates = match e_restates.as_deref() {
+            None => Restates::All,
+            Some(s) if s.eq_ignore_ascii_case("true") => Restates::All,
+            Some(list) => {
+                let tokens = split(list);
+                if tokens.is_empty() {
+                    problems.push("the `[entrance]` `restates` value is empty; use `true` for every concept or name at least one".into());
+                }
+                for tk in &tokens {
+                    if !ENTRANCE_CONCEPTS.contains(&tk.as_str()) {
+                        problems.push(format!("the `[entrance]` restates an unknown concept `{tk}` (known: {})", ENTRANCE_CONCEPTS.join(", ")));
+                    }
+                }
+                Restates::Set(tokens)
+            }
+        };
+        Some(Entrance {
+            member: e_member.unwrap_or_default(),
+            document: e_document.unwrap_or_else(|| "README.md".into()),
+            restates,
+        })
+    } else {
+        legacy_member.map(|member| Entrance { member, document: "README.md".into(), restates: Restates::All })
+    };
+
+    if let Some(e) = &entrance {
+        if e.member.is_empty() {
+            problems.push("the `[entrance]` stanza names no `member`".into());
+        } else if !members.iter().any(|m| m == &e.member) {
+            problems.push(format!("the `[entrance]` member `{}` is not a declared `[software]` member", e.member));
+        }
+        if Path::new(&e.document).is_absolute() || Path::new(&e.document).components().any(|c| c == std::path::Component::ParentDir) {
+            problems.push(format!("the `[entrance]` document `{}` must stay within the member's worktree (no `..` or absolute path)", e.document));
+        }
+    }
+
+    let entrance_member = entrance.as_ref().map(|e| e.member.clone());
+    let components = members.into_iter().filter(|m| entrance_member.as_deref() != Some(m.as_str())).collect();
+    ProjectFacts { components, drivers, entrance, problems }
 }
 
 /// The kind named in a line's `<!-- host-reconcile: KIND -->` annotation, if any.
@@ -1666,8 +1784,17 @@ fn reconcile(args: &[String]) {
     };
     let facts = match fs::read_to_string(root.join(SOFTWARE)) {
         Ok(text) => parse_project_facts(&text),
-        Err(_) => ProjectFacts { components: Vec::new(), drivers: Vec::new(), entrance: None },
+        Err(_) => ProjectFacts::default(),
     };
+    // A malformed `[entrance]` stanza corrupts the `components` set (a member wrongly kept in
+    // or dropped), so surface it here, not only in `entrance` — else reconcile would demand
+    // the front door be named a component, the call/0027 silent demotion (plan/0043 review).
+    if !facts.problems.is_empty() {
+        for p in &facts.problems {
+            eprintln!("host-lifecycle: reconcile: {p}");
+        }
+        process::exit(2);
+    }
     let docs = match tracked_markdown(&root) {
         Ok(d) => d,
         Err(e) => {
@@ -1743,29 +1870,36 @@ fn entrance_stamp_block(content: &str) -> Option<String> {
     None
 }
 
-/// The entrance coverage and stamp problems: a lifecycle phase or a wired tool the README
-/// does not name, and a `.host` stamp block that drifted from the canonical format. A phase
-/// is checked as a backtick token (`` `release` ``), since a bare word like "release" recurs
-/// in prose ("GitHub releases"); a tool name is distinctive, so a plain mention suffices.
-fn entrance_problems(content: &str, phases: &[String], tools: &[String]) -> Vec<String> {
+/// The entrance coverage and stamp problems, for the concepts the entrance declares it
+/// `restates`. A phase is checked as a backtick token (`` `release` ``), since a bare word
+/// like "release" recurs in prose ("GitHub releases"); a tool name is distinctive, so a plain
+/// mention suffices; the stamp block is checked against the canonical format. A concept the
+/// entrance does not restate is not checked (plan/0043).
+fn entrance_problems(content: &str, phases: &[String], tools: &[String], restates: &Restates) -> Vec<String> {
     let low = content.to_ascii_lowercase();
     let mut problems = Vec::new();
-    for p in phases {
-        if !content.contains(&format!("`{p}`")) {
-            problems.push(format!("the entrance omits the `{p}` lifecycle phase (the manifest declares it)"));
+    if restates.checks("phases") {
+        for p in phases {
+            if !content.contains(&format!("`{p}`")) {
+                problems.push(format!("the entrance omits the `{p}` lifecycle phase (the manifest declares it)"));
+            }
         }
     }
-    for t in tools {
-        if !low.contains(&t.to_ascii_lowercase()) {
-            problems.push(format!("the entrance omits the wired tool `{t}` (declared in {SOFTWARE})"));
+    if restates.checks("tools") {
+        for t in tools {
+            if !low.contains(&t.to_ascii_lowercase()) {
+                problems.push(format!("the entrance omits the wired tool `{t}` (declared in {SOFTWARE})"));
+            }
         }
     }
-    match entrance_stamp_block(content) {
-        None => problems.push("the entrance has no `.host` stamp code block under `## The stamp`".into()),
-        Some(block) if block.trim() != entrance_stamp().trim() => {
-            problems.push("the `.host` stamp block drifted from the canonical format; regenerate with `entrance`".into());
+    if restates.checks("stamp") {
+        match entrance_stamp_block(content) {
+            None => problems.push("the entrance has no `.host` stamp code block under `## The stamp`".into()),
+            Some(block) if block.trim() != entrance_stamp().trim() => {
+                problems.push("the `.host` stamp block drifted from the canonical format; regenerate with `entrance`".into());
+            }
+            Some(_) => {}
         }
-        Some(_) => {}
     }
     problems
 }
@@ -1804,13 +1938,14 @@ fn entrance_spine_facts(root: &Path, facts: &ProjectFacts) -> Result<(Vec<String
     Ok((phases, tools))
 }
 
-/// Resolve the entrance's README path and its content from `.host-software` (the member
-/// marked `entrance = true`, materialized at `software/<name>/<branch>/README.md`).
+/// Resolve the entrance document and its content from the `[entrance]` stanza: the member's
+/// worktree joined with `document` (default `README.md`), so a `SKILL.md` or a landing page
+/// is reached by path (plan/0043).
 fn entrance_readme(root: &Path, facts: &ProjectFacts) -> Result<(PathBuf, String), String> {
-    let name = facts.entrance.clone().ok_or_else(|| format!("no {SOFTWARE} member marked `entrance = true`"))?;
-    let branch = load_software(root).into_iter().find(|s| s.name == name).map(|s| s.branch).unwrap_or_else(|| "main".to_string());
-    let path = worktree_dir(root, &name, &branch).join("README.md");
-    let content = fs::read_to_string(&path).map_err(|e| format!("cannot read the entrance {}: {e} (materialize the `{name}` worktree)", path.display()))?;
+    let e = facts.entrance.as_ref().ok_or_else(|| format!("no `[entrance]` stanza in {SOFTWARE} (declare one naming the entrance member)"))?;
+    let branch = load_software(root).into_iter().find(|s| s.name == e.member).map(|s| s.branch).unwrap_or_else(|| "main".to_string());
+    let path = worktree_dir(root, &e.member, &branch).join(&e.document);
+    let content = fs::read_to_string(&path).map_err(|err| format!("cannot read the entrance {}: {err} (materialize the `{}` worktree)", path.display(), e.member))?;
     Ok((path, content))
 }
 
@@ -1836,10 +1971,17 @@ fn entrance(args: &[String]) {
         }
     };
     let facts = parse_project_facts(&raw);
-    // Migration: a pre-rename .host-software still works (parse accepts the old key), but the
-    // operator is told to rename, so the deprecated spelling does not pass silently (plan/0039).
-    if raw.lines().any(|l| l.trim().starts_with("front-door") && l.split_once('=').is_some_and(|(_, v)| v.trim() == "true")) {
-        eprintln!("host-lifecycle: entrance: `.host-software` uses the deprecated `front-door = true`; rename it to `entrance = true` (accepted for now, removed in a later release)");
+    if !facts.problems.is_empty() {
+        for p in &facts.problems {
+            eprintln!("host-lifecycle: entrance: {p}");
+        }
+        process::exit(2);
+    }
+    // Migration: a pre-stanza .host-software still works (the shim accepts the per-member
+    // marker), but the operator is told to declare the stanza, so the old form does not pass
+    // silently (plan/0039 deprecate-then-retire).
+    if raw.lines().any(|l| l.split_once('=').is_some_and(|(k, v)| matches!(k.trim(), "entrance" | "front-door") && v.trim() == "true")) {
+        eprintln!("host-lifecycle: entrance: `.host-software` uses the deprecated per-member marker; declare an `[entrance]` stanza naming the member instead (accepted for now, removed in a later release)");
     }
     let (readme, content) = match entrance_readme(root, &facts) {
         Ok(v) => v,
@@ -1855,11 +1997,12 @@ fn entrance(args: &[String]) {
             process::exit(2);
         }
     };
+    let restates = facts.entrance.as_ref().map(|e| e.restates.clone()).unwrap_or(Restates::All);
 
     if check {
-        let problems = entrance_problems(&content, &phases, &tools);
+        let problems = entrance_problems(&content, &phases, &tools, &restates);
         if problems.is_empty() {
-            println!("entrance: clean (every phase and wired tool is named; the stamp block matches the canonical format)");
+            println!("entrance: clean (every restated concept is complete in {})", readme.display());
             return;
         }
         for p in &problems {
@@ -1869,23 +2012,27 @@ fn entrance(args: &[String]) {
         process::exit(1);
     }
 
-    // Write mode: regenerate the one generated block (the stamp); a coverage gap is prose the
-    // author fills, so report it rather than rewrite.
-    match entrance_regenerate_stamp(&content) {
-        Some(updated) if updated != content => {
-            if let Err(e) = fs::write(&readme, updated) {
-                eprintln!("host-lifecycle: cannot write {}: {e}", readme.display());
+    // Write mode: regenerate the one generated block (the stamp) when the entrance restates it;
+    // a coverage gap is prose the author fills, so report it rather than rewrite.
+    if restates.checks("stamp") {
+        match entrance_regenerate_stamp(&content) {
+            Some(updated) if updated != content => {
+                if let Err(e) = fs::write(&readme, updated) {
+                    eprintln!("host-lifecycle: cannot write {}: {e}", readme.display());
+                    process::exit(2);
+                }
+                println!("entrance: regenerated the `.host` stamp block in {}", readme.display());
+            }
+            Some(_) => println!("entrance: the `.host` stamp block is already canonical"),
+            None => {
+                eprintln!("host-lifecycle: no `.host` stamp code block under `## The stamp` in {}", readme.display());
                 process::exit(2);
             }
-            println!("entrance: regenerated the `.host` stamp block in {}", readme.display());
         }
-        Some(_) => println!("entrance: the `.host` stamp block is already canonical"),
-        None => {
-            eprintln!("host-lifecycle: no `.host` stamp code block under `## The stamp` in {}", readme.display());
-            process::exit(2);
-        }
+    } else {
+        println!("entrance: the entrance does not restate the stamp; nothing to regenerate in {}", readme.display());
     }
-    for g in entrance_problems(&content, &phases, &tools).into_iter().filter(|p| !p.contains("stamp")) {
+    for g in entrance_problems(&content, &phases, &tools, &restates).into_iter().filter(|p| !p.contains("stamp")) {
         println!("note: {g}");
     }
 }
@@ -7308,21 +7455,21 @@ mod tests {
         let stamp = entrance_stamp();
         // Names both phases (as backtick tokens), both tools, and a canonical stamp: clean.
         let good = format!("# Entrance\n\nRun `classify` then `release`. Wire host-lint and host-lifecycle.\n\n## The stamp: `.host`\n\n```\n{stamp}```\n\n## Next\n");
-        assert!(entrance_problems(&good, &phases, &tools).is_empty(), "{:?}", entrance_problems(&good, &phases, &tools));
+        assert!(entrance_problems(&good, &phases, &tools, &Restates::All).is_empty(), "{:?}", entrance_problems(&good, &phases, &tools, &Restates::All));
         // Omitting the `release` phase token flags, even though the bare word recurs in prose.
         let drift = format!("# Entrance\n\nRun `classify`. See the GitHub releases. Wire host-lint and host-lifecycle.\n\n## The stamp: `.host`\n\n```\n{stamp}```\n");
-        let probs = entrance_problems(&drift, &phases, &tools);
+        let probs = entrance_problems(&drift, &phases, &tools, &Restates::All);
         assert_eq!(probs.len(), 1, "{probs:?}");
         assert!(probs[0].contains("release"));
         // Omitting a wired tool flags.
         let notool = format!("# Entrance\n\n`classify` `release`. Wire host-lifecycle.\n\n## The stamp: `.host`\n\n```\n{stamp}```\n");
-        assert!(entrance_problems(&notool, &phases, &tools).iter().any(|p| p.contains("host-lint")));
+        assert!(entrance_problems(&notool, &phases, &tools, &Restates::All).iter().any(|p| p.contains("host-lint")));
         // A drifted stamp flags, and regenerate restores the canonical block.
         let badstamp = "# F\n\n`classify` `release` host-lint host-lifecycle.\n\n## The stamp: `.host`\n\n```\nrevision = \"x\"\n```\n";
-        assert!(entrance_problems(badstamp, &phases, &tools).iter().any(|p| p.contains("stamp")));
+        assert!(entrance_problems(badstamp, &phases, &tools, &Restates::All).iter().any(|p| p.contains("stamp")));
         let fixed = entrance_regenerate_stamp(badstamp).unwrap();
         assert_eq!(entrance_stamp_block(&fixed).unwrap().trim(), stamp.trim());
-        assert!(entrance_problems(&fixed, &phases, &tools).is_empty(), "{:?}", entrance_problems(&fixed, &phases, &tools));
+        assert!(entrance_problems(&fixed, &phases, &tools, &Restates::All).is_empty(), "{:?}", entrance_problems(&fixed, &phases, &tools, &Restates::All));
     }
 
     #[test]
@@ -8381,19 +8528,62 @@ mod software_tests {
     // phases only — `manifest --check` rejects a project-fact stanza.
     #[test]
     fn parse_project_facts_reads_components_minus_entrance_and_drivers() {
-        let text = "[software \"host-lint\"]\n\turl = u\n[software \"host-lifecycle\"]\n\turl = u\n[software \"host-prove\"]\n\turl = u\n[software \"host-grammar\"]\n\turl = u\n[software \"host\"]\n\turl = u\n\tentrance = true\n\n[verification]\n\tdrivers = host-lint allium specula host-prove\n";
+        // the [entrance] stanza: host is set apart, the four tools are the components, the
+        // document and the restated concepts parse, and there are no problems.
+        let text = "[software \"host-lint\"]\n\turl = u\n[software \"host-lifecycle\"]\n\turl = u\n[software \"host-prove\"]\n\turl = u\n[software \"host-grammar\"]\n\turl = u\n[software \"host\"]\n\turl = u\n\n[entrance]\n\tmember = host\n\tdocument = README.md\n\trestates = phases tools\n\n[verification]\n\tdrivers = host-lint allium specula host-prove\n";
         let f = parse_project_facts(text);
-        // the entrance member (host) is set apart; the four tools are the components
+        assert!(f.problems.is_empty(), "{:?}", f.problems);
         assert_eq!(f.components, vec!["host-lint", "host-lifecycle", "host-prove", "host-grammar"]);
         assert_eq!(f.drivers, vec!["host-lint", "allium", "specula", "host-prove"]);
-        // a member that forgets the entrance marker is counted a component (fail-safe)
+        let e = f.entrance.expect("an entrance");
+        assert_eq!((e.member.as_str(), e.document.as_str()), ("host", "README.md"));
+        assert!(e.restates.checks("phases") && e.restates.checks("tools") && !e.restates.checks("stamp"));
+
+        // `restates` defaults to every concept and `document` to README.md when omitted.
+        let bare = parse_project_facts("[software \"host\"]\n\turl = u\n\n[entrance]\n\tmember = host\n");
+        let be = bare.entrance.expect("an entrance");
+        assert_eq!(be.document, "README.md");
+        assert!(be.restates.checks("stamp"), "an omitted restates means every concept");
+
+        // a member that forgets every marker is counted a component (fail-safe)
         let unmarked = "[software \"host-lint\"]\n\turl = u\n[software \"host\"]\n\turl = u\n";
-        assert_eq!(parse_project_facts(unmarked).components, vec!["host-lint", "host"]);
-        // the deprecated `front-door = true` spelling still marks the entrance (migration shim)
+        let u = parse_project_facts(unmarked);
+        assert_eq!(u.components, vec!["host-lint", "host"]);
+        assert!(u.entrance.is_none());
+
+        // the legacy per-member marker (`front-door` spelling) still marks the front-door entrance
         let legacy = "[software \"host-lint\"]\n\turl = u\n[software \"host\"]\n\turl = u\n\tfront-door = true\n";
         let lf = parse_project_facts(legacy);
         assert_eq!(lf.components, vec!["host-lint"]);
-        assert_eq!(lf.entrance.as_deref(), Some("host"));
+        assert_eq!(lf.entrance.as_ref().map(|e| e.member.as_str()), Some("host"));
+        assert!(lf.entrance.unwrap().restates.checks("stamp"), "the legacy marker means every concept");
+
+        // a second [entrance] stanza is a singleton problem
+        let two = parse_project_facts("[software \"host\"]\n\turl = u\n[entrance]\n\tmember = host\n[entrance]\n\tmember = host\n");
+        assert!(two.problems.iter().any(|p| p.contains("singleton")), "{:?}", two.problems);
+        // an unknown restated concept is a problem
+        let bad = parse_project_facts("[software \"host\"]\n\turl = u\n[entrance]\n\tmember = host\n\trestates = phases bogus\n");
+        assert!(bad.problems.iter().any(|p| p.contains("bogus")), "{:?}", bad.problems);
+        // a named member that is not declared is a problem
+        let nomember = parse_project_facts("[software \"host\"]\n\turl = u\n[entrance]\n\tmember = nope\n");
+        assert!(nomember.problems.iter().any(|p| p.contains("not a declared")), "{:?}", nomember.problems);
+        // an empty `restates` value is a problem (not a silent check-nothing)
+        let empty = parse_project_facts("[software \"host\"]\n\turl = u\n[entrance]\n\tmember = host\n\trestates =\n");
+        assert!(empty.problems.iter().any(|p| p.contains("empty")), "{:?}", empty.problems);
+        // a sub-named `[entrance \"x\"]` is the wrong form, flagged but still parsed
+        let subnamed = parse_project_facts("[software \"host\"]\n\turl = u\n[entrance \"host\"]\n\tmember = host\n");
+        assert!(subnamed.problems.iter().any(|p| p.contains("sub-named")), "{:?}", subnamed.problems);
+        assert_eq!(subnamed.entrance.as_ref().map(|e| e.member.as_str()), Some("host"));
+        // a `document` that escapes the worktree is a problem
+        let escape = parse_project_facts("[software \"host\"]\n\turl = u\n[entrance]\n\tmember = host\n\tdocument = ../etc/passwd\n");
+        assert!(escape.problems.iter().any(|p| p.contains("within the member")), "{:?}", escape.problems);
+        // the legacy marker is case-insensitive, so `True` still marks (no silent demotion)
+        let cased = parse_project_facts("[software \"host-lint\"]\n\turl = u\n[software \"host\"]\n\turl = u\n\tentrance = True\n");
+        assert_eq!(cased.entrance.as_ref().map(|e| e.member.as_str()), Some("host"));
+        assert_eq!(cased.components, vec!["host-lint"]);
+        // a duplicate `member` is a problem
+        let dup = parse_project_facts("[software \"a\"]\n\turl = u\n[software \"b\"]\n\turl = u\n[entrance]\n\tmember = a\n\tmember = b\n");
+        assert!(dup.problems.iter().any(|p| p.contains("more than once")), "{:?}", dup.problems);
     }
 
     #[test]
@@ -8419,7 +8609,7 @@ mod software_tests {
         let facts = ProjectFacts {
             components: vec!["host-lint".into(), "host-lifecycle".into(), "host-prove".into(), "host-grammar".into()],
             drivers: vec!["host-lint".into(), "allium".into(), "specula".into(), "host-prove".into()],
-            entrance: None,
+            ..Default::default()
         };
         // components: a line that omits host-prove flags; the full set clears.
         assert!(reconcile_assertion("components", "the host-* components (host-grammar, host-lint, host-lifecycle)", &facts).is_some());
@@ -8436,7 +8626,7 @@ mod software_tests {
         // an unknown kind is itself a HAZARD (guards an annotation typo).
         assert!(reconcile_assertion("bogus", "anything", &facts).is_some());
         // empty datum (pre-data template): components/verification unverifiable, skipped.
-        let bare = ProjectFacts { components: vec![], drivers: vec![], entrance: None };
+        let bare = ProjectFacts { components: vec![], drivers: vec![], ..Default::default() };
         assert!(reconcile_assertion("components", "host-lint only", &bare).is_none());
     }
 
@@ -8463,7 +8653,7 @@ mod software_tests {
         let facts = ProjectFacts {
             components: vec!["host-lint".into(), "host-lifecycle".into(), "host-prove".into(), "host-grammar".into()],
             drivers: vec!["host-lint".into(), "allium".into(), "specula".into(), "host-prove".into()],
-            entrance: None,
+            ..Default::default()
         };
         // a clean annotated restatement: no hazard
         fs::write(base.join("ok.md"), "Develops host-lint, host-lifecycle, host-prove, host-grammar. <!-- host-reconcile: components -->\n").unwrap();
@@ -8495,7 +8685,7 @@ mod software_tests {
         let facts = ProjectFacts {
             components: vec!["host-lint".into(), "host-lifecycle".into(), "host-prove".into(), "host-grammar".into()],
             drivers: vec!["host-lint".into(), "allium".into(), "specula".into(), "host-prove".into()],
-            entrance: None,
+            ..Default::default()
         };
         let structure = |components_line: &str| {
             format!("## Components {{#components}}\n{components_line}\n\n## Verifiers {{#verifiers}}\nhost-lint, allium, specula, host-prove.\n")
