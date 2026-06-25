@@ -170,16 +170,66 @@ fn validate_call_scope(dir: &Path) -> usize {
 
 fn next(dir: Option<&String>) {
     let Some(dir) = dir else {
-        eprintln!("host-lifecycle next <dir>");
+        eprintln!("usage: host-lifecycle next <dir>");
         process::exit(2);
     };
-    let max = numbered_entries(Path::new(dir))
+    let path = Path::new(dir);
+    match next_number(path) {
+        Ok(n) => println!("{}", format_number(n)),
+        Err(NextError::NotDir) => {
+            eprintln!("host-lifecycle: `{dir}` is not a directory");
+            eprintln!("  point `next` at a room such as plan/ or call/");
+            process::exit(2);
+        }
+        Err(NextError::Empty) => {
+            eprintln!("host-lifecycle: `{dir}` has no numbered (NNNN-slug) entries");
+            match rooms_with_entries(path).first() {
+                Some(room) => eprintln!("  did you mean a room? try: host-lifecycle next {room}"),
+                None => eprintln!("  point `next` at a room such as plan/ or call/ (a room's first entry is 0000)"),
+            }
+            process::exit(2);
+        }
+    }
+}
+
+/// `next` fails closed (plan/0041): a path that is not a directory, or a directory
+/// with no `NNNN-slug` entries, has no well-defined next number. The retired `0000`
+/// fallback returned a plausible wrong answer for a typo'd or non-room path.
+enum NextError {
+    NotDir,
+    Empty,
+}
+
+fn next_number(dir: &Path) -> Result<u32, NextError> {
+    if !dir.is_dir() {
+        return Err(NextError::NotDir);
+    }
+    numbered_entries(dir)
         .iter()
         .filter_map(|n| n.split('-').next())
         .filter_map(|num| num.parse::<u32>().ok())
-        .max();
-    let n = max.map_or(0, |m| m + 1);
-    println!("{}", format_number(n));
+        .max()
+        .map(|m| m + 1)
+        .ok_or(NextError::Empty)
+}
+
+/// The methodology rooms under `dir` that already hold a numbered entry, in room
+/// order — the real rooms `next` suggests when it is pointed at a parent (a repo
+/// root, a typo) that has none of its own. Restricted to the known rooms so a
+/// generated or build directory is never suggested.
+fn rooms_with_entries(dir: &Path) -> Vec<String> {
+    ROOMS
+        .iter()
+        .filter(|room| dir_has_numbered_entry(&dir.join(room)))
+        .map(|room| (*room).to_string())
+        .collect()
+}
+
+fn dir_has_numbered_entry(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|rd| {
+        rd.filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with(|c: char| c.is_ascii_digit()))
+    })
 }
 
 /// `adopt <dir> <revision> [--dry-run]` — scaffold the rooms a host needs and
@@ -7017,6 +7067,33 @@ mod tests {
         assert_eq!(parse_revision(&body).as_deref(), Some("abc123"));
         assert!(body.contains(TEMPLATE_URL));
         assert!(body.contains("2026-06-14"));
+    }
+
+    #[test]
+    fn next_fails_closed_on_numberless_dirs() {
+        let base = std::env::temp_dir().join(format!("hl-next-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        // A populated room returns the maximum plus one (unchanged behavior).
+        fs::create_dir_all(base.join("plan/0003-c")).unwrap();
+        fs::create_dir_all(base.join("plan/0007-g")).unwrap();
+        assert_eq!(next_number(&base.join("plan")).ok(), Some(8));
+        // A room whose only entry is 0000 returns 1.
+        fs::create_dir_all(base.join("call")).unwrap();
+        fs::write(base.join("call/0000-x.md"), "# x\n").unwrap();
+        assert_eq!(next_number(&base.join("call")).ok(), Some(1));
+        // An existing directory with no numbered entries fails closed.
+        fs::create_dir_all(base.join("empty")).unwrap();
+        assert!(matches!(next_number(&base.join("empty")), Err(NextError::Empty)));
+        // The host root (children are rooms, not numbered entries) fails closed.
+        assert!(matches!(next_number(&base), Err(NextError::Empty)));
+        // A missing path fails closed as a non-directory.
+        assert!(matches!(next_number(&base.join("nope")), Err(NextError::NotDir)));
+        // The did-you-mean scan names only the known rooms with entries, in room order
+        // (a non-room child such as a build directory is never suggested).
+        fs::create_dir_all(base.join("book")).unwrap();
+        fs::write(base.join("book/404.html"), "x").unwrap();
+        assert_eq!(rooms_with_entries(&base), vec!["plan".to_string(), "call".to_string()]);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
