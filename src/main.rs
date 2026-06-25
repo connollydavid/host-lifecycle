@@ -1368,9 +1368,9 @@ struct ProjectFacts {
 /// `[software "<name>"]` member except the entrance member; `drivers` = the
 /// `[verification] drivers = ...` list; `entrance` = the `[entrance]` stanza, a global
 /// singleton naming `member`, an optional `document` (default `README.md`), and a `restates`
-/// concept set (default every concept). A legacy per-member `entrance = true` (or the
-/// deprecated `front-door = true`) is accepted as the front-door entrance, the migration
-/// shim. Mirrors `parse_software`'s git-config style; unknown sections and keys are ignored
+/// concept set (default every concept). The legacy per-member `entrance = true` (and the
+/// older `front-door = true`) is retired (plan/0043): a surviving one is a `problems` entry,
+/// never the entrance. Mirrors `parse_software`'s git-config style; unknown sections and keys are ignored
 /// (forward-compatible). A member that forgets every marker is counted a component, the
 /// fail-safe: coverage then over-reports rather than hiding it. `problems` records a second
 /// stanza, an unknown concept, or a named member that is not declared (plan/0043).
@@ -1378,7 +1378,6 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
     let split = |v: &str| -> Vec<String> { v.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect() };
     let mut members: Vec<String> = Vec::new();
     let mut drivers: Vec<String> = Vec::new();
-    let mut legacy_member: Option<String> = None;
     let mut stanza_count = 0usize;
     let (mut e_member, mut e_document, mut e_restates) = (None::<String>, None::<String>, None::<String>);
     let mut section = ""; // "software" | "verification" | "entrance" | ""
@@ -1415,11 +1414,12 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
         let Some((key, val)) = t.split_once('=') else { continue };
         let (key, val) = (key.trim(), val.trim());
         match (section, key) {
-            // the legacy per-member marker (`front-door` is the older spelling), accepted as
-            // the front-door entrance so a pre-stanza .host-software still works; the shim,
-            // slated for removal. entrance() warns and names the stanza form. Case-insensitive
-            // so a `True` does not silently un-mark the member (a call/0027-class demotion).
-            ("software", "entrance" | "front-door") if val.eq_ignore_ascii_case("true") => legacy_member = Some(current_member.clone()),
+            // the legacy per-member marker is retired (plan/0043): a surviving one is a loud
+            // problem, never silently accepted, so it cannot demote the entrance into a
+            // component. Case-insensitive so a `True` is caught, not waved past.
+            ("software", "entrance" | "front-door") if val.eq_ignore_ascii_case("true") => {
+                problems.push(format!("the per-member `{key} = true` entrance marker is retired (plan/0043); declare an `[entrance]` stanza naming `{current_member}`"));
+            }
             ("verification", "drivers") => drivers = split(val),
             ("entrance", "member") => {
                 if e_member.is_some() {
@@ -1436,9 +1436,6 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
     let entrance = if stanza_count > 0 {
         if stanza_count > 1 {
             problems.push(format!("more than one `[entrance]` stanza ({stanza_count}); the entrance is a global singleton"));
-        }
-        if legacy_member.is_some() {
-            problems.push("both an `[entrance]` stanza and a legacy per-member marker; remove the legacy marker".into());
         }
         let restates = match e_restates.as_deref() {
             None => Restates::All,
@@ -1462,7 +1459,7 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
             restates,
         })
     } else {
-        legacy_member.map(|member| Entrance { member, document: "README.md".into(), restates: Restates::All })
+        None
     };
 
     if let Some(e) = &entrance {
@@ -1976,12 +1973,6 @@ fn entrance(args: &[String]) {
             eprintln!("host-lifecycle: entrance: {p}");
         }
         process::exit(2);
-    }
-    // Migration: a pre-stanza .host-software still works (the shim accepts the per-member
-    // marker), but the operator is told to declare the stanza, so the old form does not pass
-    // silently (plan/0039 deprecate-then-retire).
-    if raw.lines().any(|l| l.split_once('=').is_some_and(|(k, v)| matches!(k.trim(), "entrance" | "front-door") && v.trim() == "true")) {
-        eprintln!("host-lifecycle: entrance: `.host-software` uses the deprecated per-member marker; declare an `[entrance]` stanza naming the member instead (accepted for now, removed in a later release)");
     }
     let (readme, content) = match entrance_readme(root, &facts) {
         Ok(v) => v,
@@ -8551,12 +8542,11 @@ mod software_tests {
         assert_eq!(u.components, vec!["host-lint", "host"]);
         assert!(u.entrance.is_none());
 
-        // the legacy per-member marker (`front-door` spelling) still marks the front-door entrance
+        // the legacy per-member marker is retired: it is a problem, not the entrance
         let legacy = "[software \"host-lint\"]\n\turl = u\n[software \"host\"]\n\turl = u\n\tfront-door = true\n";
         let lf = parse_project_facts(legacy);
-        assert_eq!(lf.components, vec!["host-lint"]);
-        assert_eq!(lf.entrance.as_ref().map(|e| e.member.as_str()), Some("host"));
-        assert!(lf.entrance.unwrap().restates.checks("stamp"), "the legacy marker means every concept");
+        assert!(lf.problems.iter().any(|p| p.contains("retired")), "{:?}", lf.problems);
+        assert!(lf.entrance.is_none());
 
         // a second [entrance] stanza is a singleton problem
         let two = parse_project_facts("[software \"host\"]\n\turl = u\n[entrance]\n\tmember = host\n[entrance]\n\tmember = host\n");
@@ -8577,10 +8567,10 @@ mod software_tests {
         // a `document` that escapes the worktree is a problem
         let escape = parse_project_facts("[software \"host\"]\n\turl = u\n[entrance]\n\tmember = host\n\tdocument = ../etc/passwd\n");
         assert!(escape.problems.iter().any(|p| p.contains("within the member")), "{:?}", escape.problems);
-        // the legacy marker is case-insensitive, so `True` still marks (no silent demotion)
+        // the retired marker is caught case-insensitively, so a `True` is a problem too
         let cased = parse_project_facts("[software \"host-lint\"]\n\turl = u\n[software \"host\"]\n\turl = u\n\tentrance = True\n");
-        assert_eq!(cased.entrance.as_ref().map(|e| e.member.as_str()), Some("host"));
-        assert_eq!(cased.components, vec!["host-lint"]);
+        assert!(cased.problems.iter().any(|p| p.contains("retired")), "{:?}", cased.problems);
+        assert!(cased.entrance.is_none());
         // a duplicate `member` is a problem
         let dup = parse_project_facts("[software \"a\"]\n\turl = u\n[software \"b\"]\n\turl = u\n[entrance]\n\tmember = a\n\tmember = b\n");
         assert!(dup.problems.iter().any(|p| p.contains("more than once")), "{:?}", dup.problems);
