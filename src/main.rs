@@ -64,8 +64,9 @@ fn main() {
         Some("prose") => prose(&args[2..]),
         Some("reconcile") => reconcile(&args[2..]),
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
+        Some("tasks") => tasks(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|migrate-receipts> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|migrate-receipts|tasks> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
@@ -1634,6 +1635,945 @@ fn reconcile(args: &[String]) {
     process::exit(1);
 }
 
+// --- plan/0042: the receipted task graph ---
+//
+// An in-plan task is an anchored `### ` heading under the `## Build sequence` section of a
+// `plan/NNNN-slug/README.md`. Its global id (and ledger key) is `plan/NNNN#anchor`, so a
+// receipt and a dependency edge hang on a stable anchor, not a position. `depends` names the
+// prerequisites (a local `#anchor` or a cross-milestone `plan/NNNN#anchor`); the tool derives
+// the parallel frontier, the author never does (call/0024).
+
+#[derive(Clone, PartialEq, Debug)]
+enum TaskVerify {
+    /// A shell command the gate re-runs (mechanical).
+    Mechanical(String),
+    /// `call/NNNN` or `operator`: attested, discharged by the citation resolving.
+    Attested(String),
+}
+
+#[derive(Clone)]
+struct Task {
+    key: String,          // "plan/0042#implement-parser" — global id and ledger key (plan#anchor)
+    rel: String,          // "plan/0042-receipted-task-graph/README.md"
+    line: usize,          // 1-based heading line
+    depends: Vec<String>, // resolved global keys
+    verify: Option<TaskVerify>,
+    inputs: Vec<String>,
+}
+
+/// `plan/NNNN` from a tracked path `plan/NNNN-slug/README.md`, else None. The number is the
+/// milestone identity; the slug is content.
+fn plan_id_of(rel: &str) -> Option<String> {
+    let mut parts = rel.split('/');
+    if parts.next()? != "plan" {
+        return None;
+    }
+    let dir = parts.next()?;
+    if parts.next()? != "README.md" || parts.next().is_some() {
+        return None;
+    }
+    let num = dir.split('-').next()?;
+    if num.len() == 4 && num.bytes().all(|b| b.is_ascii_digit()) {
+        Some(format!("plan/{num}"))
+    } else {
+        None
+    }
+}
+
+/// The slug `{#anchor}` at the END of a heading line (the placement mdBook honors), if any.
+/// The anchor is a `[a-z0-9-]+` slug. A `{#...}` inside an inline-code span is skipped (it is
+/// the syntax quoted, not a live anchor).
+fn heading_end_anchor(line: &str) -> Option<String> {
+    let t = line.trim_end();
+    let close = t.strip_suffix('}')?;
+    let open = close.rfind("{#")?;
+    if t[..open].matches('`').count() % 2 == 1 {
+        return None;
+    }
+    let id = &close[open + 2..];
+    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+/// Whether `line` is the `## Build sequence` section heading (the one section whose `### `
+/// headings are tasks).
+fn is_build_sequence_heading(line: &str) -> bool {
+    if heading_level(line) != 2 {
+        return false;
+    }
+    line.trim_start().trim_start_matches('#').trim().eq_ignore_ascii_case("Build sequence")
+}
+
+/// Resolve a `depends` value to global keys. A local `#anchor` becomes `plan/NNNN#anchor`; a
+/// `plan/NNNN#anchor` passes through; `(none)` (or empty) is an explicit root.
+fn parse_depends(v: &str, plan: &str) -> Vec<String> {
+    let v = v.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("(none)") || v.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    v.split(',')
+        .filter_map(|r| {
+            let r = r.trim();
+            if r.is_empty() {
+                None
+            } else if let Some(a) = r.strip_prefix('#') {
+                Some(format!("{plan}#{a}"))
+            } else {
+                Some(r.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Parse a `verify` value: a shell command (mechanical), or `attested <call/NNNN | operator>`.
+fn parse_verify(v: &str) -> Result<TaskVerify, String> {
+    let v = v.trim();
+    if let Some(att) = v.strip_prefix("attested ") {
+        let att = att.trim();
+        if att == "operator" || (att.starts_with("call/") && att.len() > "call/".len()) {
+            Ok(TaskVerify::Attested(att.to_string()))
+        } else {
+            Err(format!("`verify: attested {att}` must cite `operator` or `call/NNNN`"))
+        }
+    } else if v.is_empty() {
+        Err("`verify:` needs a command, or `attested <call/NNNN|operator>`".to_string())
+    } else {
+        Ok(TaskVerify::Mechanical(v.to_string()))
+    }
+}
+
+/// Parse the tasks from the tracked plan READMEs, plus the structural HAZARDs: an anchored
+/// `### ` outside `## Build sequence` (a task anchor must be a task), a build-sequence `### `
+/// with no end-anchor, or a malformed `verify`. A task's `depends`/`verify`/`inputs` are the
+/// `- key: value` bullets that follow its heading.
+fn parse_tasks(docs: &[(String, String)]) -> (Vec<Task>, Vec<String>) {
+    let mut tasks = Vec::new();
+    let mut problems = Vec::new();
+    for (rel, content) in docs {
+        let Some(plan) = plan_id_of(rel) else { continue };
+        let lines: Vec<&str> = content.lines().collect();
+        let mut in_build_seq = false;
+        let mut prev_in_plan: Option<String> = None;
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            let lvl = heading_level(line);
+            if lvl == 2 {
+                in_build_seq = is_build_sequence_heading(line);
+                i += 1;
+                continue;
+            }
+            if lvl != 3 {
+                i += 1;
+                continue;
+            }
+            let anchor = heading_end_anchor(line);
+            if !in_build_seq {
+                if anchor.is_some() {
+                    problems.push(format!("{rel}:{}: an anchored `### ` heading belongs under `## Build sequence` (a task anchor must be a task)", i + 1));
+                }
+                i += 1;
+                continue;
+            }
+            let Some(anchor) = anchor else {
+                problems.push(format!("{rel}:{}: a `## Build sequence` task heading needs an anchor at its end (`### Title {{#anchor}}`)", i + 1));
+                i += 1;
+                continue;
+            };
+            let key = format!("{plan}#{anchor}");
+            let mut depends: Option<Vec<String>> = None;
+            let mut verify: Option<TaskVerify> = None;
+            let mut inputs: Vec<String> = Vec::new();
+            let mut j = i + 1;
+            while j < lines.len() && heading_level(lines[j]) == 0 {
+                let b = lines[j].trim();
+                if let Some(v) = b.strip_prefix("- depends:") {
+                    depends = Some(parse_depends(v, &plan));
+                } else if let Some(v) = b.strip_prefix("- verify:") {
+                    match parse_verify(v) {
+                        Ok(tv) => verify = Some(tv),
+                        Err(e) => problems.push(format!("{rel}:{}: {e}", j + 1)),
+                    }
+                } else if let Some(v) = b.strip_prefix("- inputs:") {
+                    inputs = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                }
+                j += 1;
+            }
+            // Linear default: no explicit `depends` means the previous task in this plan's
+            // build sequence (the first task is a root).
+            let depends = depends.unwrap_or_else(|| prev_in_plan.iter().cloned().collect());
+            tasks.push(Task { key: key.clone(), rel: rel.clone(), line: i + 1, depends, verify, inputs });
+            prev_in_plan = Some(key);
+            i = j;
+        }
+    }
+    (tasks, problems)
+}
+
+/// Graph HAZARDs over the resolved tasks: a `depends` naming a non-task (dangling), and a
+/// dependency cycle (which spans milestones, since an anchor is a global key). Topological
+/// removal: a task is removable once its real-task deps are gone; a residue is a cycle.
+fn task_graph_problems(tasks: &[Task]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let keys: std::collections::HashSet<String> = tasks.iter().map(|t| t.key.clone()).collect();
+    for t in tasks {
+        for d in &t.depends {
+            if !keys.contains(d) {
+                problems.push(format!("{}:{}: task `{}` depends on `{}`, which is not a task (dangling dependency)", t.rel, t.line, t.key, d));
+            }
+        }
+    }
+    let mut remaining: std::collections::HashMap<String, Vec<String>> = tasks
+        .iter()
+        .map(|t| (t.key.clone(), t.depends.iter().filter(|d| keys.contains(*d)).cloned().collect()))
+        .collect();
+    loop {
+        let ready: Vec<String> = remaining
+            .iter()
+            .filter(|(_, deps)| deps.iter().all(|d| !remaining.contains_key(d)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        for k in &ready {
+            remaining.remove(k);
+        }
+    }
+    if !remaining.is_empty() {
+        let mut involved: Vec<String> = remaining.into_keys().collect();
+        involved.sort();
+        problems.push(format!("task dependency cycle among: {}", involved.join(", ")));
+    }
+    problems
+}
+
+/// The `plan/NNNN#anchor` task-reference tokens on a line, outside inline-code spans. The
+/// short key form is unambiguously a task reference (a clickable doc link uses the full path).
+fn plan_anchor_tokens(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = line[i..].find("plan/") {
+        let start = i + rel;
+        // code-span guard: an odd backtick count before the token means it is quoted.
+        if line[..start].matches('`').count() % 2 == 1 {
+            i = start + 5;
+            continue;
+        }
+        let mut j = start + 5;
+        let num_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j - num_start == 4 && j < bytes.len() && bytes[j] == b'#' {
+            let anchor_start = j + 1;
+            let mut k = anchor_start;
+            while k < bytes.len() && (bytes[k].is_ascii_lowercase() || bytes[k].is_ascii_digit() || bytes[k] == b'-') {
+                k += 1;
+            }
+            if k > anchor_start {
+                out.push(line[start..k].to_string());
+            }
+            i = k;
+        } else {
+            i = start + 5;
+        }
+    }
+    out
+}
+
+/// Reference-integrity: every `plan/NNNN#anchor` task reference in prose resolves to a real
+/// task. The `depends` bullets are skipped here (the graph check covers their resolution),
+/// so a dangling dep is reported once.
+fn task_reference_problems(docs: &[(String, String)], keys: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (rel, content) in docs {
+        for (n, line) in content.lines().enumerate() {
+            if line.trim_start().starts_with("- depends:") {
+                continue;
+            }
+            for tok in plan_anchor_tokens(line) {
+                if !keys.contains(&tok) {
+                    problems.push(format!("{rel}:{}: task reference `{tok}` does not resolve to a task", n + 1));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// The full structural sweep over tracked docs: parse problems, graph problems, and
+/// reference problems. Used by `validate plan/` and the task gate.
+fn task_structure_problems(docs: &[(String, String)]) -> Vec<String> {
+    let (tasks, mut problems) = parse_tasks(docs);
+    problems.extend(task_graph_problems(&tasks));
+    let keys: std::collections::HashSet<String> = tasks.iter().map(|t| t.key.clone()).collect();
+    problems.extend(task_reference_problems(docs, &keys));
+    problems
+}
+
+const TASK_RECEIPTS: &str = ".host-task-receipts";
+
+/// A receipt for one task, in `.host-task-receipts`: `[receipt "plan/NNNN#anchor"]` stanzas
+/// (the git-config form the other receipt ledgers use; call/0024). A third receipt kind
+/// beside the methodology-version (`.host-receipts`) and operational
+/// (`.host-lifecycle-receipts`) ledgers, by the operator's ruling over the ontology objection.
+struct TaskReceipt {
+    key: String,
+    disposition: String,
+    verify: Option<String>,
+    inputs: Option<String>,
+    digest: Option<String>,
+    evidence: Option<String>,
+    reason: Option<String>,
+    tool: Option<String>,
+    recorded: Option<String>,
+}
+
+fn parse_task_receipts(text: &str) -> Vec<TaskReceipt> {
+    let mut out: Vec<TaskReceipt> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some(inner) = t.strip_prefix("[receipt \"").and_then(|r| r.strip_suffix("\"]")) {
+            out.push(TaskReceipt {
+                key: inner.to_string(),
+                disposition: String::new(),
+                verify: None,
+                inputs: None,
+                digest: None,
+                evidence: None,
+                reason: None,
+                tool: None,
+                recorded: None,
+            });
+            continue;
+        }
+        let Some((k, v)) = t.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        let Some(cur) = out.last_mut() else { continue };
+        match k {
+            "disposition" => cur.disposition = v.to_string(),
+            "verify" => cur.verify = Some(v.to_string()),
+            "inputs" => cur.inputs = Some(v.to_string()),
+            "digest" => cur.digest = Some(v.to_string()),
+            "evidence" => cur.evidence = Some(v.to_string()),
+            "reason" => cur.reason = Some(v.to_string()),
+            "tool" => cur.tool = Some(v.to_string()),
+            "recorded" => cur.recorded = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The current receipt for a task key: the LAST matching stanza (append-only, last-wins).
+fn latest_task_receipt<'a>(receipts: &'a [TaskReceipt], key: &str) -> Option<&'a TaskReceipt> {
+    receipts.iter().rev().find(|r| r.key == key)
+}
+
+fn task_receipt_stanza(r: &TaskReceipt) -> String {
+    let mut s = format!("[receipt \"{}\"]\n    disposition = {}\n", r.key, r.disposition);
+    for (k, v) in [
+        ("verify", &r.verify),
+        ("inputs", &r.inputs),
+        ("digest", &r.digest),
+        ("evidence", &r.evidence),
+        ("reason", &r.reason),
+        ("tool", &r.tool),
+        ("recorded", &r.recorded),
+    ] {
+        if let Some(v) = v {
+            s.push_str(&format!("    {k} = {v}\n"));
+        }
+    }
+    s
+}
+
+fn read_task_receipts(root: &Path) -> Vec<TaskReceipt> {
+    parse_task_receipts(&fs::read_to_string(root.join(TASK_RECEIPTS)).unwrap_or_default())
+}
+
+fn append_task_receipt(root: &Path, r: &TaskReceipt) -> std::io::Result<()> {
+    let path = root.join(TASK_RECEIPTS);
+    let mut cur = fs::read_to_string(&path).unwrap_or_default();
+    if !cur.is_empty() {
+        if !cur.ends_with('\n') {
+            cur.push('\n');
+        }
+        cur.push('\n');
+    }
+    cur.push_str(&task_receipt_stanza(r));
+    write_atomic(&path, &cur)
+}
+
+/// The verdict for one task against its current receipt (the cheap path, the obligations
+/// staleness model rather than command execution): an attested `done` resolves its citation,
+/// a mechanical `done` is fresh by input-digest, a verify that changed since the receipt is
+/// stale, and a `skip` carries a resolvable reason. `(ok, note)`; pure but for fs reads, so
+/// it is fixture-testable. The full re-run of a mechanical verify is `tasks --rederive`.
+fn task_verdict(root: &Path, t: &Task, r: &TaskReceipt) -> (bool, String) {
+    match r.disposition.as_str() {
+        "done" => {
+            let current = match &t.verify {
+                None => return (false, "done but the task declares no `verify` — a done must be re-derivable".into()),
+                Some(TaskVerify::Mechanical(c)) => c.clone(),
+                Some(TaskVerify::Attested(c)) => format!("attested {c}"),
+            };
+            if r.verify.as_deref() != Some(current.as_str()) {
+                return (false, "the task's `verify` changed since the receipt was recorded; re-derive".into());
+            }
+            match &t.verify {
+                Some(TaskVerify::Attested(c)) => {
+                    if c == "operator" {
+                        (true, "done (attested: operator)".into())
+                    } else if cited_decision_exists(root, c) {
+                        (true, format!("done (attested: {c})"))
+                    } else {
+                        (false, format!("done attested by `{c}`, which does not resolve to a `call/` decision"))
+                    }
+                }
+                Some(TaskVerify::Mechanical(_)) => {
+                    if t.inputs.is_empty() {
+                        (true, "done (mechanical; declare `inputs` to track staleness)".into())
+                    } else {
+                        match &r.digest {
+                            None => (true, "done (mechanical; run --record-digests to track staleness)".into()),
+                            Some(want) => match input_digest(&t.inputs, root) {
+                                Ok(got) if &got == want => (true, "done (mechanical; inputs fresh)".into()),
+                                Ok(_) => (false, "STALE — the verify inputs changed since the recorded re-derivation; re-derive".into()),
+                                Err(e) => (false, format!("STALE — {e}")),
+                            },
+                        }
+                    }
+                }
+                None => unreachable!(),
+            }
+        }
+        "skip" => match &r.reason {
+            None => (false, "skip without a `reason`".into()),
+            Some(reason) => {
+                if reason.starts_with("call/") && !valid_skip_citation(reason) {
+                    (false, format!("skip cites `{reason}`, which is not a `call/NNNN` id"))
+                } else if valid_skip_citation(reason) && !cited_decision_exists(root, reason) {
+                    (false, format!("skip cites `{reason}`, which does not resolve to a `call/` decision"))
+                } else {
+                    (true, format!("skip ({reason})"))
+                }
+            }
+        },
+        other => (false, format!("unknown disposition `{other}`")),
+    }
+}
+
+/// The per-task gate: every declared task needs a receipt the verdict accepts, and a receipt
+/// whose anchor no longer names a task is an orphan (a renamed or removed task left a stale
+/// receipt, the reverse-drift check). One `GateLine` each.
+fn task_gate(root: &Path, tasks: &[Task], receipts: &[TaskReceipt]) -> Vec<GateLine> {
+    let mut out = Vec::new();
+    let task_keys: std::collections::HashSet<&str> = tasks.iter().map(|t| t.key.as_str()).collect();
+    for t in tasks {
+        let label = format!("task {}", t.key);
+        let line = match latest_task_receipt(receipts, &t.key) {
+            None => GateLine {
+                label,
+                ok: false,
+                note: "no receipt".into(),
+                recheck: None,
+                remedy: Some(format!("host-lifecycle task --record {} --disposition done --evidence <...>", t.key)),
+            },
+            Some(r) => {
+                let (ok, note) = task_verdict(root, t, r);
+                GateLine { label, ok, note, recheck: None, remedy: None }
+            }
+        };
+        out.push(line);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for r in receipts.iter().rev() {
+        if !seen.insert(r.key.as_str()) {
+            continue;
+        }
+        if !task_keys.contains(r.key.as_str()) {
+            out.push(GateLine {
+                label: format!("task {}", r.key),
+                ok: false,
+                note: "orphan receipt — no task carries this anchor (a renamed or removed task left a stale receipt)".into(),
+                recheck: None,
+                remedy: None,
+            });
+        }
+    }
+    out
+}
+
+/// A task's mechanical verify runs during `tasks --rederive`. Refuse one that re-enters the
+/// gate (an infinite-recursion footgun), since `run_recheck` does not set the in-check guard.
+fn verify_command_is_safe(cmd: &str) -> bool {
+    !(cmd.contains("software --check") || cmd.contains("software --verify-build") || cmd.contains("tasks --rederive"))
+}
+
+/// The full task sweep over the tracked docs: structural problems (parse, graph, reference)
+/// and the per-task receipt gate. Inert when no task is declared and no task receipt exists,
+/// so it costs nothing until a plan adopts the form. Returns the HAZARD count.
+fn task_check_problems(root: &Path) -> usize {
+    let docs = match tracked_markdown(root) {
+        Ok(d) => d,
+        Err(_) => return 0, // not a git repo: inert
+    };
+    let mut bad = 0;
+    for p in task_structure_problems(&docs) {
+        println!("HAZARD   {p}");
+        bad += 1;
+    }
+    let (tasks, _) = parse_tasks(&docs);
+    let receipts = read_task_receipts(root);
+    if tasks.is_empty() && receipts.is_empty() {
+        return bad;
+    }
+    for line in task_gate(root, &tasks, &receipts) {
+        if line.ok {
+            println!("ok       {} — {}", line.label, line.note);
+        } else {
+            println!("HAZARD   {} — {}", line.label, line.note);
+            if let Some(rem) = &line.remedy {
+                println!("           remedy: {rem}");
+            }
+            bad += 1;
+        }
+    }
+    bad
+}
+
+/// `tasks <dir>` — the receipted task graph (plan/0042). Default prints the status (the
+/// tasks, their receipts, and the ready frontier); `--check` runs the gate; `--record`
+/// writes a receipt (pulling the task's own `verify`/`inputs`, so the agent never re-types
+/// them); `--rederive` re-runs each mechanical `done` and refreshes its input digest.
+fn tasks(args: &[String]) {
+    let mut mode = "status";
+    let (mut key, mut disposition, mut evidence, mut reason) = (None, None, None, None);
+    let mut record_digests = false;
+    let mut dir = String::from(".");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--check" => {
+                mode = "check";
+                i += 1;
+            }
+            "--rederive" => {
+                mode = "rederive";
+                i += 1;
+            }
+            "--record" => {
+                mode = "record";
+                key = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--disposition" => {
+                disposition = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--evidence" => {
+                evidence = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--reason" => {
+                reason = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--record-digests" => {
+                record_digests = true;
+                i += 1;
+            }
+            s if s.starts_with("--") => i += 1,
+            s => {
+                dir = s.to_string();
+                i += 1;
+            }
+        }
+    }
+    let root = match fs::canonicalize(Path::new(&dir)) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("host-lifecycle: not a directory: {dir}");
+            process::exit(2);
+        }
+    };
+    match mode {
+        "check" => {
+            let bad = task_check_problems(&root);
+            if bad > 0 {
+                eprintln!("-- {bad} task problem(s)");
+                process::exit(1);
+            }
+            println!("tasks: clean");
+        }
+        "record" => tasks_record(&root, key, disposition, evidence, reason, record_digests),
+        "rederive" => tasks_rederive(&root),
+        _ => tasks_status(&root),
+    }
+}
+
+fn tasks_status(root: &Path) {
+    let docs = tracked_markdown(root).unwrap_or_default();
+    let (tasks, problems) = parse_tasks(&docs);
+    let receipts = read_task_receipts(root);
+    let discharged: std::collections::HashSet<&str> = tasks
+        .iter()
+        .filter(|t| latest_task_receipt(&receipts, &t.key).is_some_and(|r| r.disposition == "done" || r.disposition == "skip"))
+        .map(|t| t.key.as_str())
+        .collect();
+    println!("{} task(s) in the plan room:", tasks.len());
+    for t in &tasks {
+        let state = latest_task_receipt(&receipts, &t.key).map(|r| r.disposition.as_str()).unwrap_or("(no receipt)");
+        let deps = if t.depends.is_empty() { "(root)".to_string() } else { t.depends.join(", ") };
+        println!("  {} [{state}]  depends: {deps}", t.key);
+    }
+    let frontier: Vec<&str> = tasks
+        .iter()
+        .filter(|t| !discharged.contains(t.key.as_str()) && t.depends.iter().all(|d| discharged.contains(d.as_str())))
+        .map(|t| t.key.as_str())
+        .collect();
+    if frontier.is_empty() {
+        println!("ready frontier: (none — every task discharged, or blocked on an undischarged dep)");
+    } else {
+        println!("ready frontier (deps satisfied, may run in parallel): {}", frontier.join(", "));
+    }
+    for p in &problems {
+        println!("note: {p}");
+    }
+}
+
+fn tasks_record(root: &Path, key: Option<String>, disposition: Option<String>, evidence: Option<String>, reason: Option<String>, record_digests: bool) {
+    let (Some(key), Some(disposition)) = (key, disposition) else {
+        eprintln!("usage: host-lifecycle tasks --record <plan/NNNN#anchor> --disposition done|skip (--evidence <e> | --reason <call/NNNN>) [--record-digests] [<dir>]");
+        process::exit(2);
+    };
+    let docs = match tracked_markdown(root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("host-lifecycle: tasks: {e}");
+            process::exit(2);
+        }
+    };
+    let (tasks, _) = parse_tasks(&docs);
+    let Some(task) = tasks.iter().find(|t| t.key == key) else {
+        eprintln!("host-lifecycle: no task `{key}` (an anchored `### ` under `## Build sequence` in its plan README)");
+        process::exit(2);
+    };
+    let (mut verify, mut inputs, mut digest) = (None, None, None);
+    match disposition.as_str() {
+        "done" => {
+            if evidence.is_none() {
+                eprintln!("host-lifecycle: a `done` task receipt needs `--evidence` (a re-derivable record)");
+                process::exit(2);
+            }
+            verify = Some(match &task.verify {
+                Some(TaskVerify::Mechanical(c)) => c.clone(),
+                Some(TaskVerify::Attested(c)) => format!("attested {c}"),
+                None => {
+                    eprintln!("host-lifecycle: task `{key}` declares no `verify`; add one before recording done");
+                    process::exit(2);
+                }
+            });
+            if !task.inputs.is_empty() {
+                inputs = Some(task.inputs.join(", "));
+                if record_digests && matches!(task.verify, Some(TaskVerify::Mechanical(_))) {
+                    match input_digest(&task.inputs, root) {
+                        Ok(d) => digest = Some(d),
+                        Err(e) => {
+                            eprintln!("host-lifecycle: cannot fingerprint inputs: {e}");
+                            process::exit(2);
+                        }
+                    }
+                }
+            }
+        }
+        "skip" => match &reason {
+            Some(r) if valid_skip_citation(r) && cited_decision_exists(root, r) => {}
+            _ => {
+                eprintln!("host-lifecycle: a `skip` task receipt needs `--reason <call/NNNN>` resolving to a decision");
+                process::exit(2);
+            }
+        },
+        other => {
+            eprintln!("host-lifecycle: unknown disposition `{other}` — use done or skip");
+            process::exit(2);
+        }
+    }
+    let r = TaskReceipt {
+        key: key.clone(),
+        disposition: disposition.clone(),
+        verify,
+        inputs,
+        digest,
+        evidence,
+        reason,
+        tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
+        recorded: Some(today()),
+    };
+    if let Err(e) = append_task_receipt(root, &r) {
+        eprintln!("host-lifecycle: cannot write {TASK_RECEIPTS}: {e}");
+        process::exit(2);
+    }
+    println!("recorded task receipt: {key} = {disposition}");
+}
+
+fn tasks_rederive(root: &Path) {
+    let docs = tracked_markdown(root).unwrap_or_default();
+    let (tasks, _) = parse_tasks(&docs);
+    let receipts = read_task_receipts(root);
+    let (mut refreshed, mut bad) = (0, 0);
+    for t in &tasks {
+        let Some(r) = latest_task_receipt(&receipts, &t.key) else { continue };
+        if r.disposition != "done" {
+            continue;
+        }
+        let Some(TaskVerify::Mechanical(cmd)) = &t.verify else { continue };
+        if !verify_command_is_safe(cmd) {
+            println!("HAZARD   {} — verify invokes the gate; refusing to run", t.key);
+            bad += 1;
+            continue;
+        }
+        if !run_recheck(root, cmd) {
+            println!("FAILED   {} — `{cmd}` exited non-zero", t.key);
+            bad += 1;
+            continue;
+        }
+        let digest = if t.inputs.is_empty() {
+            None
+        } else {
+            input_digest(&t.inputs, root).ok()
+        };
+        let fresh = TaskReceipt {
+            key: t.key.clone(),
+            disposition: "done".into(),
+            verify: Some(cmd.clone()),
+            inputs: (!t.inputs.is_empty()).then(|| t.inputs.join(", ")),
+            digest,
+            evidence: Some(format!("re-derived {}", today())),
+            reason: None,
+            tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
+            recorded: Some(today()),
+        };
+        match append_task_receipt(root, &fresh) {
+            Ok(()) => {
+                println!("ok       {} (re-derived, digest refreshed)", t.key);
+                refreshed += 1;
+            }
+            Err(e) => println!("ok       {} (re-derived) but cannot write receipt: {e}", t.key),
+        }
+    }
+    println!("-- {refreshed} re-derived, {bad} failed");
+    if bad > 0 {
+        process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod task_gate_tests {
+    use super::*;
+
+    fn doc(rel: &str, body: &str) -> (String, String) {
+        (rel.to_string(), body.to_string())
+    }
+
+    fn tr(key: &str, disp: &str, verify: Option<&str>, inputs: Option<&str>, digest: Option<&str>, reason: Option<&str>) -> TaskReceipt {
+        TaskReceipt {
+            key: key.into(),
+            disposition: disp.into(),
+            verify: verify.map(Into::into),
+            inputs: inputs.map(Into::into),
+            digest: digest.map(Into::into),
+            evidence: Some("ev".into()),
+            reason: reason.map(Into::into),
+            tool: None,
+            recorded: None,
+        }
+    }
+
+    #[test]
+    fn task_receipt_ledger_roundtrips() {
+        let r = tr("plan/0042#a", "done", Some("cargo test a"), Some("src/a.rs"), Some("deadbeef"), None);
+        let parsed = parse_task_receipts(&task_receipt_stanza(&r));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].key, "plan/0042#a");
+        assert_eq!(parsed[0].verify.as_deref(), Some("cargo test a"));
+        assert_eq!(parsed[0].digest.as_deref(), Some("deadbeef"));
+        // last-wins
+        let two = format!("{}\n{}", task_receipt_stanza(&tr("plan/0042#a", "skip", None, None, None, Some("call/0024"))), task_receipt_stanza(&r));
+        let parsed = parse_task_receipts(&two);
+        assert_eq!(latest_task_receipt(&parsed, "plan/0042#a").unwrap().disposition, "done");
+    }
+
+    #[test]
+    fn gate_checks_attested_mechanical_skip_missing_and_orphan() {
+        let base = std::env::temp_dir().join(format!("hl-taskgate-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("call")).unwrap();
+        process::Command::new("git").arg("-C").arg(&base).arg("init").arg("-q").output().unwrap();
+        fs::write(base.join("call").join("0024-x.md"), "# x\n").unwrap();
+        fs::write(base.join("engine.rs"), "fn main(){}\n").unwrap();
+
+        let docs = vec![doc(
+            "plan/0042-x/README.md",
+            "## Build sequence\n\n### A {#a}\n- verify: attested call/0024\n\n### B {#b}\n- depends: #a\n- verify: cargo test b\n- inputs: engine.rs\n",
+        )];
+        let (tasks, problems) = parse_tasks(&docs);
+        assert!(problems.is_empty(), "{problems:?}");
+        let a = tasks.iter().find(|t| t.key.ends_with("#a")).unwrap();
+        let b = tasks.iter().find(|t| t.key.ends_with("#b")).unwrap();
+
+        // attested resolves → ok; an unresolved citation → hazard
+        assert!(task_verdict(&base, a, &tr("plan/0042#a", "done", Some("attested call/0024"), None, None, None)).0);
+        assert!(!task_verdict(&base, a, &tr("plan/0042#a", "done", Some("attested call/9999"), None, None, None)).0);
+
+        // mechanical: fresh digest ok, drifted input stale, changed verify stale
+        let dg = input_digest(&["engine.rs".to_string()], &base).unwrap();
+        let rb = tr("plan/0042#b", "done", Some("cargo test b"), Some("engine.rs"), Some(&dg), None);
+        assert!(task_verdict(&base, b, &rb).0, "fresh");
+        fs::write(base.join("engine.rs"), "changed\n").unwrap();
+        assert!(!task_verdict(&base, b, &rb).0, "stale input");
+        assert!(!task_verdict(&base, b, &tr("plan/0042#b", "done", Some("cargo test OTHER"), Some("engine.rs"), Some(&dg), None)).0, "changed verify");
+
+        // skip needs a resolvable reason
+        assert!(task_verdict(&base, a, &tr("plan/0042#a", "skip", None, None, None, Some("call/0024"))).0);
+        assert!(!task_verdict(&base, a, &tr("plan/0042#a", "skip", None, None, None, Some("call/9999"))).0);
+        assert!(!task_verdict(&base, a, &tr("plan/0042#a", "skip", None, None, None, None)).0);
+
+        // gate: only a is receipted → b is "no receipt"; a stray receipt → orphan
+        let receipts = vec![
+            tr("plan/0042#a", "done", Some("attested call/0024"), None, None, None),
+            tr("plan/0099#gone", "done", Some("attested operator"), None, None, None),
+        ];
+        let lines = task_gate(&base, &tasks, &receipts);
+        assert!(lines.iter().any(|l| l.label == "task plan/0042#b" && !l.ok && l.note == "no receipt"));
+        assert!(lines.iter().any(|l| l.label == "task plan/0042#a" && l.ok));
+        assert!(lines.iter().any(|l| l.label == "task plan/0099#gone" && !l.ok && l.note.contains("orphan")));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+
+    fn doc(rel: &str, body: &str) -> (String, String) {
+        (rel.to_string(), body.to_string())
+    }
+
+    #[test]
+    fn plan_id_of_reads_the_milestone_number() {
+        assert_eq!(plan_id_of("plan/0042-receipted-task-graph/README.md").as_deref(), Some("plan/0042"));
+        assert_eq!(plan_id_of("plan/0042-x/spec/foo.md"), None);
+        assert_eq!(plan_id_of("STRUCTURE.md"), None);
+        assert_eq!(plan_id_of("plan/PLAN.md"), None);
+    }
+
+    #[test]
+    fn heading_end_anchor_only_at_the_end_of_a_heading() {
+        assert_eq!(heading_end_anchor("### Gather data {#gather-data}").as_deref(), Some("gather-data"));
+        assert_eq!(heading_end_anchor("### {#gather} Gather data"), None); // start placement
+        assert_eq!(heading_end_anchor("- not a heading {#x}").as_deref(), Some("x")); // anchor extraction is heading-agnostic; the parser gates on heading_level
+        assert_eq!(heading_end_anchor("### plain"), None);
+        assert_eq!(heading_end_anchor("### quoted `{#x}`"), None); // inside code span
+    }
+
+    #[test]
+    fn parse_tasks_reads_a_cross_milestone_diamond_with_the_linear_default() {
+        let docs = vec![
+            doc(
+                "plan/0050-engine/README.md",
+                "# t\n\n## Build sequence\n\n### Build engine {#build-engine}\n\n- verify: cargo test engine\n- inputs: src/engine.rs\n",
+            ),
+            doc(
+                "plan/0051-ship/README.md",
+                "# t\n\n## Build sequence\n\n### Write tests {#write-cli-tests}\n\n- verify: cargo test cli\n\n### Ship the cli {#ship-cli}\n\n- depends: #write-cli-tests, plan/0050#build-engine\n- verify: attested call/0024\n",
+            ),
+        ];
+        let (tasks, problems) = parse_tasks(&docs);
+        assert!(problems.is_empty(), "structural problems: {problems:?}");
+        assert_eq!(tasks.len(), 3);
+        let ship = tasks.iter().find(|t| t.key.ends_with("#ship-cli")).unwrap();
+        assert_eq!(ship.key, "plan/0051#ship-cli");
+        assert_eq!(ship.depends, vec!["plan/0051#write-cli-tests", "plan/0050#build-engine"]);
+        assert_eq!(ship.verify, Some(TaskVerify::Attested("call/0024".to_string())));
+        let engine = tasks.iter().find(|t| t.key.ends_with("#build-engine")).unwrap();
+        assert_eq!(engine.verify, Some(TaskVerify::Mechanical("cargo test engine".to_string())));
+        assert_eq!(engine.inputs, vec!["src/engine.rs".to_string()]);
+        assert!(engine.depends.is_empty()); // first task in its plan, a root
+        // linear default: write-cli-tests is the first in plan/0051, so a root
+        let wt = tasks.iter().find(|t| t.key.ends_with("#write-cli-tests")).unwrap();
+        assert!(wt.depends.is_empty());
+        // the graph is clean (every depends resolves, no cycle)
+        assert!(task_graph_problems(&tasks).is_empty());
+    }
+
+    #[test]
+    fn linear_default_chains_consecutive_tasks() {
+        let docs = vec![doc(
+            "plan/0060-x/README.md",
+            "## Build sequence\n\n### First {#first}\n- verify: a\n\n### Second {#second}\n- verify: b\n",
+        )];
+        let (tasks, _) = parse_tasks(&docs);
+        let second = tasks.iter().find(|t| t.key.ends_with("#second")).unwrap();
+        assert_eq!(second.depends, vec!["plan/0060#first"]);
+    }
+
+    #[test]
+    fn disambiguation_flags_anchored_heading_outside_and_unanchored_inside() {
+        let docs = vec![doc(
+            "plan/0070-x/README.md",
+            "## Design\n\n### A subsection {#a-sub}\n\n## Build sequence\n\n### Needs anchor\n\n- verify: a\n",
+        )];
+        let (tasks, problems) = parse_tasks(&docs);
+        assert!(tasks.is_empty());
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("belongs under `## Build sequence`")));
+        assert!(problems.iter().any(|p| p.contains("needs an anchor at its end")));
+    }
+
+    #[test]
+    fn graph_flags_dangling_and_cycle() {
+        let dangling = vec![doc(
+            "plan/0080-x/README.md",
+            "## Build sequence\n\n### A {#a}\n- depends: #nope\n- verify: a\n",
+        )];
+        let (tasks, _) = parse_tasks(&dangling);
+        let probs = task_graph_problems(&tasks);
+        assert!(probs.iter().any(|p| p.contains("dangling dependency")), "{probs:?}");
+
+        let cyclic = vec![doc(
+            "plan/0081-x/README.md",
+            "## Build sequence\n\n### A {#a}\n- depends: #b\n- verify: a\n\n### B {#b}\n- depends: #a\n- verify: b\n",
+        )];
+        let (tasks, _) = parse_tasks(&cyclic);
+        let probs = task_graph_problems(&tasks);
+        assert!(probs.iter().any(|p| p.contains("cycle")), "{probs:?}");
+    }
+
+    #[test]
+    fn reference_integrity_flags_a_broken_prose_reference() {
+        let docs = vec![doc(
+            "plan/0090-x/README.md",
+            "## Build sequence\n\n### A {#a}\n- verify: a\n\n## Notes\n\nThis follows plan/0090#ghost in spirit, and plan/0090#a is real.\n",
+        )];
+        let (tasks, _) = parse_tasks(&docs);
+        let keys: std::collections::HashSet<String> = tasks.iter().map(|t| t.key.clone()).collect();
+        let probs = task_reference_problems(&docs, &keys);
+        assert_eq!(probs.len(), 1, "{probs:?}");
+        assert!(probs[0].contains("plan/0090#ghost"));
+    }
+}
+
 fn software(args: &[String]) {
     let mut mode: Option<&str> = None;
     let mut pos: Vec<&String> = Vec::new();
@@ -2732,6 +3672,9 @@ fn software_check(root: &Path, recipe: &[Software]) {
     // plan/0025: every manifest phase emits a receipt; re-check each `done` by the
     // manifest's closed `recheck =`. Inert until the adopted template declares a manifest.
     bad += receipt_gate_problems(root, recipe);
+    // plan/0042: the receipted task graph — structural problems (parse, graph, reference)
+    // and the per-task receipt gate. Inert until a plan adopts the anchored-task form.
+    bad += task_check_problems(root);
     if bad > 0 {
         eprintln!("-- {bad} item(s) need attention");
         process::exit(1);
