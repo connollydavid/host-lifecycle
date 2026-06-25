@@ -1346,7 +1346,10 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
         }
         let Some((key, val)) = t.split_once('=') else { continue };
         match (section, key.trim()) {
-            ("software", "entrance") if val.trim() == "true" => {
+            // the entrance marker; `front-door` is the deprecated spelling, accepted so a
+            // pre-rename .host-software is not silently demoted to a component. It is the
+            // migration shim, slated for removal; entrance() warns and names the rename.
+            ("software", "entrance" | "front-door") if val.trim() == "true" => {
                 if let Some(m) = members.last_mut() {
                     m.1 = true;
                 }
@@ -1691,7 +1694,7 @@ fn reconcile(args: &[String]) {
     process::exit(1);
 }
 
-// --- plan/0040: the entrance check (named `front-door` there; renamed to `entrance`, no alias, in plan/0043) ---
+// --- plan/0040: the entrance check ---
 //
 // The single-file entrance (the `.host-software` member marked `entrance = true`) is a
 // published README in its own repo, outside any host's verify gate, so its restatements of
@@ -1825,13 +1828,19 @@ fn entrance(args: &[String]) {
         }
     }
     let root = Path::new(&dir);
-    let facts = match fs::read_to_string(root.join(SOFTWARE)) {
-        Ok(t) => parse_project_facts(&t),
+    let raw = match fs::read_to_string(root.join(SOFTWARE)) {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("host-lifecycle: entrance needs {SOFTWARE}: {e}");
             process::exit(2);
         }
     };
+    let facts = parse_project_facts(&raw);
+    // Migration: a pre-rename .host-software still works (parse accepts the old key), but the
+    // operator is told to rename, so the deprecated spelling does not pass silently (plan/0039).
+    if raw.lines().any(|l| l.trim().starts_with("front-door") && l.split_once('=').is_some_and(|(_, v)| v.trim() == "true")) {
+        eprintln!("host-lifecycle: entrance: `.host-software` uses the deprecated `front-door = true`; rename it to `entrance = true` (accepted for now, removed in a later release)");
+    }
     let (readme, content) = match entrance_readme(root, &facts) {
         Ok(v) => v,
         Err(e) => {
@@ -8380,6 +8389,11 @@ mod software_tests {
         // a member that forgets the entrance marker is counted a component (fail-safe)
         let unmarked = "[software \"host-lint\"]\n\turl = u\n[software \"host\"]\n\turl = u\n";
         assert_eq!(parse_project_facts(unmarked).components, vec!["host-lint", "host"]);
+        // the deprecated `front-door = true` spelling still marks the entrance (migration shim)
+        let legacy = "[software \"host-lint\"]\n\turl = u\n[software \"host\"]\n\turl = u\n\tfront-door = true\n";
+        let lf = parse_project_facts(legacy);
+        assert_eq!(lf.components, vec!["host-lint"]);
+        assert_eq!(lf.entrance.as_deref(), Some("host"));
     }
 
     #[test]
