@@ -1767,12 +1767,33 @@ fn parse_verify(v: &str) -> Result<TaskVerify, String> {
 /// `### ` outside `## Build sequence` (a task anchor must be a task), a build-sequence `### `
 /// with no end-anchor, or a malformed `verify`. A task's `depends`/`verify`/`inputs` are the
 /// `- key: value` bullets that follow its heading.
+/// Blank the lines inside fenced code blocks (keeping the line count so reported line numbers
+/// stay accurate). A `### ` task or a `## Build sequence` inside a ``` example is then not read
+/// as a heading.
+fn mask_fenced_lines(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in content.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push(String::new());
+        } else if in_fence {
+            out.push(String::new());
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
 fn parse_tasks(docs: &[(String, String)]) -> (Vec<Task>, Vec<String>) {
     let mut tasks = Vec::new();
     let mut problems = Vec::new();
     for (rel, content) in docs {
         let Some(plan) = plan_id_of(rel) else { continue };
-        let lines: Vec<&str> = content.lines().collect();
+        let masked = mask_fenced_lines(content);
+        let lines: Vec<&str> = masked.iter().map(|s| s.as_str()).collect();
         let mut in_build_seq = false;
         let mut prev_in_plan: Option<String> = None;
         let mut i = 0;
@@ -2653,6 +2674,20 @@ mod task_tests {
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("belongs under `## Build sequence`")));
         assert!(problems.iter().any(|p| p.contains("needs an anchor at its end")));
+    }
+
+    #[test]
+    fn fenced_example_headings_are_not_tasks() {
+        // a plan that shows the task syntax in a ``` example must not parse it as a task,
+        // nor flag the example heading as misplaced.
+        let docs = vec![doc(
+            "plan/0071-x/README.md",
+            "## Decision\n\nExample:\n\n```\n## Build sequence\n\n### Show me {#show-me}\n- verify: x\n```\n\n## Build sequence\n\n### Real task {#real-task}\n- verify: y\n",
+        )];
+        let (tasks, problems) = parse_tasks(&docs);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].key, "plan/0071#real-task");
     }
 
     #[test]
