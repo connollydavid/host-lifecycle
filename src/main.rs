@@ -1707,6 +1707,24 @@ fn is_build_sequence_heading(line: &str) -> bool {
     line.trim_start().trim_start_matches('#').trim().eq_ignore_ascii_case("Build sequence")
 }
 
+/// A heading title to its anchor slug: lowercase, every run of non-alphanumeric characters
+/// to a single `-`, trimmed. `tasks --new` emits the exact `{#slug}` so the agent never
+/// hand-types the anchor (the fill-in-the-blank fold-back for the weak-agent bar).
+fn slugify(title: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
 /// Resolve a `depends` value to global keys. A local `#anchor` becomes `plan/NNNN#anchor`; a
 /// `plan/NNNN#anchor` passes through; `(none)` (or empty) is an explicit root.
 fn parse_depends(v: &str, plan: &str) -> Vec<String> {
@@ -2157,7 +2175,7 @@ fn task_check_problems(root: &Path) -> usize {
 /// them); `--rederive` re-runs each mechanical `done` and refreshes its input digest.
 fn tasks(args: &[String]) {
     let mut mode = "status";
-    let (mut key, mut disposition, mut evidence, mut reason) = (None, None, None, None);
+    let (mut key, mut disposition, mut evidence, mut reason, mut title) = (None, None, None, None, None);
     let mut record_digests = false;
     let mut dir = String::from(".");
     let mut i = 0;
@@ -2170,6 +2188,11 @@ fn tasks(args: &[String]) {
             "--rederive" => {
                 mode = "rederive";
                 i += 1;
+            }
+            "--new" => {
+                mode = "new";
+                title = args.get(i + 1).cloned();
+                i += 2;
             }
             "--record" => {
                 mode = "record";
@@ -2199,6 +2222,10 @@ fn tasks(args: &[String]) {
             }
         }
     }
+    if mode == "new" {
+        tasks_new(title);
+        return;
+    }
     let root = match fs::canonicalize(Path::new(&dir)) {
         Ok(p) => p,
         Err(_) => {
@@ -2219,6 +2246,26 @@ fn tasks(args: &[String]) {
         "rederive" => tasks_rederive(&root),
         _ => tasks_status(&root),
     }
+}
+
+/// `tasks --new "<title>"` emits the scaffolded task block: the heading with its slug anchor
+/// at the end, and the empty field bullets to fill. The tool carries the anchor so the agent
+/// authors only `depends`/`verify`/`inputs` (the fill-in-the-blank fold-back).
+fn tasks_new(title: Option<String>) {
+    let Some(title) = title else {
+        eprintln!("usage: host-lifecycle tasks --new \"<title>\"");
+        process::exit(2);
+    };
+    let slug = slugify(&title);
+    if slug.is_empty() {
+        eprintln!("host-lifecycle: `{title}` has no slug characters for an anchor");
+        process::exit(2);
+    }
+    println!("### {title} {{#{slug}}}");
+    println!();
+    println!("- depends: ");
+    println!("- verify: ");
+    println!("- inputs: ");
 }
 
 fn tasks_status(root: &Path) {
@@ -2476,6 +2523,14 @@ mod task_tests {
         assert_eq!(plan_id_of("plan/0042-x/spec/foo.md"), None);
         assert_eq!(plan_id_of("STRUCTURE.md"), None);
         assert_eq!(plan_id_of("plan/PLAN.md"), None);
+    }
+
+    #[test]
+    fn slugify_makes_a_clean_anchor() {
+        assert_eq!(slugify("Run the migration"), "run-the-migration");
+        assert_eq!(slugify("  Build & test (CI)!  "), "build-test-ci");
+        assert_eq!(slugify("0042: ship it"), "0042-ship-it");
+        assert_eq!(slugify("!!!"), "");
     }
 
     #[test]
