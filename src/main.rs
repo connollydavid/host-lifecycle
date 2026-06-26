@@ -13,7 +13,7 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use host_grammar::{format_number, is_valid_name};
-use host_lint::{is_ci_file, is_scannable, path_ignored, scan_prose_text, scan_text_with_allow, Match, Severity};
+use host_lint::{is_ci_file, is_scannable, path_ignored, scan_text_with_allow, Match, Severity};
 
 /// The canonical template a project adopts from; recorded in the stamp.
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/host-template";
@@ -1211,44 +1211,19 @@ fn load_lintignore(root: &Path) -> Vec<String> {
     }
 }
 
-/// The prose-hygiene audit (plan/0030 D4): mirror host-lint's `--docs` walk in-process via
-/// the linked `host_lint` engine. Walk tracked markdown (`git ls-files`, honoring
-/// `.host-lintignore`, skipping symlinks and non-markdown) and scan each with the shared
-/// `scan_prose_text`, so the result is byte-identical to `host-lint --docs` without needing
-/// host-lint on PATH (this host's host-lint is embedded Where software). Returns the
+/// The prose-hygiene audit (plan/0030 D4): run host-lint's `--docs` engine in-process via
+/// the linked `host_lint` crate, so the verdict is byte-identical to `host-lint --docs`
+/// without needing host-lint on PATH (this host's host-lint is embedded Where software).
+/// `load_lexicon` supplies the repo's LEXICON masking phrases and `run_docs` performs the
+/// shared `git ls-files` walk over tracked `.md` (honoring `.host-lintignore`, skipping
+/// symlinks and non-files), masking each declared phrase before detection — so a domain
+/// noun a project declares in its LEXICON clears the same trope here as at the CLI, and the
+/// embedded engine cannot drift from the standalone one (host-lifecycle#2). Returns the
 /// accumulated matches, or an error if the repo cannot be walked.
 fn prose_audit(root: &Path) -> Result<Vec<Match>, String> {
+    let allow = host_lint::load_lexicon(root).phrases_lc;
     let ignore = load_lintignore(root);
-    let out = process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "-z"])
-        .output()
-        .map_err(|e| format!("git ls-files: {e}"))?;
-    if !out.status.success() {
-        return Err("git ls-files failed (prose needs a git repository)".to_string());
-    }
-    let listing = String::from_utf8_lossy(&out.stdout);
-    let mut matches: Vec<Match> = Vec::new();
-    for rel in listing.split('\0').filter(|s| !s.is_empty()) {
-        if !rel.to_ascii_lowercase().ends_with(".md") {
-            continue;
-        }
-        if path_ignored(rel, &ignore) {
-            continue;
-        }
-        let path = root.join(rel);
-        if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        if let Ok(content) = fs::read_to_string(&path) {
-            scan_prose_text(&content, rel, &mut matches);
-        }
-    }
-    Ok(matches)
+    host_lint::run_docs(root, &allow, &ignore)
 }
 
 /// `prose <dir>`: the repo-wide prose-hygiene recheck (plan/0030 D4), the portable form of
@@ -8508,6 +8483,45 @@ mod software_tests {
         assert!(
             dirty.iter().any(|m| m.severity == Severity::Warn || m.severity == Severity::Flag),
             "a decoration trope is detected as warn/flag"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // host-lifecycle#2: the in-process prose audit now runs host-lint's shared --docs
+    // engine, so it consults the repo's LEXICON. A declared domain noun clears the
+    // ai-diction trope here exactly as at the CLI; before the shared-engine bump the
+    // embedded engine ignored LEXICON and the verify recheck warned forever.
+    #[test]
+    fn prose_audit_honours_lexicon_masking() {
+        let base = std::env::temp_dir().join(format!("hl-prose-lex-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let g = |args: &[&str]| assert!(git_ok(&base, args), "git {args:?} failed");
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        // "harness" is an ai-diction term; two occurrences trip the density warn.
+        fs::write(
+            base.join("doc.md"),
+            "# Title\n\nThe wdm-harness drives the lane. The harness emits a verdict.\n",
+        )
+        .unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "doc"]);
+        // No LEXICON: the prose tell warns.
+        let bare = prose_audit(&base).unwrap();
+        assert!(
+            bare.iter().any(|m| m.severity == Severity::Warn),
+            "undeclared, the ai-diction term warns in the in-process audit"
+        );
+        // Declare the phrases: the audit masks them before detection, so the warn clears.
+        fs::write(base.join("LEXICON"), "wdm-harness\nthe harness\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "lexicon"]);
+        let masked = prose_audit(&base).unwrap();
+        assert!(
+            !masked.iter().any(|m| m.severity == Severity::Warn),
+            "a LEXICON-declared phrase clears the prose tell in the in-process audit"
         );
         let _ = fs::remove_dir_all(&base);
     }
