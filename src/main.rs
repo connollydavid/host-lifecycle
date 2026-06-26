@@ -4175,6 +4175,9 @@ fn software_check(root: &Path, recipe: &[Software]) {
         // Verification lanes are mandatory when a spec of their kind exists: a
         // materialized component carrying a `.allium`/`.tla` must run its lane.
         bad += spec_lane_problems(root, s);
+        // A declared deeper rung must have a RUNNABLE re-deriver, not merely a present CI
+        // lane (call/0018, plan/0048): re-derivation that cannot run is not discharged.
+        bad += tier_rederiver_problems(root, s);
     }
     // Worktree-absence coherence (call/0005): a tracked symlink whose target is not
     // itself tracked here points into a separately-materialized path — a software
@@ -4574,6 +4577,56 @@ fn read_obligations_text(dir: &Path) -> String {
         }
     }
     text
+}
+
+/// Probe (cheaply, never running the proof) that a declared rung's re-deriver EXECUTES — host-prove,
+/// the shared driver for every rung — not merely resolves on PATH (`call/0018`, plan/0048). The
+/// rung-specific verifier (`cargo kani` / `apalache-mc` / `tlapm`) can be CI-only by design (TLAPS is,
+/// the apalache JVM is optional locally), so its presence is the pluggable re-derivation's concern,
+/// not this cheap, context-independent gate's: host-prove is the one driver without which no rung
+/// re-derives anywhere. A declared rung whose driver cannot run is *available, not discharged* — the
+/// gap that hid a missing host-prove install for two weeks. Returns `Some(reason)` when not runnable,
+/// `None` when it runs (or the token is not a deeper rung, so there is nothing to probe).
+fn rung_rederiver_problem(token: &str) -> Option<String> {
+    if !matches!(token, "kani:" | "apalache:" | "tlaps:") {
+        return None;
+    }
+    // host-prove must spawn to completion (execute), not merely be findable on PATH.
+    if process::Command::new("host-prove").arg("--help").output().is_err() {
+        Some("host-prove, the re-deriver for every rung, does not run — install it on PATH".to_string())
+    } else {
+        None
+    }
+}
+
+/// `software --check`'s runnability pass (plan/0048): a component that declares any deeper rung must
+/// have a runnable re-deriver, so the re-derivation that earns its digest can actually run. host-prove
+/// is the shared driver, so one probe covers every rung the component declares. Kept out of
+/// `spec_lane_problems` so the lane-present logic stays unit-tested without host-prove on PATH; this
+/// pass is impure (it spawns) and is exercised by the real `software --check`. Returns the HAZARD count.
+fn tier_rederiver_problems(root: &Path, s: &Software) -> usize {
+    let worktree = worktree_dir(root, &s.name, &s.branch);
+    if !worktree.is_dir() {
+        return 0;
+    }
+    let manifests = read_obligations_text(&worktree);
+    let declared: Vec<&str> = ["kani:", "apalache:", "tlaps:"]
+        .into_iter()
+        .filter(|t| manifests.contains(*t))
+        .collect();
+    if declared.is_empty() {
+        return 0;
+    }
+    match rung_rederiver_problem(declared[0]) {
+        None => {
+            println!("ok       {} re-deriver runnable (declares {})", s.name, declared.join(" "));
+            0
+        }
+        Some(reason) => {
+            println!("HAZARD   {} declares {} but the re-deriver is not runnable — {reason}", s.name, declared.join(" "));
+            1
+        }
+    }
 }
 
 /// Walk a worktree (skipping `.git`, `target`, `node_modules`) and report whether
@@ -7679,6 +7732,17 @@ mod tests {
 #[cfg(test)]
 mod software_tests {
     use super::*;
+
+    // plan/0048: a non-rung token has no re-deriver to probe, so the check returns None
+    // without spawning any subprocess. (The runnable/not-runnable branches for a real rung
+    // are environment-dependent — host-prove + the verifier on PATH — and are integration-
+    // tested by `software --check`, not here, so the suite stays portable.)
+    #[test]
+    fn rung_rederiver_problem_ignores_non_rung_tokens() {
+        assert!(rung_rederiver_problem("test:").is_none());
+        assert!(rung_rederiver_problem("structural").is_none());
+        assert!(rung_rederiver_problem("").is_none());
+    }
 
     #[test]
     fn parses_multi_component_recipe() {
