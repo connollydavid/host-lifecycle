@@ -91,7 +91,7 @@ fn main() {
             eprintln!("  entrance [--check] <dir>    — hold the single-file entrance to the spine: cover the phases + wired tools, generate the .host stamp block (plan/0040)");
             eprintln!("  migrate-receipts <dir>        — re-home the receipts family: applied-set to .host-receipts, operational receipts to .host-lifecycle-receipts (plan/0037)");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
-            eprintln!("  book <dir> [--dry-run]        — generate docs/ + SUMMARY.md (lifecycle order) for mdBook");
+            eprintln!("  book <dir> [--dry-run]        — generate mdBook/src/ + SUMMARY.md (lifecycle order) for mdBook");
             eprintln!("  book --check <dir>            — fail unless every room renders at least one page");
             eprintln!("  obligations <spec.allium>     — every `allium plan` obligation is dispositioned in <stem>.obligations");
             eprintln!("  manifest --check <path>       — the lifecycle manifest is well-formed (orders unique, requires resolve)");
@@ -5586,10 +5586,10 @@ struct Section {
     pages: Vec<Page>,
 }
 
-/// One rendered page: where it lands under `docs/`, its sidebar label and indent,
+/// One rendered page: where it lands under `mdBook/src/`, its sidebar label and indent,
 /// and how to produce it.
 struct Page {
-    /// Path under `docs/`, e.g. `cast/mara.md`.
+    /// Path under `mdBook/src/`, e.g. `cast/mara.md`.
     dest: String,
     /// Sidebar label.
     label: String,
@@ -5605,7 +5605,7 @@ enum PageBody {
     Inline(String),
 }
 
-/// `book <dir> [--dry-run]` — generate `book.toml` + `docs/` (SUMMARY in lifecycle
+/// `book <dir> [--dry-run]` — generate `book.toml` + `mdBook/src/` (SUMMARY in lifecycle
 /// order, specs rendered, a Where stub from `.host-software`). `book --check <dir>`
 /// fails unless every room renders at least one page with content. The methodology
 /// mandates five rooms and two spec formats but shipped no canonical way to publish
@@ -5912,22 +5912,24 @@ fn page_has_content(p: &Page) -> bool {
     }
 }
 
-/// Generate `book.toml` and `docs/` from the plan. `docs/` is rebuilt from scratch
-/// (it is generated output, gitignored), so a removed source never lingers.
+/// Generate `book.toml` and the mdBook source under `mdBook/src/` from the plan. The source tree
+/// is rebuilt from scratch (it is generated output, gitignored), so a removed source never
+/// lingers; the built HTML lands in `mdBook/out/` via `book.toml`'s `build-dir`. Both live under
+/// one gitignored `mdBook/` folder, leaving `docs/` free for authored content (host-lifecycle#3).
 fn write_book(root: &Path, home: &Page, sections: &[Section], dry: bool) {
-    let docs = root.join("docs");
+    let src_dir = root.join("mdBook/src");
     let all = std::iter::once(home).chain(sections.iter().flat_map(|s| s.pages.iter()));
     if dry {
         println!("write  book.toml (dry-run)");
-        println!("write  docs/SUMMARY.md (dry-run)");
+        println!("write  mdBook/src/SUMMARY.md (dry-run)");
         for p in all {
-            println!("write  docs/{} (dry-run)", p.dest);
+            println!("write  mdBook/src/{} (dry-run)", p.dest);
         }
         return;
     }
-    let _ = fs::remove_dir_all(&docs);
-    if let Err(e) = fs::create_dir_all(&docs) {
-        eprintln!("host-lifecycle: cannot create {}: {e}", docs.display());
+    let _ = fs::remove_dir_all(&src_dir);
+    if let Err(e) = fs::create_dir_all(&src_dir) {
+        eprintln!("host-lifecycle: cannot create {}: {e}", src_dir.display());
         process::exit(2);
     }
     if let Err(e) = fs::write(root.join("book.toml"), book_toml(root)) {
@@ -5936,7 +5938,7 @@ fn write_book(root: &Path, home: &Page, sections: &[Section], dry: bool) {
     }
     let mut count = 0usize;
     for p in all {
-        let dest = docs.join(&p.dest);
+        let dest = src_dir.join(&p.dest);
         if let Some(parent) = dest.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -5950,22 +5952,23 @@ fn write_book(root: &Path, home: &Page, sections: &[Section], dry: bool) {
         }
         count += 1;
     }
-    if let Err(e) = fs::write(docs.join("SUMMARY.md"), summary_text(home, sections)) {
-        eprintln!("host-lifecycle: cannot write docs/SUMMARY.md: {e}");
+    if let Err(e) = fs::write(src_dir.join("SUMMARY.md"), summary_text(home, sections)) {
+        eprintln!("host-lifecycle: cannot write mdBook/src/SUMMARY.md: {e}");
         process::exit(2);
     }
-    println!("-- wrote book.toml + {count} page(s) + docs/SUMMARY.md");
+    println!("-- wrote book.toml + {count} page(s) + mdBook/src/SUMMARY.md");
 }
 
-/// The mdBook config: `src = "docs"` (never `"."`, which would walk the
-/// un-materialized worktrees — `call/0005`), the house light/navy theme, and
-/// `custom.css` only if the repo ships one. The title is the stamp's `name` (so it
-/// is deterministic regardless of the checkout directory), falling back to the
-/// directory name when the stamp carries none.
+/// The mdBook config: `src = "mdBook/src"` and `build-dir = "mdBook/out"` (the generated source
+/// and HTML consolidated under one gitignored `mdBook/` folder, host-lifecycle#3; never `"."`,
+/// which would walk the un-materialized worktrees — `call/0005`), the house light/navy theme, and
+/// `custom.css` only if the repo ships one. `book.toml` stays at the root, so `mdbook build` still
+/// runs from the root. The title is the stamp's `name` (so it is deterministic regardless of the
+/// checkout directory), falling back to the directory name when the stamp carries none.
 fn book_toml(root: &Path) -> String {
     let title = stamp_title(root);
     let mut s = format!(
-        "[book]\nlanguage = \"en\"\nsrc = \"docs\"\ntitle = \"{title}\"\n\n[output.html]\ndefault-theme = \"light\"\npreferred-dark-theme = \"navy\"\n"
+        "[book]\nlanguage = \"en\"\nsrc = \"mdBook/src\"\ntitle = \"{title}\"\n\n[build]\nbuild-dir = \"mdBook/out\"\n\n[output.html]\ndefault-theme = \"light\"\npreferred-dark-theme = \"navy\"\n"
     );
     if root.join("custom.css").is_file() {
         s.push_str("additional-css = [\"custom.css\"]\n");
@@ -6019,7 +6022,7 @@ fn served_link(dest: &str) -> String {
     }
 }
 
-/// Render `docs/SUMMARY.md`: the home page as a prefix chapter (mdBook's landing),
+/// Render `mdBook/src/SUMMARY.md`: the home page as a prefix chapter (mdBook's landing),
 /// then a `# <part>` header per section with its pages as indented list items in
 /// lifecycle order.
 fn summary_text(home: &Page, sections: &[Section]) -> String {
@@ -8900,18 +8903,61 @@ mod book_tests {
     }
 
     #[test]
-    fn book_toml_scopes_src_to_docs() {
+    fn book_toml_scopes_src_to_mdbook() {
         let base = std::env::temp_dir().join(format!("hl-toml-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let toml = book_toml(&base);
-        assert!(toml.contains("src = \"docs\""), "never src = \".\" (call/0005)");
+        // Generated source and HTML under one gitignored mdBook/ folder (host-lifecycle#3);
+        // never src = "." (call/0005). book.toml stays at root, so mdbook builds from root.
+        assert!(toml.contains("src = \"mdBook/src\""), "src scoped to mdBook/src");
+        assert!(toml.contains("build-dir = \"mdBook/out\""), "build-dir scoped to mdBook/out");
         assert!(!toml.contains("src = \".\""));
         assert!(toml.contains("default-theme = \"light\""));
         // no custom.css → no additional-css line
         assert!(!toml.contains("additional-css"));
         fs::write(base.join("custom.css"), "body{}").unwrap();
         assert!(book_toml(&base).contains("additional-css = [\"custom.css\"]"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // host-lifecycle#3: the generator writes its source under mdBook/src/ and never touches a
+    // project's authored docs/, so a migrating project that keeps documentation in docs/ is safe.
+    #[test]
+    fn write_book_targets_mdbook_dir_and_leaves_docs_intact() {
+        let base = std::env::temp_dir().join(format!("hl-writebook-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        // A pre-existing authored docs/ that must survive untouched.
+        fs::create_dir_all(base.join("docs")).unwrap();
+        fs::write(base.join("docs/authored.md"), "hand-written").unwrap();
+
+        let home = Page {
+            dest: "index.md".to_string(),
+            label: "Home".to_string(),
+            depth: 0,
+            body: PageBody::Inline("# Home\n".to_string()),
+        };
+        let sections = vec![Section {
+            title: "Cast: who".to_string(),
+            room: "cast",
+            required: true,
+            pages: vec![Page {
+                dest: "cast/mara.md".to_string(),
+                label: "Mara".to_string(),
+                depth: 1,
+                body: PageBody::Inline("# Mara\n".to_string()),
+            }],
+        }];
+        write_book(&base, &home, &sections, false);
+
+        assert!(base.join("mdBook/src/SUMMARY.md").is_file(), "SUMMARY lands under mdBook/src");
+        assert!(base.join("mdBook/src/cast/mara.md").is_file(), "pages land under mdBook/src");
+        assert!(base.join("book.toml").is_file(), "book.toml stays at the root");
+        assert!(book_toml(&base).contains("src = \"mdBook/src\""));
+        // The regression: the authored docs/ is never read, cleared, or written.
+        assert!(base.join("docs/authored.md").is_file(), "authored docs/ is left intact");
+        assert!(!base.join("docs/SUMMARY.md").exists(), "nothing is generated into docs/");
         let _ = fs::remove_dir_all(&base);
     }
 
