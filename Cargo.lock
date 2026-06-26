@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "host-lifecycle"
-version = "0.30.2"
+version = "0.30.3"
 dependencies = [
  "host-grammar",
  "host-lint",
@@ -36,8 +36,8 @@ dependencies = [
 
 [[package]]
 name = "host-lint"
-version = "0.10.2"
-source = "git+https://github.com/connollydavid/host-lint?rev=5a9d2c562c24598999f6909efbdcfb029d40a8ec#5a9d2c562c24598999f6909efbdcfb029d40a8ec"
+version = "0.10.4"
+source = "git+https://github.com/connollydavid/host-lint?rev=ce683be96ba8d519e4e1b0c50ad5ee18459aaaa8#ce683be96ba8d519e4e1b0c50ad5ee18459aaaa8"
 dependencies = [
  "host-grammar",
 ]
