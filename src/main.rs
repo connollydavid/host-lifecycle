@@ -6952,15 +6952,22 @@ fn next_version(current: &str, class: &ChangeClass) -> Result<String, String> {
 /// this). Only the first `[package]` version is touched — dependency versions in other
 /// tables are left alone.
 fn set_cargo_version(text: &str, new: &str) -> Option<String> {
-    let mut in_package = false;
+    // Bump `[package] version` if the manifest has one, else `[workspace.package] version` (a virtual
+    // workspace root, e.g. host-reference), so a workspace component bumps through the same path.
+    let target = if has_section_version(text, "[package]") {
+        "[package]"
+    } else {
+        "[workspace.package]"
+    };
+    let mut in_target = false;
     let mut done = false;
     let mut out = String::with_capacity(text.len() + 16);
     for line in text.lines() {
         let t = line.trim();
         if t.starts_with('[') {
-            in_package = t == "[package]";
+            in_target = t == target;
         }
-        if in_package && !done {
+        if in_target && !done {
             if let Some(rest) = t.strip_prefix("version") {
                 if rest.trim_start().starts_with('=') {
                     out.push_str(&format!("version = \"{new}\"\n"));
@@ -6973,6 +6980,25 @@ fn set_cargo_version(text: &str, new: &str) -> Option<String> {
         out.push('\n');
     }
     done.then_some(out)
+}
+
+/// Whether a Cargo.toml has a literal `version = "..."` under the given section header.
+fn has_section_version(text: &str, header: &str) -> bool {
+    let mut in_section = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_section = t == header;
+        }
+        if in_section {
+            if let Some(rest) = t.strip_prefix("version") {
+                if rest.trim_start().starts_with('=') {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// A migrated-escape skip cites a bare `call/NNNN` — never a phase name or a
@@ -7067,23 +7093,37 @@ fn current_version(root: &Path, s: &Software) -> Result<String, String> {
     }
 }
 
-/// Read the `[package] version` from a Cargo.toml (the inverse of `set_cargo_version`).
+/// Read the version from a Cargo.toml (the inverse of `set_cargo_version`). `[package] version` is
+/// preferred; a virtual workspace (a root with no `[package]`) keeps the version in
+/// `[workspace.package]`, so fall back to that, which lets a workspace component release through the
+/// same path as a single-crate one.
 fn cargo_version(text: &str) -> Option<String> {
-    let mut in_package = false;
+    let mut package = None;
+    let mut workspace_package = None;
+    let mut section = "";
     for line in text.lines() {
         let t = line.trim();
         if t.starts_with('[') {
-            in_package = t == "[package]";
+            section = match t {
+                "[package]" => "package",
+                "[workspace.package]" => "workspace",
+                _ => "",
+            };
         }
-        if in_package {
+        if !section.is_empty() {
             if let Some(rest) = t.strip_prefix("version") {
                 if let Some(v) = rest.trim_start().strip_prefix('=') {
-                    return Some(v.trim().trim_matches('"').to_string());
+                    let value = v.trim().trim_matches('"').to_string();
+                    if section == "package" {
+                        package = Some(value);
+                    } else {
+                        workspace_package = Some(value);
+                    }
                 }
             }
         }
     }
-    None
+    package.or(workspace_package)
 }
 
 /// Read the `[package] name` from a Cargo.toml — the crate name, which keys the crate's
@@ -7132,6 +7172,42 @@ fn set_lock_version(lock: &str, crate_name: &str, new: &str) -> Option<String> {
         out.push('\n');
     }
     bumped.then_some(out)
+}
+
+/// Parse the `[workspace] members = [...]` array into member directory paths. Handles a single-line or
+/// multi-line array; the paths carry no brackets, so the first `]` after `members` closes the array.
+fn workspace_members(root_toml: &str) -> Vec<String> {
+    let Some(start) = root_toml.find("members") else { return Vec::new() };
+    let region = &root_toml[start..];
+    let (Some(a), Some(b)) = (region.find('['), region.find(']')) else { return Vec::new() };
+    if b <= a {
+        return Vec::new();
+    }
+    region[a + 1..b]
+        .split('"')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, s)| s.to_string())
+        .collect()
+}
+
+/// Whether a member crate's `[package]` inherits the workspace version (`version.workspace = true`),
+/// so it moves with the `[workspace.package]` bump and its `Cargo.lock` entry must move too.
+fn inherits_workspace_version(member_toml: &str) -> bool {
+    let mut in_package = false;
+    for line in member_toml.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+        }
+        if in_package {
+            let c = t.replace(' ', "");
+            if c.starts_with("version.workspace=true") || c.starts_with("version={workspace=true") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview: bool) {
@@ -7239,15 +7315,33 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     // stale lock (the bump changes the crate's version, which the lock records too).
     let lock_path = work.join("Cargo.lock");
     if let Ok(lock) = fs::read_to_string(&lock_path) {
-        let crate_name = cargo_package_name(&toml).unwrap_or_else(|| s.name.clone());
-        if let Some(updated) = set_lock_version(&lock, &crate_name, &new) {
-            if updated != lock {
-                if let Err(e) = fs::write(&lock_path, updated) {
-                    eprintln!("host-lifecycle: cannot write {}: {e}", lock_path.display());
-                    process::exit(2);
-                }
-                println!("  synced {}/Cargo.lock to {new}", s.name);
+        // A single crate bumps just itself; a virtual workspace bumps every member that inherits the
+        // workspace version, since the [workspace.package] bump moves them all and a stale member
+        // version fails the pinned `--locked` build.
+        let is_workspace =
+            !has_section_version(&toml, "[package]") && has_section_version(&toml, "[workspace.package]");
+        let crates: Vec<String> = if is_workspace {
+            workspace_members(&toml)
+                .into_iter()
+                .filter_map(|m| fs::read_to_string(work.join(&m).join("Cargo.toml")).ok())
+                .filter(|t| inherits_workspace_version(t))
+                .filter_map(|t| cargo_package_name(&t))
+                .collect()
+        } else {
+            vec![cargo_package_name(&toml).unwrap_or_else(|| s.name.clone())]
+        };
+        let mut updated = lock.clone();
+        for crate_name in &crates {
+            if let Some(u) = set_lock_version(&updated, crate_name, &new) {
+                updated = u;
             }
+        }
+        if updated != lock {
+            if let Err(e) = fs::write(&lock_path, updated) {
+                eprintln!("host-lifecycle: cannot write {}: {e}", lock_path.display());
+                process::exit(2);
+            }
+            println!("  synced {}/Cargo.lock to {new} ({} crate(s))", s.name, crates.len());
         }
     }
 
@@ -7642,6 +7736,31 @@ mod tests {
         assert!(bumped.contains("serde = { version = \"1.0\" }"));
         // no [package] version → None (a tool with no crate manifest).
         assert!(set_cargo_version("[workspace]\nmembers = []\n", "1.0.0").is_none());
+    }
+
+    #[test]
+    fn cargo_version_falls_back_to_workspace_package() {
+        // A virtual workspace root (no [package]) keeps the version in [workspace.package]; a
+        // workspace component releases through the same read-and-bump path as a single crate.
+        let toml = "[workspace]\nmembers = [\"crates/cli\"]\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        assert_eq!(cargo_version(toml).as_deref(), Some("0.1.0"));
+        let bumped = set_cargo_version(toml, "0.2.0").unwrap();
+        assert_eq!(cargo_version(&bumped).as_deref(), Some("0.2.0"));
+        assert!(bumped.contains("[workspace.package]"));
+        // a root [package] still wins over [workspace.package] when both are present.
+        let both = "[package]\nname = \"x\"\nversion = \"1.2.3\"\n\n[workspace.package]\nversion = \"9.9.9\"\n";
+        assert_eq!(cargo_version(both).as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn workspace_members_and_inheritance_parse() {
+        let root = "[workspace]\nresolver = \"2\"\nmembers = [\"crates/core\", \"crates/cli\"]\n\n[workspace.package]\nversion = \"0.1.0\"\n";
+        assert_eq!(workspace_members(root), vec!["crates/core", "crates/cli"]);
+        // a member that inherits the workspace version moves with the bump …
+        assert!(inherits_workspace_version("[package]\nname = \"c\"\nversion.workspace = true\n"));
+        assert!(inherits_workspace_version("[package]\nname = \"c\"\nversion = { workspace = true }\n"));
+        // … one with a literal version does not.
+        assert!(!inherits_workspace_version("[package]\nname = \"c\"\nversion = \"2.0.0\"\n"));
     }
 
     #[test]
