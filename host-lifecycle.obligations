@@ -19,33 +19,38 @@ transition-rejected.Check.status     => structural
 transition-terminal.Check.status     => structural
 
 # --- HAZARD rules (behavioural) ---
-rule-success.DetectOffPin                        => test:host_root_escape_is_detected
-rule-failure.DetectOffPin.1                      => test:materialize_then_check_roundtrip
-rule-entity-creation.DetectOffPin.1              => test:host_root_escape_is_detected
-rule-success.DetectArtifactNotReproducible       => test:provenance_attestation_and_exemption
-rule-failure.DetectArtifactNotReproducible.1     => test:provenance_attestation_and_exemption
-rule-entity-creation.DetectArtifactNotReproducible.1 => test:provenance_attestation_and_exemption
-rule-success.DetectUnreproducedArtifact          => test:provenance_attestation_and_exemption
-rule-failure.DetectUnreproducedArtifact.1        => test:provenance_attestation_and_exemption
-rule-entity-creation.DetectUnreproducedArtifact.1 => test:provenance_attestation_and_exemption
-rule-success.DetectStaleReceipt                  => test:staleness_detects_an_input_change
-rule-failure.DetectStaleReceipt.1                => test:receipts_parse_and_latest_wins
-rule-entity-creation.DetectStaleReceipt.1        => test:staleness_detects_an_input_change
-rule-success.DetectDepsBundleDrift               => test:deps_bundle_drift_is_detected
-rule-failure.DetectDepsBundleDrift.1             => test:deps_bundle_drift_is_detected
-rule-entity-creation.DetectDepsBundleDrift.1     => test:deps_bundle_drift_is_detected
+# Each `test:` carries an `exercises=<symbol>` link to the entrypoint the discharging
+# test drives, checked by `obligations --strict-discharge` (plan/0052, no-hollow-green):
+# a named test that does not reference the symbol does not exercise the rule. This is
+# where the plan/0051 review found the hole — the off-pin and verdict obligations were
+# pointed at `host_root_escape_is_detected`, a pure helper test that never drove the gate.
+rule-success.DetectOffPin                        => test:off_pin_worktree_hazards_the_check exercises=software_check
+rule-failure.DetectOffPin.1                      => test:materialize_then_check_roundtrip exercises=software_check
+rule-entity-creation.DetectOffPin.1              => test:off_pin_worktree_hazards_the_check exercises=software_check
+rule-success.DetectArtifactNotReproducible       => test:provenance_attestation_and_exemption exercises=provenance_problems
+rule-failure.DetectArtifactNotReproducible.1     => test:provenance_attestation_and_exemption exercises=provenance_problems
+rule-entity-creation.DetectArtifactNotReproducible.1 => test:provenance_attestation_and_exemption exercises=provenance_problems
+rule-success.DetectUnreproducedArtifact          => test:unreproduced_artifact_is_detected exercises=artifact_reproduces
+rule-failure.DetectUnreproducedArtifact.1        => test:unreproduced_artifact_is_detected exercises=artifact_reproduces
+rule-entity-creation.DetectUnreproducedArtifact.1 => test:unreproduced_artifact_is_detected exercises=artifact_reproduces
+rule-success.DetectStaleReceipt                  => test:staleness_detects_an_input_change exercises=staleness_problems
+rule-failure.DetectStaleReceipt.1                => test:staleness_detects_an_input_change exercises=staleness_problems
+rule-entity-creation.DetectStaleReceipt.1        => test:staleness_detects_an_input_change exercises=staleness_problems
+rule-success.DetectDepsBundleDrift               => test:deps_bundle_drift_is_detected exercises=provenance_problems
+rule-failure.DetectDepsBundleDrift.1             => test:deps_bundle_drift_is_detected exercises=provenance_problems
+rule-entity-creation.DetectDepsBundleDrift.1     => test:deps_bundle_drift_is_detected exercises=provenance_problems
 
 # --- Verdict lifecycle (behavioural — clean/hazarded exit) ---
-transition-edge.Check.checking.clean    => test:materialize_then_check_roundtrip
-transition-edge.Check.checking.hazarded => test:host_root_escape_is_detected
-rule-success.RecordHazard               => test:host_root_escape_is_detected
-rule-success.VerdictHazarded            => test:host_root_escape_is_detected
-rule-failure.VerdictHazarded.1          => test:materialize_then_check_roundtrip
-rule-success.VerdictClean               => test:materialize_then_check_roundtrip
-rule-failure.VerdictClean.1             => test:host_root_escape_is_detected
+transition-edge.Check.checking.clean    => test:materialize_then_check_roundtrip exercises=software_check
+transition-edge.Check.checking.hazarded => test:off_pin_worktree_hazards_the_check exercises=software_check
+rule-success.RecordHazard               => test:off_pin_worktree_hazards_the_check exercises=software_check
+rule-success.VerdictHazarded            => test:off_pin_worktree_hazards_the_check exercises=software_check
+rule-failure.VerdictHazarded.1          => test:materialize_then_check_roundtrip exercises=software_check
+rule-success.VerdictClean               => test:materialize_then_check_roundtrip exercises=software_check
+rule-failure.VerdictClean.1             => test:off_pin_worktree_hazards_the_check exercises=software_check
 rule-success.StartCheck                 => waived: lifecycle entry — a check unconditionally enters `checking`; no observable assertion
 
 # --- Invariants (behavioural) ---
-invariant.ArtifactImpliesToolchain      => test:provenance_attestation_and_exemption
-invariant.ReceiptsReDerive              => test:record_layer_segregated_and_marked
-invariant.HazardBlocksClean             => test:host_root_escape_is_detected
+invariant.ArtifactImpliesToolchain      => test:provenance_attestation_and_exemption exercises=provenance_problems
+invariant.ReceiptsReDerive              => test:staleness_detects_an_input_change exercises=staleness_problems
+invariant.HazardBlocksClean             => test:off_pin_worktree_hazards_the_check exercises=software_check

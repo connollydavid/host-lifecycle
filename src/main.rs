@@ -3155,7 +3155,14 @@ fn software(args: &[String]) {
     }
     match mode {
         "materialize" => software_materialize(&root, &recipe),
-        "check" => software_check(&root, &recipe),
+        "check" => {
+            let bad = software_check(&root, &recipe);
+            if bad > 0 {
+                eprintln!("-- {bad} item(s) need attention");
+                process::exit(1);
+            }
+            println!("-- all components at their pinned SHA; no worktree-symlink hazards");
+        }
         "verify-build" => software_verify_build(&root, &recipe),
         "install-hooks" => software_install_hooks(&root, &recipe),
         "teardown" => software_teardown(&root, &recipe, force),
@@ -3404,6 +3411,15 @@ fn run_build_in_container(runtime: &str, image: &str, build: &str, src: &Path, o
 /// escape clause for not-yet-reproducible migrated software (issue #10).
 fn software_verify_build(root: &Path, recipe: &[Software]) {
     let mut bad = 0usize;
+    // plan/0052 (no-hollow-green): three states the summary and the exit code must agree
+    // on — VERIFIED (rebuilt and matched), DEFERRED/EXEMPT (legitimately not checked here),
+    // and UNVERIFIABLE (in scope here but the lane could not run). The clean attestation is
+    // printed only when a build was actually verified and none was UNVERIFIABLE; an
+    // all-skipped or could-not-check run never reports clean.
+    let mut verified = 0usize;
+    let mut deferred = 0usize;
+    let mut exempt = 0usize;
+    let mut unverifiable = 0usize;
     let host = std::env::consts::OS;
     for s in recipe {
         let bare = store_dir(root, &s.name);
@@ -3420,13 +3436,15 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
             // toolchain here) — skipped like an exemption, not failed.
             if let Some(ah) = b.attest_host {
                 if ah != host {
-                    println!("skip     {tag} reproduces on {ah} (host is {host})");
+                    println!("DEFERRED {tag} reproduces on {ah} (host is {host}) — verified there, not here");
+                    deferred += 1;
                     continue;
                 }
             }
             if let Some(cite) = b.repro_exempt {
                 if cited_decision_exists(root, cite) {
-                    println!("warn     {tag} repro-exempt ({cite}) — rebuild comparison skipped");
+                    println!("EXEMPT   {tag} repro-exempt ({cite}) — rebuild comparison skipped");
+                    exempt += 1;
                 } else {
                     println!("DRIFT    {tag} repro-exempt cites missing decision {cite}");
                     bad += 1;
@@ -3444,11 +3462,13 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
             // Honor each component's own recorded image verbatim (no version is
             // imposed). With no pin or no runtime, skip clearly — never ambient-build.
             let Some(image) = b.toolchain else {
-                println!("skip     {tag} no `toolchain` pin — cannot verify in a pinned environment (software --check flags this)");
+                println!("UNVERIFIABLE {tag} — no `toolchain` pin; cannot verify in a pinned environment. Record a toolchain, or run on the attest-host (software --check also flags this)");
+                unverifiable += 1;
                 continue;
             };
             let Some(runtime) = container_runtime() else {
-                println!("skip     {tag} no container runtime (docker/podman) — cannot verify in the recorded toolchain {image}");
+                println!("UNVERIFIABLE {tag} — no container runtime (docker/podman); cannot rebuild in the recorded toolchain {image}. Install docker or podman, or run on the attest-host");
+                unverifiable += 1;
                 continue;
             };
             if !bare.is_dir() {
@@ -3487,14 +3507,14 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
                 println!("ERROR    {tag} — build failed in {runtime} {image}: `{build}`");
                 bad += 1;
             } else {
-                match sha256_file(&work.join(path)) {
-                    Some(h) if &h == sha => println!("ok       {tag} rebuild reproduces {path} @ {} (in {image})", short(sha)),
-                    Some(h) => {
-                        println!("DRIFT    {tag} rebuild is {} but recorded {} — NOT reproducible", short(&h), short(sha));
-                        bad += 1;
+                let rebuilt = sha256_file(&work.join(path));
+                match artifact_reproduces(rebuilt.as_deref(), sha) {
+                    Ok(()) => {
+                        println!("ok       {tag} rebuild reproduces {path} @ {} (in {image})", short(sha));
+                        verified += 1;
                     }
-                    None => {
-                        println!("ERROR    {tag} — built artifact {path} not found");
+                    Err(reason) => {
+                        println!("DRIFT    {tag} {reason}");
                         bad += 1;
                     }
                 }
@@ -3507,7 +3527,31 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
         eprintln!("-- {bad} build(s) failed reproducibility verification");
         process::exit(1);
     }
-    println!("-- every non-exempt build reproduces its recorded artifact");
+    // No-hollow-green: never attest what was not checked. An in-scope build the lane
+    // could not run (UNVERIFIABLE) makes the run incomplete; the clean line is printed
+    // only when a build was actually verified here and none was UNVERIFIABLE.
+    if unverifiable > 0 {
+        eprintln!("-- verify-build INCOMPLETE: {verified} verified, {deferred} deferred, {exempt} exempt, {unverifiable} UNVERIFIABLE — reproducibility NOT attested");
+        process::exit(1);
+    }
+    if verified > 0 {
+        println!("-- {verified} build(s) reproduced their recorded artifact ({deferred} deferred, {exempt} exempt)");
+    } else {
+        println!("-- 0 builds verified here ({deferred} deferred to other hosts, {exempt} exempt); nothing to attest");
+    }
+}
+
+/// The reproducibility verdict for a rebuilt artifact: `Ok` when the rebuilt hash equals
+/// the recorded one, `Err(reason)` (a DRIFT) otherwise, and `Err` for a missing artifact.
+/// Pure, so the unreproduced-artifact detection is unit-testable without a container
+/// rebuild (plan/0051 finding 4 — the rule was dispositioned to a test that asserted it
+/// did NOT bite, so a regression accepting a non-matching rebuild would have stayed green).
+fn artifact_reproduces(rebuilt: Option<&str>, recorded: &str) -> Result<(), String> {
+    match rebuilt {
+        Some(h) if h == recorded => Ok(()),
+        Some(h) => Err(format!("rebuild is {} but recorded {} — NOT reproducible", short(h), short(recorded))),
+        None => Err("built artifact not found at the recorded path".to_string()),
+    }
 }
 
 /// Read `.host-software` from the repo root, exiting if it is absent.
@@ -4058,7 +4102,11 @@ fn upgrade_claim_problems(root: &Path) -> usize {
     bad
 }
 
-fn software_check(root: &Path, recipe: &[Software]) {
+/// Returns the count of hazards (`bad`); the caller settles the verdict and exits.
+/// Returning the count rather than calling `process::exit` here makes the hazarded
+/// verdict observable in a test (plan/0051 finding 3 — the off-pin HAZARD was untestable
+/// while this exited in place).
+fn software_check(root: &Path, recipe: &[Software]) -> usize {
     let mut bad = 0usize;
     for s in recipe {
         let bare = store_dir(root, &s.name);
@@ -4204,11 +4252,7 @@ fn software_check(root: &Path, recipe: &[Software]) {
     // plan/0042: the receipted task graph — structural problems (parse, graph, reference)
     // and the per-task receipt gate. Inert until a plan adopts the anchored-task form.
     bad += task_check_problems(root);
-    if bad > 0 {
-        eprintln!("-- {bad} item(s) need attention");
-        process::exit(1);
-    }
-    println!("-- all components at their pinned SHA; no worktree-symlink hazards");
+    bad
 }
 
 /// The receipt gate over `software --check` (plan/0025): load the manifest the
@@ -4697,6 +4741,7 @@ fn obligations(args: &[String]) {
     let mut prove_arg: Option<&String> = None;
     let mut rederive_arg: Option<&String> = None;
     let mut record_digests_flag = false;
+    let mut strict_discharge = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -4717,12 +4762,13 @@ fn obligations(args: &[String]) {
                 i += 1;
             }
             "--record-digests" => record_digests_flag = true,
+            "--strict-discharge" => strict_discharge = true,
             _ => pos.push(&args[i]),
         }
         i += 1;
     }
     let Some(spec) = pos.first() else {
-        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>] [--prove <dir>] [--rederive <dir>] [--record-digests]");
+        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>] [--prove <dir>] [--rederive <dir>] [--record-digests] [--strict-discharge]");
         process::exit(2);
     };
     if record_digests_flag && rederive_arg.is_none() {
@@ -4787,15 +4833,162 @@ fn obligations(args: &[String]) {
         let base = manifest.parent().unwrap_or(Path::new("."));
         problems.extend(staleness_problems(&dispositions, base, &ledger));
     }
+    // plan/0052 (no-hollow-green): the strengthened `test:` discharge link. Advisory
+    // by default so a tool bump never reds an adopter's green ladder; HAZARD under
+    // `--strict-discharge`, which host-lifecycle's own CI runs to keep the dogfood honest.
+    let discharge_warns = discharge_warnings(&plan_ids, &dispositions, tests.as_deref());
+    if strict_discharge {
+        problems.extend(discharge_warns);
+    } else {
+        for w in &discharge_warns {
+            println!("warning: {w}  (advisory; HAZARD under --strict-discharge)");
+        }
+    }
     for p in &problems {
         println!("{p}");
     }
     if !problems.is_empty() {
-        eprintln!("-- {} obligation(s) undispositioned, stale, missing a test, or UNPROVEN ({})", problems.len(), manifest.display());
+        eprintln!("-- {} obligation(s) undispositioned, stale, missing a test, unlinked, or UNPROVEN ({})", problems.len(), manifest.display());
         process::exit(1);
     }
     let mode = if rederive_arg.is_some() { "dispositioned; rungs re-derived" } else { "dispositioned" };
     println!("-- all {} obligation(s) {mode}", plan_ids.len());
+}
+
+/// How a `test:<name>` disposition resolves against the concatenated test source.
+enum TestRef<'a> {
+    /// No `fn <name>(` definition (a substring of the name may still occur).
+    Absent,
+    /// More than one `fn <name>(` definition — the disposition is ambiguous.
+    Ambiguous(usize),
+    /// Exactly one definition; `body` is its brace-matched body and `ignored` is true
+    /// when an `#[ignore]` attribute sits on it (an ignored test never runs under
+    /// `cargo test`, so it discharges nothing).
+    Found { body: &'a str, ignored: bool },
+}
+
+/// Resolve `test:<name>` to its definition in `src` by an exact `fn <name>(` match,
+/// not a substring. A name that only occurs inside another identifier no longer
+/// counts (the plan/0051 hole: `host_root_escape_is_detected` substring-matched while
+/// driving nothing), and two definitions are `Ambiguous`. The body is brace-matched
+/// from the first `{` after the signature; brace counting is a static heuristic and
+/// can over-read a body that embeds `{`/`}` in a string, which is acceptable for the
+/// `exercises=` containment check below.
+fn resolve_test<'a>(src: &'a str, name: &str) -> TestRef<'a> {
+    let needle = format!("fn {name}(");
+    let mut hits = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(&needle) {
+        let at = from + rel;
+        let boundary = src[..at].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if boundary {
+            hits.push(at);
+        }
+        from = at + needle.len();
+    }
+    match hits.len() {
+        0 => TestRef::Absent,
+        1 => {
+            // `#[ignore]` sits on one of the few attribute lines just above the `fn`.
+            let ignored = src[..hits[0]].lines().rev().take(5).any(|l| l.contains("#[ignore"));
+            match src[hits[0]..].find('{') {
+                None => TestRef::Found { body: "", ignored },
+                Some(rel) => {
+                    let bopen = hits[0] + rel;
+                    let mut depth = 0i32;
+                    let mut end = src.len();
+                    for (k, &b) in src.as_bytes()[bopen..].iter().enumerate() {
+                        if b == b'{' {
+                            depth += 1;
+                        } else if b == b'}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = bopen + k + 1;
+                                break;
+                            }
+                        }
+                    }
+                    TestRef::Found { body: &src[bopen..end], ignored }
+                }
+            }
+        }
+        n => TestRef::Ambiguous(n),
+    }
+}
+
+/// The obligation kinds the spec's own `allium check`/`analyse` lane discharges
+/// (field presence, enum comparability, surface shape, declared transition graph),
+/// taken from the obligation id prefix. A `structural` disposition is legitimate only
+/// for one of these; on a behavioural kind it is the relabel-dodge below.
+fn is_behavioural_kind(id: &str) -> bool {
+    let kind = id.split('.').next().unwrap_or("");
+    matches!(kind, "rule-success" | "rule-failure" | "rule-entity-creation" | "invariant" | "transition-edge")
+}
+
+/// The strengthened-discharge WARNINGS (plan/0052, no-hollow-green). These are
+/// ADVISORY by default and escalate to HAZARD under `--strict-discharge`, so the
+/// tightening of a shared gate reaches adopters warn-then-retire rather than turning a
+/// green ladder red on a tool bump. The existing `obligation_gaps` substring HAZARD is
+/// left intact beneath this.
+///
+/// For a `test:<name> [exercises=<tok>,<tok>]` disposition, with test sources:
+/// `AMBIGUOUS` (the name matches more than one definition), `HOLLOW` (an `exercises=`
+/// token the discharging test must reference is absent from its body, the bite that
+/// catches a test pointed at the wrong code), or `UNLINKED` (no `exercises=` declared
+/// yet, the staged requirement). Two escapes are also closed, so hardening `test:` does
+/// not just move the hole (the weak-agent relabel route): `RELABEL` (a behavioural
+/// obligation dispositioned `structural`, which the analyse lane does not discharge) and
+/// `UNWAIVED` (a `waived:` with no reason). Whether `waived:` needs a recorded-decision
+/// citation is a probe question — a software repo has no `call/` to cite. Pure, so it is
+/// unit-tested.
+fn discharge_warnings(plan_ids: &[String], dispositions: &[(String, String)], tests: Option<&str>) -> Vec<String> {
+    let mut warns = Vec::new();
+    for id in plan_ids {
+        let Some((_, disp)) = dispositions.iter().find(|(k, _)| k == id) else { continue };
+        if let Some(rest) = disp.strip_prefix("test:") {
+            let Some(src) = tests else { continue };
+            let mut toks = rest.split_whitespace();
+            let Some(name) = toks.next().filter(|n| !n.is_empty()) else { continue };
+            let exercises: Vec<&str> = toks
+                .filter_map(|t| t.strip_prefix("exercises="))
+                .flat_map(|v| v.split(','))
+                .filter(|s| !s.is_empty())
+                .collect();
+            match resolve_test(src, name) {
+                // A genuine absence is already a HAZARD in obligation_gaps; warn only on
+                // the looser case where a substring matched but no real definition does.
+                TestRef::Absent if src.contains(name) => {
+                    warns.push(format!("UNLINKED {id} — `test:{name}` matches no `fn {name}(` definition (substring only)"));
+                }
+                TestRef::Absent => {}
+                TestRef::Ambiguous(n) => {
+                    warns.push(format!("AMBIGUOUS {id} — `test:{name}` matches {n} definitions; name the one that drives the rule"));
+                }
+                TestRef::Found { ignored: true, .. } => {
+                    warns.push(format!("IGNORED  {id} — `test:{name}` is #[ignore]'d; an ignored test never runs and discharges nothing"));
+                }
+                TestRef::Found { .. } if exercises.is_empty() => {
+                    warns.push(format!("UNLINKED {id} — `test:{name}` declares no `exercises=` link to the rule it discharges"));
+                }
+                TestRef::Found { body, .. } => {
+                    for tok in &exercises {
+                        if !body.contains(tok) {
+                            warns.push(format!("HOLLOW   {id} — `test:{name}` does not reference `{tok}` (declared via exercises=); it may not exercise the rule"));
+                        }
+                    }
+                }
+            }
+        } else if disp == "structural" {
+            if is_behavioural_kind(id) {
+                warns.push(format!("RELABEL  {id} — `structural` on a behavioural obligation the analyse lane does not discharge; disposition it `test:` (do not relabel to dodge)"));
+            }
+        } else if let Some(reason) = disp.strip_prefix("waived:") {
+            if reason.trim().is_empty() {
+                warns.push(format!("UNWAIVED {id} — `waived:` with no reason; record why the obligation is not discharged"));
+            }
+        }
+    }
+    warns
 }
 
 /// The disposition gaps between the derived obligations and the manifest:
@@ -4814,8 +5007,9 @@ fn obligation_gaps(
         match dispositions.iter().find(|(k, _)| k == id) {
             None => problems.push(format!("MISSING  {id} — no disposition")),
             Some((_, disp)) => {
-                if let (Some(name), Some(src)) = (disp.strip_prefix("test:"), tests) {
-                    let name = name.trim();
+                if let (Some(rest), Some(src)) = (disp.strip_prefix("test:"), tests) {
+                    // The name is the first token; `exercises=` and other suffixes follow it.
+                    let name = rest.split_whitespace().next().unwrap_or("");
                     if !name.is_empty() && !src.contains(name) {
                         problems.push(format!("ABSENT   {id} — `test:{name}` not in the test sources"));
                     }
@@ -8156,6 +8350,64 @@ mod software_tests {
         assert!(!obligation_gaps(&ids, &m, None, Some("fn other() {}")).is_empty());
     }
 
+    // plan/0052 (no-hollow-green): the strengthened `test:` discharge link. The
+    // confirmed hole was a disposition pointed at a test that drives nothing; the
+    // `exercises=` token must occur in the named test's body, the name must resolve to
+    // exactly one definition, and an unlinked or substring-only `test:` is flagged.
+    #[test]
+    fn discharge_warnings_catch_hollow_unlinked_and_ambiguous() {
+        let src = "fn a_drives() { let _ = software_check(&p); }\n\
+                   fn b_helper_only() { assert!(escapes_root(\"x\")); }\n";
+        // HOLLOW: b declares it drives software_check but its body references only a helper.
+        let ids = vec!["r.A".to_string(), "r.B".to_string()];
+        let m = parse_obligation_manifest(
+            "r.A => test:a_drives exercises=software_check\n\
+             r.B => test:b_helper_only exercises=software_check\n",
+        );
+        let w = discharge_warnings(&ids, &m, Some(src));
+        assert!(w.iter().any(|x| x.contains("HOLLOW") && x.contains("r.B")), "{w:?}");
+        assert!(!w.iter().any(|x| x.contains("r.A")), "a linked test must not warn: {w:?}");
+
+        // UNLINKED: a `test:` with no `exercises=` is the staged requirement.
+        let m2 = parse_obligation_manifest("r.A => test:a_drives\n");
+        let w2 = discharge_warnings(&["r.A".to_string()], &m2, Some(src));
+        assert!(w2.iter().any(|x| x.contains("UNLINKED") && x.contains("r.A")), "{w2:?}");
+
+        // AMBIGUOUS: two definitions of the same name.
+        let dup = "fn a_drives() {}\nfn a_drives() {}\n";
+        let w3 = discharge_warnings(&["r.A".to_string()], &m2, Some(dup));
+        assert!(w3.iter().any(|x| x.contains("AMBIGUOUS")), "{w3:?}");
+
+        // substring-only: a name that is not a real definition, only a substring, is
+        // flagged UNLINKED rather than silently passing (the plan/0051 hole).
+        let sub = "fn a_drives_extra() {}\n";
+        let w4 = discharge_warnings(&["r.A".to_string()], &m2, Some(sub));
+        assert!(w4.iter().any(|x| x.contains("UNLINKED") && x.contains("substring only")), "{w4:?}");
+
+        // IGNORED: a discharging test that is #[ignore]'d never runs, so it discharges nothing.
+        let ign_src = "#[test]\n#[ignore]\nfn a_drives() { let _ = software_check(&p); }\n";
+        let w_ign = discharge_warnings(&["r.A".to_string()], &m2, Some(ign_src));
+        assert!(w_ign.iter().any(|x| x.contains("IGNORED") && x.contains("r.A")), "{w_ign:?}");
+
+        // no test sources supplied: the `test:` checks are skipped (offline/cheap path).
+        assert!(discharge_warnings(&ids, &m, None).is_empty());
+
+        // RELABEL: a behavioural obligation dispositioned `structural` is the relabel dodge.
+        let relabel = parse_obligation_manifest("rule-success.X => structural\n");
+        let w5 = discharge_warnings(&["rule-success.X".to_string()], &relabel, None);
+        assert!(w5.iter().any(|x| x.contains("RELABEL")), "{w5:?}");
+        // a genuinely structural obligation dispositioned `structural` is fine.
+        let ok = parse_obligation_manifest("entity-fields.Y => structural\n");
+        assert!(discharge_warnings(&["entity-fields.Y".to_string()], &ok, None).is_empty());
+
+        // UNWAIVED: an empty waiver reason is flagged; a real reason (StartCheck) is not.
+        let empty = parse_obligation_manifest("rule-success.Z => waived:\n");
+        let w6 = discharge_warnings(&["rule-success.Z".to_string()], &empty, None);
+        assert!(w6.iter().any(|x| x.contains("UNWAIVED")), "{w6:?}");
+        let reasoned = parse_obligation_manifest("rule-success.Z => waived: lifecycle entry, no observable assertion\n");
+        assert!(discharge_warnings(&["rule-success.Z".to_string()], &reasoned, None).is_empty());
+    }
+
     // `--rederive` (call/0018): discharge is the verifier PASSING at the declared bound,
     // re-run via host-prove — not name-presence. The verdict-interpretation is pure.
     #[test]
@@ -8532,8 +8784,8 @@ mod software_tests {
         let canon = host.join("software").join("demo").join("main");
         assert!(canon.is_dir(), "canonical worktree created");
         assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
-        // check passes (returns without process::exit on a matching pin)
-        software_check(&host, &recipe);
+        // A clean check is clean (VerdictClean): a matching pin yields no hazard.
+        assert_eq!(software_check(&host, &recipe), 0, "matching pin is clean");
 
         // Re-materialize after the worktree is removed: `worktree prune` clears the
         // stale admin entry, so the canonical is re-created rather than hard-failing
@@ -8545,6 +8797,62 @@ mod software_tests {
         assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0051 finding 3 / plan/0052: a materialized worktree moved OFF its pin must be
+    // detected (DetectOffPin) and make the check HAZARDED (VerdictHazarded,
+    // HazardBlocksClean, RecordHazard) — observable now that software_check returns its
+    // hazard count. This is the test the off-pin and hazarded-verdict obligations were
+    // mis-pointed away from (a pure helper that never drove the gate).
+    #[test]
+    fn off_pin_worktree_hazards_the_check() {
+        let base = std::env::temp_dir().join(format!("hl-offpin-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let host = base.join("host");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        let g = |cwd: &Path, args: &[&str]| assert!(git_ok(cwd, args), "git {args:?} failed");
+        g(&src, &["init", "-q", "-b", "main"]);
+        g(&src, &["config", "user.email", "t@t"]);
+        g(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("readme.txt"), "seed").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "seed"]);
+        let pin = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+        let recipe = vec![Software {
+            name: "demo".to_string(),
+            url: src.to_string_lossy().to_string(),
+            pin: pin.clone(),
+            branch: "main".to_string(),
+            worktrees: Vec::new(),
+            lines: Vec::new(),
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        }];
+        software_materialize(&host, &recipe);
+        let canon = host.join("software").join("demo").join("main");
+        // At the pin: clean (the rule's precondition is not met — DetectOffPin.1 failure).
+        assert_eq!(software_check(&host, &recipe), 0, "a matching pin is clean");
+        // Move the worktree off its pin by committing ahead of it.
+        g(&canon, &["config", "user.email", "t@t"]);
+        g(&canon, &["config", "user.name", "t"]);
+        fs::write(canon.join("readme.txt"), "drifted").unwrap();
+        g(&canon, &["add", "-A"]);
+        g(&canon, &["commit", "-qm", "drift"]);
+        // HEAD != pin: DetectOffPin fires, the hazard blocks a clean verdict.
+        assert!(software_check(&host, &recipe) > 0, "an off-pin worktree must hazard the check");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0051 finding 4 / plan/0052: DetectUnreproducedArtifact. A rebuild whose hash
+    // differs from the recorded artifact is detected, not silently accepted. The container
+    // rebuild is integration-tested by --verify-build; this unit-tests the verdict so a
+    // regression that accepted a non-matching rebuild cannot pass the suite green.
+    #[test]
+    fn unreproduced_artifact_is_detected() {
+        assert!(artifact_reproduces(Some("aaaa"), "aaaa").is_ok(), "a matching rebuild reproduces");
+        assert!(artifact_reproduces(Some("aaaa"), "bbbb").is_err(), "a non-matching rebuild must be detected");
+        assert!(artifact_reproduces(None, "aaaa").is_err(), "a missing artifact must be an error");
     }
 
     // plan/0029: `--teardown` removes a clean, fully-pushed component (it re-materializes
