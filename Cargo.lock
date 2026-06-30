@@ -36,8 +36,8 @@ dependencies = [
 
 [[package]]
 name = "host-lint"
-version = "0.11.0"
-source = "git+https://github.com/connollydavid/host-lint?rev=cefc9376ca20b6f0b8d11960f54661b43c1b0220#cefc9376ca20b6f0b8d11960f54661b43c1b0220"
+version = "0.12.0"
+source = "git+https://github.com/connollydavid/host-lint?rev=78bd526fccfb845cf77331e5aa11e089dfd90b60#78bd526fccfb845cf77331e5aa11e089dfd90b60"
 dependencies = [
  "host-grammar",
 ]
