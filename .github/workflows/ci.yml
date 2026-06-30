@@ -33,7 +33,7 @@ jobs:
             name: host-lifecycle-windows-arm64.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install musl toolchain
         if: contains(matrix.target, 'musl')
         run: |
@@ -58,7 +58,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Test
         run: cargo test --verbose
       - name: Clippy
@@ -67,7 +67,7 @@ jobs:
   allium:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install allium-cli (pinned 3.4.2)
         run: cargo install allium-cli --version 3.4.2
       - name: allium check
@@ -88,7 +88,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Download all binaries
         uses: actions/download-artifact@v4
         with:
