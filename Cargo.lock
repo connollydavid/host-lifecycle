@@ -19,8 +19,8 @@ dependencies = [
 
 [[package]]
 name = "host-grammar"
-version = "0.3.0"
-source = "git+https://github.com/connollydavid/host-grammar?rev=9d51468ab1f0a7e253cd2ee7d149d7325e65f47b#9d51468ab1f0a7e253cd2ee7d149d7325e65f47b"
+version = "0.4.0"
+source = "git+https://github.com/connollydavid/host-grammar?rev=9470b81c9c851b0fedc872203437ea0de60b7f62#9470b81c9c851b0fedc872203437ea0de60b7f62"
 dependencies = [
  "pulldown-cmark",
  "unicode-segmentation",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "host-lifecycle"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "host-grammar",
  "host-lint",
@@ -36,8 +36,8 @@ dependencies = [
 
 [[package]]
 name = "host-lint"
-version = "0.10.4"
-source = "git+https://github.com/connollydavid/host-lint?rev=ce683be96ba8d519e4e1b0c50ad5ee18459aaaa8#ce683be96ba8d519e4e1b0c50ad5ee18459aaaa8"
+version = "0.11.0"
+source = "git+https://github.com/connollydavid/host-lint?rev=cefc9376ca20b6f0b8d11960f54661b43c1b0220#cefc9376ca20b6f0b8d11960f54661b43c1b0220"
 dependencies = [
  "host-grammar",
 ]

@@ -1,13 +1,13 @@
 [package]
 name = "host-lifecycle"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 description = "Token-free lifecycle tool for an agentic project — scaffolds milestones, decisions, and personas, and validates the tree."
 license = "Unlicense"
 
 [dependencies]
-host-grammar = { git = "https://github.com/connollydavid/host-grammar", rev = "9d51468ab1f0a7e253cd2ee7d149d7325e65f47b" }
-host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "ce683be96ba8d519e4e1b0c50ad5ee18459aaaa8" }
+host-grammar = { git = "https://github.com/connollydavid/host-grammar", rev = "9470b81c9c851b0fedc872203437ea0de60b7f62" }
+host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "cefc9376ca20b6f0b8d11960f54661b43c1b0220" }
 
 # Reproducible builds: strip symbols and the .comment section (which embed the build
 # host's toolchain/distro). Combined with --build-id=none (.cargo/config.toml), the
