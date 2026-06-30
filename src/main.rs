@@ -869,7 +869,14 @@ fn collect_files(dir: &Path, root: &Path, subs: &[String], out: &mut Vec<PathBuf
     for e in rd.filter_map(|e| e.ok()) {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
-        if p.is_dir() {
+        // Take the type from the DirEntry, which does NOT follow symlinks, and skip symlinks
+        // (issue #24) as the sibling `tracked_markdown` does: a symlink out of the tree must
+        // not be classified by its target or descended into.
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
             if matches!(name.as_str(), ".git" | "target" | "node_modules" | "vendor") {
                 continue;
             }
@@ -885,7 +892,7 @@ fn collect_files(dir: &Path, root: &Path, subs: &[String], out: &mut Vec<PathBuf
                 }
             }
             collect_files(&p, root, subs, out);
-        } else if p.is_file() {
+        } else if ft.is_file() {
             out.push(p);
         }
     }
@@ -1354,6 +1361,8 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
     let mut members: Vec<String> = Vec::new();
     let mut drivers: Vec<String> = Vec::new();
     let mut stanza_count = 0usize;
+    let mut v_stanza_count = 0usize;
+    let mut drivers_seen = false;
     let (mut e_member, mut e_document, mut e_restates) = (None::<String>, None::<String>, None::<String>);
     let mut section = ""; // "software" | "verification" | "entrance" | ""
     let mut current_member = String::new();
@@ -1380,6 +1389,7 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
                 problems.push(format!("the entrance stanza is `[entrance]`, not a sub-named section like `{t}`"));
                 "entrance"
             } else if t == "[verification]" {
+                v_stanza_count += 1;
                 "verification"
             } else {
                 ""
@@ -1395,7 +1405,20 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
             ("software", "entrance" | "front-door") if val.eq_ignore_ascii_case("true") => {
                 problems.push(format!("the per-member `{key} = true` entrance marker is retired (plan/0043); declare an `[entrance]` stanza naming `{current_member}`"));
             }
-            ("verification", "drivers") => drivers = split(val),
+            // issue #14: the verifier set is a singleton, so a repeated `drivers` key (last-wins)
+            // or an empty value silently disarms the reconcile coverage check; flag both, the way
+            // the `[entrance]` stanza guards `member`/`restates`.
+            ("verification", "drivers") => {
+                if drivers_seen {
+                    problems.push("the `[verification]` stanza names `drivers` more than once".into());
+                }
+                drivers_seen = true;
+                let parsed = split(val);
+                if parsed.is_empty() {
+                    problems.push("the `[verification]` `drivers` value is empty; name at least one rung-driver or omit the stanza".into());
+                }
+                drivers = parsed;
+            }
             ("entrance", "member") => {
                 if e_member.is_some() {
                     problems.push("the `[entrance]` stanza names `member` more than once".into());
@@ -1406,6 +1429,10 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
             ("entrance", "restates") => e_restates = Some(val.to_string()),
             _ => {}
         }
+    }
+
+    if v_stanza_count > 1 {
+        problems.push(format!("more than one `[verification]` stanza ({v_stanza_count}); the verifier set is a global singleton"));
     }
 
     let entrance = if stanza_count > 0 {
@@ -1575,6 +1602,13 @@ fn is_heading(line: &str) -> bool {
     heading_level(line) != 0
 }
 
+/// True when byte offset `pos` falls outside an inline-`code`-span: an even number of
+/// backticks precede it. The one inline-code-span guard the markdown scanners share (issue
+/// #23), replacing the hand-copied `matches('`').count() % 2` idiom.
+fn outside_code_span(s: &str, pos: usize) -> bool {
+    s[..pos].matches('`').count().is_multiple_of(2)
+}
+
 /// The concept homes: `id -> [(file, line)]` for every **heading ending in `{#id}`** with
 /// `id` in the vocabulary. mdBook honors `{#id}` only as a heading attribute at the *end*
 /// of the heading: a `{#id}` on a non-heading line, or one at the *start* of a heading
@@ -1583,7 +1617,10 @@ fn is_heading(line: &str) -> bool {
 fn scan_concept_anchors(docs: &[(String, String)]) -> std::collections::BTreeMap<String, Vec<(String, usize)>> {
     let mut anchors: std::collections::BTreeMap<String, Vec<(String, usize)>> = std::collections::BTreeMap::new();
     for (rel, content) in docs {
-        for (n, line) in content.lines().enumerate() {
+        // Mask fenced code (issue #12): a heading carrying `{#id}` inside a fenced example is
+        // the syntax quoted, not a live concept home, so it must not register an anchor.
+        let masked = mask_fenced_lines(content);
+        for (n, line) in masked.iter().enumerate() {
             if !is_heading(line) {
                 continue;
             }
@@ -1591,7 +1628,7 @@ fn scan_concept_anchors(docs: &[(String, String)]) -> std::collections::BTreeMap
                 let needle = format!("{{#{id}}}");
                 if line.trim_end().ends_with(&needle) {
                     let pos = line.find(&needle).unwrap_or(0);
-                    if line[..pos].matches('`').count() % 2 == 0 {
+                    if outside_code_span(line, pos) {
                         anchors.entry(id.to_string()).or_default().push((rel.clone(), n + 1));
                     }
                 }
@@ -1609,7 +1646,7 @@ fn concept_links_on(line: &str) -> Vec<(String, String)> {
     let mut i = 0;
     while let Some(rel) = line[i..].find("](") {
         let open = i + rel;
-        if line[..open].matches('`').count() % 2 == 1 {
+        if !outside_code_span(line, open) {
             i = open + 2;
             continue;
         }
@@ -1645,6 +1682,30 @@ fn home_section(content: &str, home_line: usize) -> String {
     lines.get(start..end).map(|s| s.join("\n")).unwrap_or_default()
 }
 
+/// Whether `haystack` names `token` as a whole word — the token is delimited by a
+/// non-identifier character (or a string boundary) on each side, so `host-reference` does not
+/// match inside `host-reference-testkit` (issue #19: a recall-biased substring check misses
+/// this). Identifier characters are ASCII alphanumerics plus `-` and `_`, the shape of a
+/// component or driver name.
+fn names_token(haystack: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let is_id = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(token) {
+        let start = from + rel;
+        let end = start + token.len();
+        let before_ok = haystack[..start].chars().next_back().map(is_id) != Some(true);
+        let after_ok = haystack[end..].chars().next().map(is_id) != Some(true);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// The concept-as-URI checks (plan/0039). **declared-anchor**: every concept link points
 /// at a real concept that has a home. **link-integrity**: the link names the file holding
 /// that home (case-sensitive). **coverage**: each project-local list concept's home names
@@ -1660,7 +1721,10 @@ fn concept_checks(docs: &[(String, String)], facts: &ProjectFacts) -> Vec<String
         }
     }
     for (rel, content) in docs {
-        for (n, line) in content.lines().enumerate() {
+        // Mask fenced code (issue #12): a `](FILE#id)` inside a fenced example is documentation
+        // of the link syntax, not a live link, so it must not be checked for resolution.
+        let masked = mask_fenced_lines(content);
+        for (n, line) in masked.iter().enumerate() {
             for (file, id) in concept_links_on(line) {
                 match anchors.get(&id) {
                     None => hazards.push(format!("{rel}:{}: link to `#{id}` but no doc defines that concept (`{{#{id}}}`)", n + 1)),
@@ -1694,13 +1758,34 @@ fn concept_checks(docs: &[(String, String)], facts: &ProjectFacts) -> Vec<String
             return;
         };
         let section = home_section(content, *line);
-        let missing: Vec<&str> = members.iter().map(String::as_str).filter(|m| !section.contains(*m)).collect();
+        // Match on word boundaries (issue #19): a substring check would count `host-reference`
+        // as covered by the longer `host-reference-testkit` and miss a genuinely-omitted member.
+        let missing: Vec<&str> = members.iter().map(String::as_str).filter(|m| !names_token(&section, m)).collect();
         if !missing.is_empty() {
             hazards.push(format!("{file}:{line}: the `{id}` home omits {} (the project's {id}: {})", missing.join(", "), members.join(", ")));
         }
     };
     cover("components", &facts.components);
     cover("verifiers", &facts.drivers);
+    // Single-value homes get a content bite too (issue #15): link-integrity alone would let the
+    // software-root or spec-home home drift from the canonical fact while the pointers still
+    // resolve. Each assertion is a positive affirmation correct against the real wording — NOT
+    // the old inline `where-root`/`spec-path` predicate, whose `plan/`-and-`spec` form would
+    // false-positive on the canonical spec-home text "co-located ... never under `plan/`".
+    for (id, needle, msg) in [
+        ("software-root", "software/", "the software-root home does not name `software/` (the recorded Where layout)"),
+        ("spec-home", "co-locat", "the spec-home home does not affirm specs co-locate with their software (never under plan/)"),
+    ] {
+        let Some((file, line)) = anchors.get(id).and_then(|h| h.first()) else {
+            continue;
+        };
+        let Some(content) = by_rel.get(file.as_str()) else {
+            continue;
+        };
+        if !home_section(content, *line).to_ascii_lowercase().contains(needle) {
+            hazards.push(format!("{file}:{line}: {msg}"));
+        }
+    }
     hazards
 }
 
@@ -1710,7 +1795,7 @@ fn count_inline_annotations(docs: &[(String, String)]) -> usize {
     docs.iter()
         .flat_map(|(_, content)| content.lines())
         .filter(|line| match line.find(RECONCILE_MARK) {
-            Some(pos) => line[..pos].matches('`').count() % 2 == 0,
+            Some(pos) => outside_code_span(line, pos),
             None => false,
         })
         .count()
@@ -1728,7 +1813,7 @@ fn reconcile_scan(docs: &[(String, String)], facts: &ProjectFacts) -> Vec<String
             // A marker inside an inline-code span is documentation of the syntax, not a
             // live directive (the spine and adopters quote it as an example). An odd
             // backtick count before the marker means it opens inside a code span.
-            if line[..mpos].matches('`').count() % 2 == 1 {
+            if !outside_code_span(line, mpos) {
                 continue;
             }
             let Some(kind) = reconcile_kind(line) else { continue };
@@ -1847,6 +1932,13 @@ fn entrance_stamp_block(content: &str) -> Option<String> {
 /// like "release" recurs in prose ("GitHub releases"); a tool name is distinctive, so a plain
 /// mention suffices; the stamp block is checked against the canonical format. A concept the
 /// entrance does not restate is not checked (plan/0043).
+///
+/// The tool check is deliberately a lenient whole-document presence test (issue #20 disposition,
+/// plan/0051): the entrance is a human-facing README whose host-* tool names are distinctive and
+/// hyphenated, so a plain mention anywhere is a faithful restatement, and a word-boundary or
+/// prose-only rule would flag legitimate phrasings (a tool named only inside a `[text](url)`
+/// link, or a heading) while still not catching a token buried in a bare href. The real bite is
+/// elsewhere: the phase backtick tokens and the byte-exact stamp block. Left lenient by design.
 fn entrance_problems(content: &str, phases: &[String], tools: &[String], restates: &Restates) -> Vec<String> {
     let low = content.to_ascii_lowercase();
     let mut problems = Vec::new();
@@ -1858,6 +1950,7 @@ fn entrance_problems(content: &str, phases: &[String], tools: &[String], restate
         }
     }
     if restates.checks("tools") {
+        // Lenient whole-document presence by design — see the function doc (issue #20).
         for t in tools {
             if !low.contains(&t.to_ascii_lowercase()) {
                 problems.push(format!("the entrance omits the wired tool `{t}` (declared in {SOFTWARE})"));
@@ -2055,7 +2148,7 @@ fn heading_end_anchor(line: &str) -> Option<String> {
     let t = line.trim_end();
     let close = t.strip_suffix('}')?;
     let open = close.rfind("{#")?;
-    if t[..open].matches('`').count() % 2 == 1 {
+    if !outside_code_span(t, open) {
         return None;
     }
     let id = &close[open + 2..];
@@ -2266,8 +2359,8 @@ fn plan_anchor_tokens(line: &str) -> Vec<String> {
     let mut i = 0;
     while let Some(rel) = line[i..].find("plan/") {
         let start = i + rel;
-        // code-span guard: an odd backtick count before the token means it is quoted.
-        if line[..start].matches('`').count() % 2 == 1 {
+        // code-span guard: a token inside an inline-code span is quoted, not a live reference.
+        if !outside_code_span(line, start) {
             i = start + 5;
             continue;
         }
@@ -2471,12 +2564,15 @@ fn task_verdict(root: &Path, t: &Task, r: &TaskReceipt) -> (bool, String) {
                 None => unreachable!(),
             }
         }
+        // A skip must cite a real decision, exactly as the recorder `tasks_record` requires
+        // (issue #7): a free-text reason such as `wip` is an unaccountable justification, and
+        // the gate is the fail-safe authority over hand-edited receipt files.
         "skip" => match &r.reason {
             None => (false, "skip without a `reason`".into()),
             Some(reason) => {
-                if reason.starts_with("call/") && !valid_skip_citation(reason) {
-                    (false, format!("skip cites `{reason}`, which is not a `call/NNNN` id"))
-                } else if valid_skip_citation(reason) && !cited_decision_exists(root, reason) {
+                if !valid_skip_citation(reason) {
+                    (false, format!("skip cites `{reason}`, which is not a `call/NNNN` id — a skip must cite a decision"))
+                } else if !cited_decision_exists(root, reason) {
                     (false, format!("skip cites `{reason}`, which does not resolve to a `call/` decision"))
                 } else {
                     (true, format!("skip ({reason})"))
@@ -2490,23 +2586,32 @@ fn task_verdict(root: &Path, t: &Task, r: &TaskReceipt) -> (bool, String) {
 /// The per-task gate: every declared task needs a receipt the verdict accepts, and a receipt
 /// whose anchor no longer names a task is an orphan (a renamed or removed task left a stale
 /// receipt, the reverse-drift check). One `GateLine` each.
+/// The completion words a `## Status` first line may begin with (issue #18): the repo's
+/// vocabulary, not only three of them, so a synonym is not read as an open milestone.
+const COMPLETION_WORDS: [&str; 5] = ["complete", "done", "landed", "shipped", "released"];
+
 /// Whether a milestone is marked complete, read from its README `## Status` section: the
 /// first non-empty line begins with a completion word (the repo's Status convention, for
 /// example "complete, landed …" or "done (…)"). An open milestone's tasks may be pending; a
 /// complete one owes a done or skip receipt per task.
 fn milestone_complete(content: &str) -> bool {
+    // Read the masked view so a fenced `## Status` example cannot flip the verdict (issue #11);
+    // the sibling task-gate parsers already mask fences, so the two no longer disagree.
+    let masked = mask_fenced_lines(content);
     let mut in_status = false;
-    for line in content.lines() {
+    for line in &masked {
         if heading_level(line) == 2 {
             in_status = line.trim_start().trim_start_matches('#').trim().eq_ignore_ascii_case("Status");
             continue;
         }
         if in_status {
-            let t = line.trim_start_matches(['*', ' ', '\t']).to_ascii_lowercase();
+            // Strip leading list markers (`-`, `*`, `+`) before the completion word, and
+            // recognise the repo's completion synonyms, not only three of them (issue #18).
+            let t = line.trim_start_matches(['-', '*', '+', ' ', '\t']).to_ascii_lowercase();
             if t.is_empty() {
                 continue;
             }
-            return t.starts_with("complete") || t.starts_with("done") || t.starts_with("landed");
+            return COMPLETION_WORDS.iter().any(|w| t.starts_with(w));
         }
     }
     false
@@ -2676,7 +2781,11 @@ fn tasks(args: &[String]) {
             println!("tasks: clean");
         }
         "record" => tasks_record(&root, key, disposition, evidence, reason, record_digests),
-        "rederive" => tasks_rederive(&root),
+        "rederive" => {
+            if tasks_rederive(&root) > 0 {
+                process::exit(1);
+            }
+        }
         _ => tasks_status(&root),
     }
 }
@@ -2806,7 +2915,7 @@ fn tasks_record(root: &Path, key: Option<String>, disposition: Option<String>, e
     println!("recorded task receipt: {key} = {disposition}");
 }
 
-fn tasks_rederive(root: &Path) {
+fn tasks_rederive(root: &Path) -> usize {
     let docs = tracked_markdown(root).unwrap_or_default();
     let (tasks, _) = parse_tasks(&docs);
     let receipts = read_task_receipts(root);
@@ -2848,13 +2957,17 @@ fn tasks_rederive(root: &Path) {
                 println!("ok       {} (re-derived, digest refreshed)", t.key);
                 refreshed += 1;
             }
-            Err(e) => println!("ok       {} (re-derived) but cannot write receipt: {e}", t.key),
+            // The fresh receipt is the persisted record of the re-derivation; a write that
+            // fails leaves nothing persisted, so it is a failure, not a success (issue #8) —
+            // the manual-record path treats the same error as fatal.
+            Err(e) => {
+                println!("FAILED   {} re-derived but cannot write receipt: {e}", t.key);
+                bad += 1;
+            }
         }
     }
     println!("-- {refreshed} re-derived, {bad} failed");
-    if bad > 0 {
-        process::exit(1);
-    }
+    bad
 }
 
 #[cfg(test)]
@@ -2927,6 +3040,9 @@ mod task_gate_tests {
         assert!(task_verdict(&base, a, &tr("plan/0042#a", "skip", None, None, None, Some("call/0024"))).0);
         assert!(!task_verdict(&base, a, &tr("plan/0042#a", "skip", None, None, None, Some("call/9999"))).0);
         assert!(!task_verdict(&base, a, &tr("plan/0042#a", "skip", None, None, None, None)).0);
+        // issue #7: a free-text reason is not a citation — the gate must match the recorder,
+        // which requires `--reason <call/NNNN>`, so `wip` cannot slip a task through.
+        assert!(!task_verdict(&base, a, &tr("plan/0042#a", "skip", None, None, None, Some("wip"))).0);
 
         // gate: only a is receipted. With plan/0042 OPEN, b is pending-ok; when complete it owes one.
         let receipts = vec![
@@ -2946,6 +3062,38 @@ mod task_gate_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    // issue #8: `tasks --rederive` must not report success when the verify passed but the
+    // fresh receipt cannot be persisted — an unpersisted re-derivation is a failure.
+    #[cfg(unix)]
+    #[test]
+    fn rederive_counts_an_unpersistable_receipt_as_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("hl-rederive-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("plan/0001-x")).unwrap();
+        let g = |args: &[&str]| {
+            process::Command::new("git").arg("-C").arg(&base).args(args).output().unwrap();
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        // a task with a trivial, safe mechanical verify, and a `done` receipt for it
+        fs::write(base.join("plan/0001-x/README.md"), "## Build sequence\n\n### T {#t}\n- verify: true\n").unwrap();
+        g(&["add", "-A"]);
+        fs::write(base.join(TASK_RECEIPTS), task_receipt_stanza(&tr("plan/0001#t", "done", Some("true"), None, None, None))).unwrap();
+        let canon = fs::canonicalize(&base).unwrap();
+        // writable tree: the verify passes and the fresh receipt persists.
+        assert_eq!(tasks_rederive(&canon), 0, "clean re-derive");
+        // read-only root: reads still work, but the receipt write fails. A passing verify whose
+        // receipt cannot be written must count as failed, not pass.
+        let ro = fs::Permissions::from_mode(0o555);
+        fs::set_permissions(&canon, ro).unwrap();
+        let bad = tasks_rederive(&canon);
+        fs::set_permissions(&canon, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(bad, 1, "an unpersistable receipt is a failure (issue #8)");
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn milestone_complete_reads_the_status_section() {
         assert!(milestone_complete("## Status\n\ncomplete, landed 2026-06-24\n"));
@@ -2954,6 +3102,15 @@ mod task_gate_tests {
         assert!(!milestone_complete("## Status\n\nOpen, design phase.\n"));
         assert!(!milestone_complete("## Build sequence\n\ncomplete\n")); // not the Status section
         assert!(!milestone_complete("no status section here"));
+        // issue #18: completion synonyms and a leading list marker are recognised.
+        assert!(milestone_complete("## Status\n\n- shipped as v0.32.0\n"));
+        assert!(milestone_complete("## Status\n\nReleased 2026-06-30\n"));
+        assert!(milestone_complete("## Status\n\n+ complete\n")); // a `+` list marker is stripped
+        // issue #11: a fenced `## Status` example does not flip the verdict. The real Status
+        // says open, so a fenced "complete" example must not read as complete.
+        assert!(!milestone_complete("## Status\n\nOpen.\n\n```\n## Status\ncomplete\n```\n"));
+        // and a real Status after a fenced fake one is still read.
+        assert!(milestone_complete("## Plan\n\n```\n## Status\nopen\n```\n\n## Status\n\ndone\n"));
     }
 }
 
@@ -3371,6 +3528,43 @@ fn stage_deps_bundle(work: &Path, url: &str, want_sha: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Reverts a deps-bundle staged into the *live* canonical worktree (issue #22): it removes the
+/// extracted `vendor/` dir and restores the pre-staging `.cargo/config.toml` (the original text,
+/// or removes the file if there was none). `release` calls `restore` explicitly after the build,
+/// but the `Drop` is the backstop — an abnormal exit (a panic) between staging and that explicit
+/// restore still leaves the worktree carrying only the version bump, never the source-replacement
+/// snippet and vendored tree. `restore` disarms, so it never repeats on the subsequent drop.
+struct StagedDepsGuard {
+    work: PathBuf,
+    cfg_backup: Option<String>,
+    armed: bool,
+}
+
+impl StagedDepsGuard {
+    fn restore(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let _ = fs::remove_dir_all(self.work.join("vendor"));
+        let cfg = self.work.join(".cargo/config.toml");
+        match &self.cfg_backup {
+            Some(text) => {
+                let _ = fs::write(&cfg, text);
+            }
+            None => {
+                let _ = fs::remove_file(&cfg);
+            }
+        }
+    }
+}
+
+impl Drop for StagedDepsGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 /// Run a recorded `build` recipe inside the recorded `toolchain` container against
 /// `src` (mounted at `/src`), returning whether it succeeded. Shared by
 /// `--verify-build` and `release` so the docker incantation lives in one place. The
@@ -3722,6 +3916,13 @@ fn parse_software(text: &str) -> Vec<Software> {
             process::exit(2);
         }
     }
+    let problems = recipe_problems(&out);
+    if !problems.is_empty() {
+        for p in &problems {
+            eprintln!("host-lifecycle: {SOFTWARE}: {p}");
+        }
+        process::exit(2);
+    }
     out
 }
 
@@ -3748,6 +3949,52 @@ fn escapes_root(dir: &str) -> bool {
         }
     }
     false
+}
+
+/// Recipe-level defects detectable without the filesystem: a duplicate `[software "<name>"]`
+/// stanza (issue #16 — materialize and release act on the first, so the second's url is
+/// silently ignored), and an `artifact` or `hooks` path that escapes its worktree (issue #21
+/// — an absolute artifact path replaces the join base, so `--verify-build` would hash a file
+/// outside the throwaway worktree). Pure, so it is unit-tested; `parse_software` exits on any.
+fn recipe_problems(recipe: &[Software]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for s in recipe {
+        if !seen.insert(s.name.as_str()) {
+            problems.push(format!("duplicate [software \"{}\"] stanza (the second is silently ignored)", s.name));
+        }
+        for b in s.builds_view() {
+            if let Some((path, _)) = b.artifact {
+                if escapes_root(path) {
+                    let tag = match b.platform {
+                        Some(p) => format!("{} [{}]", s.name, p),
+                        None => s.name.clone(),
+                    };
+                    problems.push(format!("{tag} artifact path `{path}` escapes the worktree (absolute or `..`)"));
+                }
+            }
+        }
+        if let Some(h) = &s.hooks {
+            if escapes_root(h) {
+                problems.push(format!("{} hooks path `{h}` escapes the worktree (absolute or `..`)", s.name));
+            }
+        }
+    }
+    problems
+}
+
+/// The first recorded branch/name token that would escape the host root (issue #2): the
+/// component name, its canonical branch, a parallel `worktrees` branch, or a `worktree =`
+/// line's branch. `software --check` HAZARDs the same condition, but the fresh-clone flow
+/// runs `--materialize` first and it mutates the tree, so materialize fails closed on this
+/// too — reusing the one `escapes_root` check so the two paths cannot diverge. Pure (no
+/// filesystem), so it is unit-tested.
+fn worktree_escapes(s: &Software) -> Option<&str> {
+    std::iter::once(s.name.as_str())
+        .chain(std::iter::once(s.branch.as_str()))
+        .chain(s.worktrees.iter().map(String::as_str))
+        .chain(s.lines.iter().map(|w| w.branch.as_str()))
+        .find(|t| escapes_root(t))
 }
 
 /// The Where-room software root: every component materializes under `<root>/software/`
@@ -3875,6 +4122,14 @@ fn add_worktree(bare: &Path, path: &Path, args: &[&str]) -> bool {
 fn software_materialize(root: &Path, recipe: &[Software]) {
     let mut made = 0usize;
     for s in recipe {
+        // Where-room invariant (issue #2): refuse to materialize a recipe whose name, branch,
+        // or any worktree branch escapes the host root. `software --check` HAZARDs the same,
+        // but materialize runs first in the fresh-clone flow and clones/creates worktrees, so
+        // it must fail closed before touching the filesystem.
+        if let Some(esc) = worktree_escapes(s) {
+            eprintln!("host-lifecycle: refusing to materialize {}: `{esc}` escapes the host root", s.name);
+            process::exit(2);
+        }
         let bare = store_dir(root, &s.name);
         let bare_rel = format!("software/{}/.git", s.name);
         let canon = worktree_dir(root, &s.name, &s.branch);
@@ -4506,7 +4761,8 @@ fn provenance_problems(root: &Path, s: &Software) -> usize {
     // recorded `.host-software` pin MUST equal it, or the producer and the orchestration
     // have drifted. The build-offline-under-`--network none` proof is `--verify-build`.
     if let Some((url, sha)) = &s.deps_bundle {
-        let lock = worktree_dir(root, &s.name, &s.branch).join("deps-bundle.lock");
+        let worktree = worktree_dir(root, &s.name, &s.branch);
+        let lock = worktree.join("deps-bundle.lock");
         match fs::read_to_string(&lock) {
             Ok(text) => {
                 let f: Vec<&str> = text.split_whitespace().collect();
@@ -4517,7 +4773,19 @@ fn provenance_problems(root: &Path, s: &Software) -> usize {
                     bad += 1;
                 }
             }
-            Err(_) => println!("note     {} deps-bundle pinned; deps-bundle.lock not yet in the worktree", s.name),
+            // A lock git tracks but that is missing from the worktree was deleted, and the pin
+            // cross-check it would run is silently bypassed while the pin still reads clean
+            // (issue #6, engineered): HAZARD. A lock git never tracked is a not-yet-locked
+            // onboarding component (it declares a bundle but has not committed its lock yet): a
+            // lenient note, not a fault, so onboarding does not turn `--check` red.
+            Err(_) => {
+                if git_ok(&worktree, &["ls-files", "--error-unmatch", "deps-bundle.lock"]) {
+                    println!("HAZARD   {} deps-bundle.lock is tracked but missing from the worktree — the pin cross-check is bypassed", s.name);
+                    bad += 1;
+                } else {
+                    println!("note     {} deps-bundle pinned; deps-bundle.lock not yet committed (onboarding)", s.name);
+                }
+            }
         }
     }
     bad
@@ -4574,13 +4842,15 @@ fn spec_lane_problems(root: &Path, s: &Software) -> usize {
     // `apalache:` / `tlaps:` disposition). No declaration → no requirement, no HAZARD
     // — bare `.tla`/crate presence never activates a tier.
     if has_obligations {
-        let manifests = read_obligations_text(&worktree);
+        // Parse the dispositions (issue #13), not a raw substring: a tier is required only
+        // once a disposition genuinely `parse_rung`s to it, matching the obligations engine.
+        let declared = declared_rung_tokens(&worktree);
         for (token, label, lane_present) in [
             ("kani:", "Kani code-conformance", workflows.contains("cargo kani") || workflows.contains("kani-verifier")),
             ("apalache:", "Apalache symbolic", workflows.contains("apalache-mc")),
             ("tlaps:", "TLAPS proof", workflows.contains("tlapm")),
         ] {
-            if manifests.contains(token) {
+            if declared.contains(&token) {
                 if lane_present {
                     println!("ok       {} {label} lane present (declares {token})", s.name);
                 } else {
@@ -4623,6 +4893,28 @@ fn read_obligations_text(dir: &Path) -> String {
     text
 }
 
+/// The deeper rungs a worktree's `.obligations` manifests actually DECLARE — parsed with the
+/// same `parse_rung` the obligations engine uses, not a raw substring over concatenated bodies
+/// (issue #13): a `kani:` in a comment, or a non-rung disposition mentioning the word, must not
+/// activate a tier and demand a CI lane the engine never treats as a rung. Each element is the
+/// bare tool token (`kani:` / `apalache:` / `tlaps:`) the lane-name lookups key on.
+fn declared_rung_tokens(dir: &Path) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    for (_id, disp) in parse_obligation_manifest(&read_obligations_text(dir)) {
+        let Some(rung) = parse_rung(&disp) else { continue };
+        let tok = match rung.tool.as_str() {
+            "kani" => "kani:",
+            "apalache" => "apalache:",
+            "tlaps" => "tlaps:",
+            _ => continue,
+        };
+        if !found.contains(&tok) {
+            found.push(tok);
+        }
+    }
+    found
+}
+
 /// Probe (cheaply, never running the proof) that a declared rung's re-deriver EXECUTES — host-prove,
 /// the shared driver for every rung — not merely resolves on PATH (`call/0018`, plan/0048). The
 /// rung-specific verifier (`cargo kani` / `apalache-mc` / `tlapm`) can be CI-only by design (TLAPS is,
@@ -4653,11 +4945,8 @@ fn tier_rederiver_problems(root: &Path, s: &Software) -> usize {
     if !worktree.is_dir() {
         return 0;
     }
-    let manifests = read_obligations_text(&worktree);
-    let declared: Vec<&str> = ["kani:", "apalache:", "tlaps:"]
-        .into_iter()
-        .filter(|t| manifests.contains(*t))
-        .collect();
+    // Parse the dispositions (issue #13), not a raw substring over concatenated bodies.
+    let declared = declared_rung_tokens(&worktree);
     if declared.is_empty() {
         return 0;
     }
@@ -6944,8 +7233,17 @@ fn migrate_receipts(args: &[String]) {
         return;
     }
 
-    // The full `applied =` lines (with recorded/via), from both files (transitional-safe).
-    let applied_lines: Vec<String> = stamp.lines().chain(rc_text.lines()).filter(|l| is_applied_line(l)).map(|l| l.trim().to_string()).collect();
+    // The full `applied =` lines (with recorded/via), from both files (transitional-safe),
+    // de-duplicated by exact line: a partial prior run (a crash between writes) can leave the
+    // same applied line in both files, and the recovery re-run must not double it (issue #9).
+    let mut seen_applied = std::collections::HashSet::new();
+    let applied_lines: Vec<String> = stamp
+        .lines()
+        .chain(rc_text.lines())
+        .filter(|l| is_applied_line(l))
+        .map(|l| l.trim().to_string())
+        .filter(|l| seen_applied.insert(l.clone()))
+        .collect();
 
     // `.host`: the stamp minus the applied lines.
     let mut new_stamp: String = stamp.lines().filter(|l| !is_applied_line(l)).collect::<Vec<_>>().join("\n");
@@ -6980,7 +7278,11 @@ fn migrate_receipts(args: &[String]) {
         new_op.push_str(&receipt_stanza(r));
     }
 
-    for (name, content) in [(STAMP, &new_stamp), (RECEIPTS, &new_rc), (LIFECYCLE_RECEIPTS, &new_op)] {
+    // Crash-safety (issue #9): write each data-receiving file before the file that sheds that
+    // data — applied lines move STAMP→RECEIPTS, operational receipts move RECEIPTS→
+    // LIFECYCLE_RECEIPTS — so an I/O fault mid-set leaves the data duplicated (the re-run
+    // dedups and converges) rather than stripped from the source before the destination has it.
+    for (name, content) in [(LIFECYCLE_RECEIPTS, &new_op), (RECEIPTS, &new_rc), (STAMP, &new_stamp)] {
         if let Err(e) = write_atomic(&root.join(name), content) {
             eprintln!("host-lifecycle: cannot write {name}: {e}");
             process::exit(2);
@@ -7545,13 +7847,17 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     // staged tree afterward, so the release commit carries only the version bump.
     let offline = s.deps_bundle.is_some();
     let cfg_path = work.join(".cargo/config.toml");
-    let cfg_backup = if offline { Some(fs::read_to_string(&cfg_path).ok()) } else { None };
+    let mut deps_guard = None;
     if let Some((url, want)) = &s.deps_bundle {
+        let cfg_backup = fs::read_to_string(&cfg_path).ok();
         println!("  staging deps-bundle (verifying recorded sha) …");
         if let Err(e) = stage_deps_bundle(&work, url, want) {
             eprintln!("host-lifecycle: {e} — release blocked");
             process::exit(1);
         }
+        // The guard reverts the staged vendor dir + config edit on Drop, so an abnormal exit
+        // (a panic) before the explicit restore below still leaves only the version bump (#22).
+        deps_guard = Some(StagedDepsGuard { work: work.clone(), cfg_backup, armed: true });
     }
 
     // Build the bumped worktree in the recorded image and hash the artifact. The hash
@@ -7559,14 +7865,11 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     println!("  building {component} in {image} to compute the canonical hash …");
     let build_ok = run_build_in_container(runtime, image, view.build.unwrap_or("cargo build --release"), &work, offline);
 
-    // Restore the worktree: drop the staged vendor dir and revert the config edit, so a
-    // following `git commit -am` carries only the version bump, never the source-replacement.
-    if let Some(orig) = cfg_backup {
-        let _ = fs::remove_dir_all(work.join("vendor"));
-        match orig {
-            Some(text) => { let _ = fs::write(&cfg_path, text); }
-            None => { let _ = fs::remove_file(&cfg_path); }
-        }
+    // Restore the worktree (disarming the guard so the revert is not repeated on drop): drop the
+    // staged vendor dir and revert the config edit, so a following `git commit -am` carries only
+    // the version bump, never the source-replacement.
+    if let Some(g) = deps_guard.as_mut() {
+        g.restore();
     }
     if !build_ok {
         eprintln!("host-lifecycle: build failed in {runtime} {image} — release blocked");
@@ -7716,6 +8019,30 @@ mod remap_tests {
             apply_rules("Phase 5.3 weed #1 finding #7", &r),
             "mcp-integration.3 weed #1 finding #7"
         );
+    }
+
+    // issue #24: collect_files takes the entry type from the DirEntry (no symlink following)
+    // and skips symlinks, like the sibling tracked_markdown — a symlinked file is not collected
+    // and a symlinked directory is not descended.
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("hl-collect-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("realdir")).unwrap();
+        fs::write(base.join("real.md"), "x").unwrap();
+        fs::write(base.join("target.md"), "y").unwrap();
+        fs::write(base.join("realdir/inner.md"), "z").unwrap();
+        symlink(base.join("target.md"), base.join("link.md")).unwrap();
+        symlink(base.join("realdir"), base.join("linkdir")).unwrap();
+        let mut out = Vec::new();
+        collect_files(&base, &base, &[], &mut out);
+        let names: Vec<String> = out.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert!(names.contains(&"real.md".to_string()) && names.contains(&"target.md".to_string()) && names.contains(&"inner.md".to_string()), "real files collected: {names:?}");
+        assert!(!names.contains(&"link.md".to_string()), "a file symlink is skipped");
+        assert_eq!(names.iter().filter(|n| n.as_str() == "inner.md").count(), 1, "a dir symlink is not descended (inner.md appears once)");
+        let _ = fs::remove_dir_all(&base);
     }
 }
 
@@ -8283,6 +8610,29 @@ mod software_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    // issue #13: the tier gate parses dispositions (parse_rung), so a `kani:` in a comment or a
+    // non-rung disposition does not activate a tier and demand a CI lane the engine never treats
+    // as a rung.
+    #[test]
+    fn tier_declaration_parses_dispositions_not_substrings() {
+        let base = std::env::temp_dir().join(format!("hl-tier-decl-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software").join("comp").join("main");
+        fs::create_dir_all(wt.join(".github/workflows")).unwrap();
+        let mk = || Software {
+            name: "comp".into(), url: "u".into(), pin: "p".into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None,
+            repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        };
+        // a comment mentioning `kani:`, a real apalache rung, and a non-rung `test:` disposition.
+        fs::write(wt.join("p.obligations"), "# kani: is discussed here, not declared\nInvSafe => apalache:Inv spec=S.tla\nFoo => test:foo\n").unwrap();
+        assert_eq!(declared_rung_tokens(&wt), vec!["apalache:"], "only the parsed rung is declared");
+        // so only the apalache lane is missing → exactly one HAZARD, never a phantom kani demand.
+        assert_eq!(spec_lane_problems(&base, &mk()), 1);
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // Obligation discharge: every `allium plan` id must be dispositioned; stale
     // dispositions and absent `test:` references are flagged.
     #[test]
@@ -8674,6 +9024,44 @@ mod software_tests {
         assert!(!escapes_root("ik_llama.cpp.windows"));
         assert!(!escapes_root("nested/handle"));
         assert!(!escapes_root("a/b/../c"));
+    }
+
+    #[test]
+    fn recipe_problems_flags_duplicate_names_and_escaping_paths() {
+        // A clean single-component recipe has no recipe-level problem.
+        let clean = parse_software("[software \"x\"]\n url=u\n pin=p\n");
+        assert!(recipe_problems(&clean).is_empty());
+        // Issue #16: a duplicate `[software "<name>"]` stanza — the second is silently
+        // ignored by materialize/release, so the parser must reject it.
+        let mut dup = parse_software("[software \"x\"]\n url=u\n pin=p\n");
+        dup.extend(parse_software("[software \"x\"]\n url=v\n pin=q\n"));
+        assert!(recipe_problems(&dup).iter().any(|p| p.contains("duplicate")));
+        // Issue #21: an absolute artifact path escapes the throwaway worktree.
+        let mut abs = parse_software("[software \"x\"]\n url=u\n pin=p\n");
+        abs[0].artifact = Some(("/etc/passwd".into(), "deadbeef".into()));
+        assert!(recipe_problems(&abs).iter().any(|p| p.contains("artifact") && p.contains("escapes")));
+        // Issue #21: a `..`-climbing hooks path escapes the worktree.
+        let mut hooks = parse_software("[software \"x\"]\n url=u\n pin=p\n");
+        hooks[0].hooks = Some("../../evil".into());
+        assert!(recipe_problems(&hooks).iter().any(|p| p.contains("hooks") && p.contains("escapes")));
+    }
+
+    #[test]
+    fn worktree_escapes_catches_name_branch_and_lines() {
+        // Issue #2: materialize fails closed when any recorded branch/name escapes.
+        let clean = parse_software("[software \"x\"]\n url=u\n pin=p\n");
+        assert!(worktree_escapes(&clean[0]).is_none());
+        let mut bad_name = parse_software("[software \"x\"]\n url=u\n pin=p\n");
+        bad_name[0].name = "../x".into();
+        assert_eq!(worktree_escapes(&bad_name[0]), Some("../x"));
+        let mut bad_branch = parse_software("[software \"x\"]\n url=u\n pin=p\n");
+        bad_branch[0].branch = "a/../../b".into();
+        assert!(worktree_escapes(&bad_branch[0]).is_some());
+        // A `worktree =` line branch is covered too.
+        let mut bad_line = parse_software("[software \"x\"]\n url=u\n pin=p\n worktree = ../up abc\n");
+        assert!(worktree_escapes(&bad_line[0]).is_some());
+        bad_line[0].lines.clear();
+        assert!(worktree_escapes(&bad_line[0]).is_none());
     }
 
     #[test]
@@ -9082,6 +9470,14 @@ mod software_tests {
         // a duplicate `member` is a problem
         let dup = parse_project_facts("[software \"a\"]\n\turl = u\n[software \"b\"]\n\turl = u\n[entrance]\n\tmember = a\n\tmember = b\n");
         assert!(dup.problems.iter().any(|p| p.contains("more than once")), "{:?}", dup.problems);
+        // issue #14: [verification] is a singleton, like [entrance]. A second stanza, a repeated
+        // `drivers` key (last-wins), or an empty value silently disarms the coverage check.
+        let two_v = parse_project_facts("[software \"host\"]\n\turl = u\n[verification]\n\tdrivers = host-lint\n[verification]\n\tdrivers = allium\n");
+        assert!(two_v.problems.iter().any(|p| p.contains("singleton") && p.contains("verification")), "{:?}", two_v.problems);
+        let dup_drivers = parse_project_facts("[software \"host\"]\n\turl = u\n[verification]\n\tdrivers = host-lint\n\tdrivers = allium\n");
+        assert!(dup_drivers.problems.iter().any(|p| p.contains("drivers") && p.contains("more than once")), "{:?}", dup_drivers.problems);
+        let empty_drivers = parse_project_facts("[software \"host\"]\n\turl = u\n[verification]\n\tdrivers =\n");
+        assert!(empty_drivers.problems.iter().any(|p| p.contains("drivers") && p.contains("empty")), "{:?}", empty_drivers.problems);
     }
 
     #[test]
@@ -9233,6 +9629,43 @@ mod software_tests {
             "## Components {#components}\n\n### host-lint\nx\n\n### host-lifecycle\nx\n\n### host-prove\nx\n\n### host-grammar\nx\n\n## Next section\nunrelated\n".to_string(),
         )];
         assert!(concept_checks(&subheaded, &facts).is_empty(), "a sub-headed home covers all members: {:?}", concept_checks(&subheaded, &facts));
+        // issue #12: a heading carrying {#components} inside a fenced example is not a live home,
+        // so the real (unfenced) pointer fails declared-anchor rather than resolving to it.
+        let fenced_home = vec![
+            ("STRUCTURE.md".to_string(), "Example:\n\n```\n## Components {#components}\nfoo\n```\n".to_string()),
+            ("README.md".to_string(), "See the [components](STRUCTURE.md#components).\n".to_string()),
+        ];
+        assert!(concept_checks(&fenced_home, &facts).iter().any(|m| m.contains("no doc defines that concept")), "a fenced anchor is not a home (issue #12)");
+        // issue #12: a concept link inside a fenced example is not a live link, so a deliberately
+        // wrong file part in a fence does not flag link-integrity.
+        let fenced_link = vec![
+            ("STRUCTURE.md".to_string(), structure("host-lint, host-lifecycle, host-prove, host-grammar.")),
+            ("README.md".to_string(), "Real: [components](STRUCTURE.md#components).\n\n```\n[components](wrong.md#components)\n```\n".to_string()),
+        ];
+        assert!(concept_checks(&fenced_link, &facts).is_empty(), "a fenced link is not checked (issue #12): {:?}", concept_checks(&fenced_link, &facts));
+        // issue #19: a home that names only a longer identifier (host-prove-helper) does not cover
+        // the member host-prove — a substring check would miss this omission.
+        let substring_only = vec![("STRUCTURE.md".to_string(), structure("host-lint, host-lifecycle, host-prove-helper, host-grammar."))];
+        assert!(concept_checks(&substring_only, &facts).iter().any(|m| m.contains("omits") && m.contains("host-prove")), "token-boundary coverage flags host-prove (issue #19)");
+        // issue #15: the single-value homes carry a content bite too. The canonical wording is
+        // clean; a software-root home that drops `software/`, or a spec-home that drops the
+        // co-location affirmation, is a HAZARD (and the canonical "never under `plan/`" must NOT
+        // false-positive the way the old `plan/`-and-`spec` predicate would).
+        let single = |sw: &str, spec: &str| {
+            vec![(
+                "STRUCTURE.md".to_string(),
+                format!("## Software-root {{#software-root}}\n{sw}\n\n## Spec-home {{#spec-home}}\n{spec}\n"),
+            )]
+        };
+        let canonical = single(
+            "Where the software under development lives: `software/`.",
+            "Where specifications live: with their software, co-located in each component's repo, never under `plan/`.",
+        );
+        assert!(concept_checks(&canonical, &facts).is_empty(), "the canonical single-value homes are clean: {:?}", concept_checks(&canonical, &facts));
+        let sw_drift = single("Where the software lives: under the root.", "co-located with their software.");
+        assert!(concept_checks(&sw_drift, &facts).iter().any(|m| m.contains("software-root")), "a software-root home dropping `software/` flags (issue #15)");
+        let spec_drift = single("lives under `software/`.", "Specs live under `plan/<milestone>/spec/`.");
+        assert!(concept_checks(&spec_drift, &facts).iter().any(|m| m.contains("spec-home")), "a spec-home home dropping co-location flags (issue #15)");
     }
 
     // plan/0037: migrate-receipts moves the applied-set into .host-receipts and splits the
@@ -9275,6 +9708,31 @@ mod software_tests {
         migrate_receipts(std::slice::from_ref(&arg));
         let rc2 = fs::read_to_string(canon.join(".host-receipts")).unwrap();
         assert!(rc2.contains("applied = 897ce0d") && !rc2.contains("[receipt \"embed\""), "second run is a no-op");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // issue #9: a crash can leave the applied set in BOTH .host and .host-receipts (the new
+    // write order writes the receiver before the source sheds). The recovery re-run must
+    // converge — applied set in .host-receipts exactly once, stripped from .host — never lost
+    // to the data-shedding-first order, never doubled.
+    #[test]
+    fn migrate_receipts_recovers_a_partial_write_without_loss_or_duplication() {
+        let base = std::env::temp_dir().join(format!("hl-migrate-recover-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let applied = "applied = 897ce0d recorded=2026-06-20 via=verify";
+        // .host still carries the applied line (the shed never completed); .host-receipts
+        // already received it alongside a methodology receipt.
+        fs::write(base.join(".host"), format!("baseline = \"a22704e\"\n{applied}\n")).unwrap();
+        fs::write(base.join(".host-receipts"), format!("{applied}\n\n[receipt \"adopt\"]\n    disposition = done\n    evidence = a5fef9d\n")).unwrap();
+        let arg = base.to_string_lossy().to_string();
+        migrate_receipts(std::slice::from_ref(&arg));
+        let canon = fs::canonicalize(&base).unwrap();
+        let stamp = fs::read_to_string(canon.join(".host")).unwrap();
+        let rc = fs::read_to_string(canon.join(".host-receipts")).unwrap();
+        assert!(!stamp.contains("applied ="), ".host shed the applied set");
+        assert_eq!(rc.matches("applied = 897ce0d").count(), 1, "applied set present exactly once (deduped)");
+        assert!(rc.contains("[receipt \"adopt\"]"), "the methodology receipt survives");
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -9860,6 +10318,77 @@ mod book_tests {
         fs::write(wt.join("deps-bundle.lock"), "https://x/v1.tgz abc\n").unwrap();
         assert_eq!(provenance_problems(&base, &mk("https://x/v1.tgz", "abc")), 0, "matching lock is clean");
         assert_eq!(provenance_problems(&base, &mk("https://x/v1.tgz", "DIFFERENT")), 1, "drift is a HAZARD");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // issue #6 (engineered): a missing deps-bundle.lock is a lenient onboarding note when git
+    // never tracked it, but a HAZARD when it is tracked and deleted (the pin cross-check is then
+    // silently bypassed while the worktree-at-pin check still reads clean).
+    #[test]
+    fn deps_bundle_lock_deletion_hazards_but_onboarding_is_a_note() {
+        let base = std::env::temp_dir().join(format!("hl-bundle-lock-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software").join("comp").join("main");
+        fs::create_dir_all(&wt).unwrap();
+        let g = |args: &[&str]| {
+            process::Command::new("git").arg("-C").arg(&wt).args(args).output().unwrap();
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        let mk = || Software {
+            name: "comp".into(), url: "u".into(), pin: "p".into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None,
+            repro_exempt: None, hooks: None,
+            deps_bundle: Some(("https://x/v.tgz".into(), "abc".into())), builds: vec![],
+        };
+        // onboarding: a bundle is declared but the lock was never committed → a note, not a fault.
+        assert_eq!(provenance_problems(&base, &mk()), 0, "an uncommitted lock is an onboarding note");
+        // commit a matching lock → clean.
+        fs::write(wt.join("deps-bundle.lock"), "https://x/v.tgz abc\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "lock"]);
+        assert_eq!(provenance_problems(&base, &mk()), 0, "a matching tracked lock is clean");
+        // delete the tracked lock from the worktree → the cross-check is bypassed → HAZARD.
+        fs::remove_file(wt.join("deps-bundle.lock")).unwrap();
+        assert_eq!(provenance_problems(&base, &mk()), 1, "a deleted tracked lock hazards");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // issue #22: the deps-bundle staging guard reverts the live worktree on Drop — it removes the
+    // staged vendor/ dir and restores (or removes) .cargo/config.toml — so an abnormal exit
+    // between staging and the explicit restore leaves only the version bump. `restore` disarms.
+    #[test]
+    fn staged_deps_guard_reverts_on_drop_and_disarms() {
+        let base = std::env::temp_dir().join(format!("hl-depsguard-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".cargo")).unwrap();
+        let cfg = base.join(".cargo/config.toml");
+        // a config the staging created (none existed before) is removed, and vendor/ is dropped.
+        fs::create_dir_all(base.join("vendor")).unwrap();
+        fs::write(&cfg, "edited by staging\n").unwrap();
+        {
+            let _g = StagedDepsGuard { work: base.clone(), cfg_backup: None, armed: true };
+        }
+        assert!(!base.join("vendor").exists(), "the staged vendor dir is removed on drop");
+        assert!(!cfg.exists(), "a config that did not exist before staging is removed");
+        // a pre-existing config is restored to its original text on drop.
+        fs::create_dir_all(base.join("vendor")).unwrap();
+        fs::write(&cfg, "STAGED\n").unwrap();
+        {
+            let _g = StagedDepsGuard { work: base.clone(), cfg_backup: Some("ORIGINAL\n".into()), armed: true };
+        }
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), "ORIGINAL\n", "the original config is restored");
+        assert!(!base.join("vendor").exists());
+        // an explicit restore disarms: a later drop does not clobber a subsequent edit.
+        fs::write(&cfg, "ORIGINAL\n").unwrap();
+        let mut g = StagedDepsGuard { work: base.clone(), cfg_backup: Some("BACKUP\n".into()), armed: true };
+        g.restore();
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), "BACKUP\n", "restore reverts immediately");
+        fs::write(&cfg, "operator edit\n").unwrap();
+        drop(g);
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), "operator edit\n", "a disarmed guard does not re-restore");
         let _ = fs::remove_dir_all(&base);
     }
 }
