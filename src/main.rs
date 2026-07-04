@@ -445,6 +445,28 @@ fn stamp_value_after_eq(rest: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
+/// Strip a single surrounding double-quote pair from a `.host-software` value token: `"main"`
+/// yields `main`, a bare token is returned unchanged. `.host-software` value lines are bare by
+/// convention (only the `[software "<name>"]` subsection name is quoted), but a heavily-quantized
+/// operator writes `worktrees = "main"`; without this the quotes leak into refs, paths, hashes,
+/// and URLs (issue #6). A lone, unbalanced, or interior quote (`"main`, `"`, `a"b`, `"a"b"`) is a
+/// mis-authored value, reported as `None` so the caller can fail per its own discipline. Unlike
+/// `stamp_value_after_eq` this keeps the whole token (multi-token fields unquote per token) and
+/// does not strip a trailing `# comment` — it only concerns quotes.
+fn unquote_recipe_token(tok: &str) -> Option<String> {
+    if let Some(rest) = tok.strip_prefix('"') {
+        let inner = rest.strip_suffix('"')?; // `"main` (unbalanced) / `"` (lone) -> None
+        if inner.contains('"') {
+            return None; // `"a"b"` — an interior quote is malformed
+        }
+        return Some(inner.to_string());
+    }
+    if tok.contains('"') {
+        return None; // `main"` — a stray trailing/interior quote with no opening wrapper
+    }
+    Some(tok.to_string())
+}
+
 /// Every value for `key` (`key = "v"` or `key = v …`), in file order. The key must
 /// be followed (after optional spaces) by `=`, so `revision` never matches
 /// `revisionx`. Comment- and quote-tolerant. Multi-valued for repeated keys
@@ -712,10 +734,6 @@ fn remap(args: &[String]) {
         process::exit(2);
     }
     let rules = load_remap(root);
-    if rules.is_empty() {
-        eprintln!("host-lifecycle: no usable entries in {REMAP}");
-        process::exit(2);
-    }
     let allow = load_allow(root);
     let ignore = load_ignore(root);
     match mode {
@@ -726,10 +744,15 @@ fn remap(args: &[String]) {
 }
 
 /// Parse `.host-remap`: `old => new` per line, `#` comments and blanks ignored.
-/// Sorted longest-`old`-first so `Phase 5.0` is consumed before `Phase 5`.
+/// Sorted longest-`old`-first so `Phase 5.0` is consumed before `Phase 5`. An absent
+/// dictionary yields no rules (issue #7): the caller then audits with zero rules rather
+/// than erroring, so an empty rule set never stands in for a skipped scan.
 fn load_remap(root: &Path) -> Vec<Rule> {
     let text = match fs::read_to_string(root.join(REMAP)) {
         Ok(t) => t,
+        // A missing dictionary is a fail-safe no-op, not an error. Any other read fault
+        // (a permission denial, a bad encoding) still exits loudly.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
             eprintln!("host-lifecycle: cannot read {REMAP}: {e}");
             process::exit(2);
@@ -924,11 +947,20 @@ fn is_spec_ext(ext: &str) -> bool {
 /// undispositioned and need a dictionary or allow entry. Exit 1 on a remaining
 /// flag, 3 on a remaining warning, 0 when clean.
 fn remap_check(root: &Path, rules: &[Rule], allow: &[String], ignore: &[String]) {
+    process::exit(remap_check_code(root, rules, allow, ignore));
+}
+
+/// The scan-and-decide core of `--check`, returning the exit code (`1` on any flag, `3` on
+/// any warn, else `0`) so it is unit-testable off the `process::exit` boundary. An empty
+/// `rules` still walks and scans every target, so a missing or empty `.host-remap` audits
+/// rather than reporting a hollow clean (issue #7).
+fn remap_check_code(root: &Path, rules: &[Rule], allow: &[String], ignore: &[String]) -> i32 {
     let subs = submodule_paths(root);
     let mut files = Vec::new();
     collect_files(root, root, &subs, &mut files);
     files.sort();
 
+    let mut scanned = 0usize;
     let mut changed = 0usize;
     let mut specs = 0usize;
     let mut remaining: Vec<Match> = Vec::new();
@@ -943,6 +975,7 @@ fn remap_check(root: &Path, rules: &[Rule], allow: &[String], ignore: &[String])
         let Ok(content) = fs::read_to_string(f) else {
             continue;
         };
+        scanned += 1;
         if is_spec_ext(f.extension().and_then(|e| e.to_str()).unwrap_or("")) {
             specs += 1;
         }
@@ -956,22 +989,34 @@ fn remap_check(root: &Path, rules: &[Rule], allow: &[String], ignore: &[String])
         let kind = if m.severity == Severity::Warn { "warning" } else { "tell" };
         println!("{}:{}: {kind}: {} ({})", m.file, m.line, m.text, m.term);
     }
+    let outcome = if remaining.is_empty() { "clean" } else { "author a .host-remap or allow entry" };
     println!(
-        "-- {changed} file(s) would change ({specs} spec file(s) scanned); {} undispositioned tell(s) remain",
+        "-- {} rule(s); {changed}/{scanned} file(s) would change ({specs} spec file(s) scanned); {} undispositioned tell(s) remain; {outcome}",
+        rules.len(),
         remaining.len()
     );
     if remaining.iter().any(|m| m.severity == Severity::Flag) {
-        process::exit(1);
+        return 1;
     }
     if remaining.iter().any(|m| m.severity == Severity::Warn) {
-        process::exit(3);
+        return 3;
     }
+    0
 }
 
 /// `--apply`: write the substitutions. Refuses unless the git tree is clean, so
 /// the prior commit archives the originals verbatim (`CLAUDE.md` §6). `--dry-run`
 /// previews without the guard and without writing.
 fn remap_apply(root: &Path, rules: &[Rule], ignore: &[String], dry: bool) {
+    // An empty dictionary renames nothing, so it is a fail-safe no-op that writes nothing and
+    // needs no clean tree — return before the clean-git guard rather than erroring (issue #7).
+    if rules.is_empty() {
+        println!(
+            "remap --apply: no rules in {REMAP}; nothing to rename (0 files {})",
+            if dry { "would change (dry-run)" } else { "changed" }
+        );
+        return;
+    }
     if !dry {
         require_clean_git(root);
     }
@@ -1198,8 +1243,9 @@ fn filter_item(recipe: Vec<Software>, spec: &str) -> Vec<Software> {
 }
 
 /// `software --materialize|--check <dir>` — realise the `.host-software` recipe.
-/// `--materialize` clones each `<name>.git` bare store and adds the canonical
-/// worktree `<name>/` at its `pin` (plus any parallel worktrees), idempotently —
+/// `--materialize` clones each `<name>/.bare` bare store (with a `.git` gitdir-link
+/// beside it, call/0039) and adds the canonical worktree `<name>/<branch>/` at its
+/// `pin` (plus any parallel worktrees), idempotently —
 /// it skips what already exists. `--check` verifies each canonical worktree is at
 /// its recorded pin: the audit that replaces a submodule gitlink's `git submodule
 /// status`.
@@ -1357,7 +1403,16 @@ struct ProjectFacts {
 /// fail-safe: coverage then over-reports rather than hiding it. `problems` records a second
 /// stanza, an unknown concept, or a named member that is not declared (plan/0043).
 fn parse_project_facts(text: &str) -> ProjectFacts {
-    let split = |v: &str| -> Vec<String> { v.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect() };
+    // Split a list value and strip a `"..."` wrapper from each token; a mis-quoted token is kept
+    // raw and surfaces downstream (issue #6), matching this parser's tolerant discipline (it
+    // collects problems rather than exiting the way `parse_software` does).
+    let split = |v: &str| -> Vec<String> {
+        v.split([',', ' '])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| unquote_recipe_token(s).unwrap_or_else(|| s.to_string()))
+            .collect()
+    };
     let mut members: Vec<String> = Vec::new();
     let mut drivers: Vec<String> = Vec::new();
     let mut stanza_count = 0usize;
@@ -1423,10 +1478,10 @@ fn parse_project_facts(text: &str) -> ProjectFacts {
                 if e_member.is_some() {
                     problems.push("the `[entrance]` stanza names `member` more than once".into());
                 }
-                e_member = Some(val.to_string());
+                e_member = Some(unquote_recipe_token(val).unwrap_or_else(|| val.to_string()));
             }
-            ("entrance", "document") => e_document = Some(val.to_string()),
-            ("entrance", "restates") => e_restates = Some(val.to_string()),
+            ("entrance", "document") => e_document = Some(unquote_recipe_token(val).unwrap_or_else(|| val.to_string())),
+            ("entrance", "restates") => e_restates = Some(unquote_recipe_token(val).unwrap_or_else(|| val.to_string())),
             _ => {}
         }
     }
@@ -3666,7 +3721,7 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
                 continue;
             };
             if !bare.is_dir() {
-                println!("MISSING  software/{}/.git (run --materialize)", s.name);
+                println!("MISSING  software/{}/.bare (run --materialize)", s.name);
                 bad += 1;
                 continue;
             }
@@ -3767,6 +3822,19 @@ fn parse_software(text: &str) -> Vec<Software> {
     // While inside a `[build "s" "p"]` subsection, key=val lines configure the
     // current platform build rather than the software stanza.
     let mut in_build = false;
+    // Normalize a value token: strip a `"..."` wrapper, exit loudly on a stray quote (issue #6).
+    // Applied per token so multi-token fields (`artifact = <path> <sha>`) unquote each side.
+    let unq = |tok: &str, i: usize| -> String {
+        unquote_recipe_token(tok).unwrap_or_else(|| {
+            eprintln!("host-lifecycle: {SOFTWARE}:{}: value `{tok}` has an unbalanced or stray quote (recipe values are bare; only the [software \"…\"] name is quoted)", i + 1);
+            process::exit(2);
+        })
+    };
+    // The free-form `build` command is passed verbatim to a shell, where interior quotes are
+    // meaningful (`CFLAGS="-O2" make`); strip only a clean surrounding wrapper and pass anything
+    // else through, never failing on an interior quote (issue #6 review). Contrast `unq`, which
+    // fails closed because a ref/path/hash/URL is bare by convention.
+    let unq_cmd = |tok: &str| unquote_recipe_token(tok).unwrap_or_else(|| tok.to_string());
     for (i, line) in text.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
@@ -3830,28 +3898,28 @@ fn parse_software(text: &str) -> Vec<Software> {
         if in_build {
             let b = cur.builds.last_mut().expect("in_build implies a pushed build");
             match key {
-                "build" => b.build = Some(val.to_string()),
-                "toolchain" => b.toolchain = Some(val.to_string()),
-                "deploy" => b.deploy = Some(val.to_string()),
+                "build" => b.build = Some(unq_cmd(val)),
+                "toolchain" => b.toolchain = Some(unq(val, i)),
+                "deploy" => b.deploy = Some(unq(val, i)),
                 "artifact" => {
                     let f: Vec<&str> = val.split_whitespace().collect();
                     let [path, sha] = f[..] else {
                         eprintln!("host-lifecycle: {SOFTWARE}:{}: `artifact` needs `<path> <sha256>`", i + 1);
                         process::exit(2);
                     };
-                    b.artifact = Some((path.to_string(), sha.to_string()));
+                    b.artifact = Some((unq(path, i), unq(sha, i)));
                 }
-                "repro-exempt" => b.repro_exempt = Some(val.to_string()),
-                "attest-host" => b.attest_host = Some(val.to_string()),
+                "repro-exempt" => b.repro_exempt = Some(unq(val, i)),
+                "attest-host" => b.attest_host = Some(unq(val, i)),
                 _ => {}
             }
             continue;
         }
         match key {
-            "url" => cur.url = val.to_string(),
-            "pin" => cur.pin = val.to_string(),
-            "branch" => cur.branch = val.to_string(),
-            "worktrees" => cur.worktrees = val.split_whitespace().map(String::from).collect(),
+            "url" => cur.url = unq(val, i),
+            "pin" => cur.pin = unq(val, i),
+            "branch" => cur.branch = unq(val, i),
+            "worktrees" => cur.worktrees = val.split_whitespace().map(|t| unq(t, i)).collect(),
             "worktree" => {
                 // `worktree = <branch> <pin> [store=<path>] [host=<os>]` — a parallel
                 // line, fully pinned; the path is `software/<name>/<branch>/`; optional
@@ -3864,29 +3932,29 @@ fn parse_software(text: &str) -> Vec<Software> {
                     );
                     process::exit(2);
                 }
-                let (branch, pin) = (f[0], f[1]);
+                let (branch, pin) = (unq(f[0], i), unq(f[1], i));
                 let mut store = None;
                 let mut host = None;
                 for tok in &f[2..] {
                     if let Some(v) = tok.strip_prefix("store=") {
-                        store = Some(v.to_string());
+                        store = Some(unq(v, i));
                     } else if let Some(v) = tok.strip_prefix("host=") {
-                        host = Some(v.to_string());
+                        host = Some(unq(v, i));
                     } else {
                         eprintln!("host-lifecycle: {SOFTWARE}:{}: unknown `worktree` token `{tok}` (expected store=/host=)", i + 1);
                         process::exit(2);
                     }
                 }
                 cur.lines.push(Worktree {
-                    branch: branch.to_string(),
-                    pin: pin.to_string(),
+                    branch,
+                    pin,
                     store,
                     host,
                 });
             }
-            "build" => cur.build = Some(val.to_string()),
-            "toolchain" => cur.toolchain = Some(val.to_string()),
-            "deploy" => cur.deploy = Some(val.to_string()),
+            "build" => cur.build = Some(unq_cmd(val)),
+            "toolchain" => cur.toolchain = Some(unq(val, i)),
+            "deploy" => cur.deploy = Some(unq(val, i)),
             "artifact" => {
                 // `artifact = <path> <sha256>` — the deployed artifact's expected hash.
                 let f: Vec<&str> = val.split_whitespace().collect();
@@ -3894,10 +3962,10 @@ fn parse_software(text: &str) -> Vec<Software> {
                     eprintln!("host-lifecycle: {SOFTWARE}:{}: `artifact` needs `<path> <sha256>`", i + 1);
                     process::exit(2);
                 };
-                cur.artifact = Some((path.to_string(), sha.to_string()));
+                cur.artifact = Some((unq(path, i), unq(sha, i)));
             }
-            "repro-exempt" => cur.repro_exempt = Some(val.to_string()),
-            "hooks" => cur.hooks = Some(val.to_string()),
+            "repro-exempt" => cur.repro_exempt = Some(unq(val, i)),
+            "hooks" => cur.hooks = Some(unq(val, i)),
             "deps-bundle" => {
                 // `deps-bundle = <url> <sha256>` — a pinned vendored-dependency bundle.
                 let f: Vec<&str> = val.split_whitespace().collect();
@@ -3905,7 +3973,7 @@ fn parse_software(text: &str) -> Vec<Software> {
                     eprintln!("host-lifecycle: {SOFTWARE}:{}: `deps-bundle` needs `<url> <sha256>`", i + 1);
                     process::exit(2);
                 };
-                cur.deps_bundle = Some((url.to_string(), sha.to_string()));
+                cur.deps_bundle = Some((unq(url, i), unq(sha, i)));
             }
             _ => {}
         }
@@ -4046,11 +4114,24 @@ fn branch_collision_problems(s: &Software) -> Vec<String> {
     out
 }
 
-/// A component's bare object store: `<root>/software/<name>/.git/` (store-dir name
-/// fixed to `.git`; it sits beside the branch worktrees, never inside one).
+/// A component's bare object store: `<root>/software/<name>/.bare/`, with a `.git` file beside
+/// it (`gitdir: ./.bare`, see `store_gitlink`) so a git command run in the component dir resolves
+/// through to the store (call/0039). A bare repo named `.git` fought git tooling, which reads a
+/// `.git` directory as a working tree's repository; `.bare` names the bare store plainly and the
+/// branch worktrees sit alongside.
 fn store_dir(root: &Path, name: &str) -> PathBuf {
+    component_dir(root, name).join(".bare")
+}
+
+/// The gitdir-link file beside the bare store (call/0039): `<root>/software/<name>/.git`, whose
+/// `gitdir: ./.bare` body points git at the sibling `.bare` store. Written by `--materialize` and
+/// asserted by `--check`.
+fn store_gitlink(root: &Path, name: &str) -> PathBuf {
     component_dir(root, name).join(".git")
 }
+
+/// The body of the `.git` gitdir-link file (a trailing newline, as git writes it).
+const STORE_GITLINK_BODY: &str = "gitdir: ./.bare\n";
 
 /// A component worktree, keyed by branch: `<root>/software/<name>/<branch>/`. The
 /// branch keeps its slashes (`feature/login` nests); the canonical worktree is the
@@ -4130,8 +4211,28 @@ fn software_materialize(root: &Path, recipe: &[Software]) {
             eprintln!("host-lifecycle: refusing to materialize {}: `{esc}` escapes the host root", s.name);
             process::exit(2);
         }
+        // One-time migration from the plan/0029 layout (a bare repo named `.git`) to call/0039's
+        // `.bare` store: rename the old `.git` bare directory to `.bare` and repair the existing
+        // worktrees' gitdir links, before the clone check so no stray second `.bare` is cloned and
+        // no `.git` gitdir-link is written over a directory. The recorded pin reproduces either
+        // way, and the rename preserves the local store. Idempotent: once `.git` is the gitdir-link
+        // file (not a directory) this is skipped.
+        let old_store = component_dir(root, &s.name).join(".git");
+        let new_store = store_dir(root, &s.name);
+        if old_store.is_dir() {
+            if new_store.exists() {
+                eprintln!("host-lifecycle: software/{}: both the old `.git` bare store and a `.bare` store exist; remove the stray one and re-run (the old bare store is the `.git` directory)", s.name);
+                process::exit(2);
+            }
+            if let Err(e) = fs::rename(&old_store, &new_store) {
+                eprintln!("host-lifecycle: cannot migrate software/{}/.git to .bare: {e}", s.name);
+                process::exit(2);
+            }
+            git_ok(&new_store, &["worktree", "repair"]);
+            println!("migrate  software/{}/.git -> .bare (call/0039)", s.name);
+        }
         let bare = store_dir(root, &s.name);
-        let bare_rel = format!("software/{}/.git", s.name);
+        let bare_rel = format!("software/{}/.bare", s.name);
         let canon = worktree_dir(root, &s.name, &s.branch);
         if bare.exists() {
             println!("skip     {bare_rel} (exists)");
@@ -4144,6 +4245,18 @@ fn software_materialize(root: &Path, recipe: &[Software]) {
             git_ok(&bare, &["fetch", "origin"]);
             println!("clone    {bare_rel}");
             made += 1;
+        }
+        // Write the `.git` gitdir-link file beside the bare store (call/0039) so a git command
+        // run in `software/<name>/` resolves through to `.bare`. Unconditional (when the store
+        // exists) so a re-materialize self-heals a half-migrated component missing its link.
+        if bare.is_dir() {
+            let gitlink = store_gitlink(root, &s.name);
+            if fs::read_to_string(&gitlink).ok().as_deref() != Some(STORE_GITLINK_BODY) {
+                if let Err(e) = fs::write(&gitlink, STORE_GITLINK_BODY) {
+                    eprintln!("host-lifecycle: cannot write {}: {e}", gitlink.display());
+                    process::exit(2);
+                }
+            }
         }
         // Clear stale worktree admin (a prior teardown or move leaves entries that are
         // registered but missing on disk; plan/0029) so a re-materialize re-adds a
@@ -4389,7 +4502,14 @@ fn software_check(root: &Path, recipe: &[Software]) -> usize {
             bad += 1;
         }
         if !bare.is_dir() {
-            println!("MISSING  software/{}/.git (run --materialize)", s.name);
+            println!("MISSING  software/{}/.bare (run --materialize)", s.name);
+            bad += 1;
+            continue;
+        }
+        // The `.git` gitdir-link must sit beside the store and point at `.bare` (call/0039); a
+        // half-migrated component with the store but no link (or a stale link) is caught here.
+        if fs::read_to_string(store_gitlink(root, &s.name)).ok().as_deref() != Some(STORE_GITLINK_BODY) {
+            println!("MISSING  software/{}/.git gitdir-link -> .bare (run --materialize)", s.name);
             bad += 1;
             continue;
         }
@@ -4507,6 +4627,10 @@ fn software_check(root: &Path, recipe: &[Software]) -> usize {
     // plan/0042: the receipted task graph — structural problems (parse, graph, reference)
     // and the per-task receipt gate. Inert until a plan adopts the anchored-task form.
     bad += task_check_problems(root);
+    // call/0038: the host-template's prose CI must pin the same host-lifecycle commit the host
+    // gates on; a drifted pin ships new adopters a stale tool. Inert unless this repo develops
+    // host-lifecycle and carries the template submodule, so it fires only on the dev host.
+    bad += template_pin_problems(root, recipe);
     bad
 }
 
@@ -5343,14 +5467,18 @@ fn parse_rung(disp: &str) -> Option<Rung> {
     if !["kani", "apalache", "tlaps"].contains(&tool) || name.is_empty() {
         return None;
     }
-    let mut rung = Rung { tool: tool.into(), name: name.into(), bound: None, spec: None, inputs: Vec::new() };
+    // Strip a `"..."` wrapper from each disposition token; a mis-quoted token is kept raw and
+    // fails downstream on a not-found spec (issue #6). parse_rung never exits — a malformed
+    // disposition already returns None — so this stays tolerant.
+    let unq = |s: &str| unquote_recipe_token(s).unwrap_or_else(|| s.to_string());
+    let mut rung = Rung { tool: tool.into(), name: unq(name), bound: None, spec: None, inputs: Vec::new() };
     for t in toks {
         if let Some(v) = t.strip_prefix("bound=") {
-            rung.bound = Some(v.to_string());
+            rung.bound = Some(unq(v));
         } else if let Some(v) = t.strip_prefix("spec=") {
-            rung.spec = Some(v.to_string());
+            rung.spec = Some(unq(v));
         } else if let Some(v) = t.strip_prefix("inputs=") {
-            rung.inputs = v.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+            rung.inputs = v.split(',').filter(|s| !s.is_empty()).map(&unq).collect();
         }
     }
     Some(rung)
@@ -6100,6 +6228,124 @@ fn find_template_dir(root: &Path) -> Option<PathBuf> {
     }
     let conv = root.join("host-template");
     conv.join("UPGRADING.md").is_file().then_some(conv)
+}
+
+/// What the host-template's prose CI pins host-lifecycle at (call/0038). A `cargo install …
+/// host-lifecycle --rev <sha>` line yields `Rev`; a host-lifecycle install with no parseable
+/// `--rev` yields `InstallNoRev` (fail closed, so a `--rev=<sha>`/`--tag` form or a dropped pin
+/// does not pass silently); no host-lifecycle install yields `NoInstall` (legitimately inert).
+enum TemplatePin {
+    NoInstall,
+    Rev(String),
+    InstallNoRev,
+}
+
+/// Read the host-lifecycle pin out of the template's prose-CI text. Pure, so it is unit-tested.
+fn template_hostlc_pin(prose_yaml: &str) -> TemplatePin {
+    let mut saw_install = false;
+    for line in prose_yaml.lines() {
+        if !(line.contains("cargo install") && line.contains("host-lifecycle")) {
+            continue;
+        }
+        saw_install = true;
+        let mut toks = line.split_whitespace();
+        while let Some(t) = toks.next() {
+            if t == "--rev" {
+                if let Some(sha) = toks.next() {
+                    return TemplatePin::Rev(sha.trim_matches('"').to_string());
+                }
+            } else if let Some(sha) = t.strip_prefix("--rev=") {
+                return TemplatePin::Rev(sha.trim_matches('"').to_string());
+            }
+        }
+    }
+    if saw_install {
+        TemplatePin::InstallNoRev
+    } else {
+        TemplatePin::NoInstall
+    }
+}
+
+/// Whether two hex commit ids designate the same commit: a case-insensitive prefix match (git
+/// abbreviates SHAs), with a 7-char floor so a too-short id cannot match everything.
+fn sha_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+    let n = a.len().min(b.len());
+    n >= 7 && a[..n] == b[..n]
+}
+
+/// A host-* tool's commit pinned in host-template's git tree at `subpath` (a submodule gitlink),
+/// read from HEAD via `git -C <template> rev-parse HEAD:<subpath>`. Reads the recorded pin from the
+/// tree, so it works even when the submodule is not checked out. `None` when the path is not a
+/// gitlink in HEAD or git cannot resolve it.
+fn template_submodule_pin(template: &Path, subpath: &str) -> Option<String> {
+    git_out(template, &["rev-parse", &format!("HEAD:{subpath}")])
+}
+
+/// One template submodule gitlink checked against the recorded pin (call/0038). A gitlink that is
+/// present and drifted is 1 HAZARD; an absent submodule (the template does not carry the tool) is
+/// inert.
+fn submodule_pin_problem(template: &Path, subpath: &str, tool: &str, want: &str) -> usize {
+    match template_submodule_pin(template, subpath) {
+        Some(sub) if !sha_eq(&sub, want) => {
+            println!(
+                "HAZARD   host-template {subpath} submodule pins {tool} {} but .host-software gates on {} (call/0038: bump the submodule on release)",
+                short(&sub),
+                short(want)
+            );
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// call/0038: the host-template must pin every host-* tool it carries at the same commit the host
+/// gates on, so a tool release that does not fully upgrade the template is caught. host-template
+/// pins host-lifecycle in TWO places (the prose-CI `--rev` install and the `tools/host-lifecycle`
+/// submodule) and host-lint in one (`tools/host-lint`); each is checked against the recorded
+/// `.host-software` pin. Returns the count of drifted pins (0 clean). Inert (0) when this repo
+/// carries no template submodule, or names no such recipe pin. The whole-suite `software --check`
+/// (no `--item`) is the enforcing gate; a component-narrowed check legitimately skips this global
+/// invariant.
+fn template_pin_problems(root: &Path, recipe: &[Software]) -> usize {
+    let Some(tdir) = find_template_dir(root) else {
+        return 0;
+    };
+    let pin_of = |name: &str| recipe.iter().find(|s| s.name == name).map(|s| s.pin.as_str());
+    let mut bad = 0usize;
+
+    // host-lifecycle: the prose-CI `--rev` install and the tools/host-lifecycle submodule.
+    if let Some(hl) = pin_of("host-lifecycle") {
+        if let Ok(yaml) = fs::read_to_string(tdir.join(".github").join("workflows").join("prose.yml")) {
+            match template_hostlc_pin(&yaml) {
+                TemplatePin::NoInstall => {}
+                TemplatePin::Rev(rev) if sha_eq(&rev, hl) => {}
+                TemplatePin::Rev(rev) => {
+                    println!(
+                        "HAZARD   host-template prose.yml pins host-lifecycle {} but .host-software gates on {} (call/0038: bump the template pin on release)",
+                        short(&rev),
+                        short(hl)
+                    );
+                    bad += 1;
+                }
+                TemplatePin::InstallNoRev => {
+                    println!(
+                        "HAZARD   host-template prose.yml installs host-lifecycle but pins no --rev commit (call/0038: pin it to {})",
+                        short(hl)
+                    );
+                    bad += 1;
+                }
+            }
+        }
+        bad += submodule_pin_problem(&tdir, "tools/host-lifecycle", "host-lifecycle", hl);
+    }
+
+    // host-lint: the tools/host-lint submodule.
+    if let Some(hlint) = pin_of("host-lint") {
+        bad += submodule_pin_problem(&tdir, "tools/host-lint", "host-lint", hlint);
+    }
+
+    bad
 }
 
 /// Root-level `.md` files the book places in a specific room (so the catch-all
@@ -7890,7 +8136,26 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     println!("  then re-pin {SOFTWARE} for [software \"{component}\"]:");
     println!("    pin      = <the pushed commit SHA>");
     println!("    artifact = {artifact_path} {hash}");
+    for line in template_pin_bump_lines(component, &new) {
+        println!("{line}");
+    }
     println!("    host-lifecycle receipt --record release --component {component} --disposition done --evidence v{new}@{hash}");
+}
+
+/// The outward template-pin-bump steps a release must run (call/0038): a host-lifecycle release
+/// is incomplete until host-template's prose-CI pin equals the released commit, or `software
+/// --check` HAZARDs the drift. Empty for any other component, since only host-lifecycle is pinned
+/// by the template today. Pure, so the exact steps are unit-tested.
+fn template_pin_bump_lines(component: &str, new: &str) -> Vec<String> {
+    if component != "host-lifecycle" {
+        return Vec::new();
+    }
+    vec![
+        "  then bump host-template's host-lifecycle pin (call/0038):".to_string(),
+        format!("    set --rev in host-template/.github/workflows/prose.yml to <the pushed commit SHA> (and the v{new} comment)"),
+        format!("    cd host-template && git commit -am 'pin host-lifecycle v{new}' && git push && cd .."),
+        "    git add host-template && git commit -m 'bump host-template pointer' && git push".to_string(),
+    ]
 }
 
 /// The `verify` phase's closed `recheck` command from the live manifest (the verify
@@ -8019,6 +8284,65 @@ mod remap_tests {
             apply_rules("Phase 5.3 weed #1 finding #7", &r),
             "mcp-integration.3 weed #1 finding #7"
         );
+    }
+
+    // issue #7: an absent `.host-remap` is a fail-safe no-op (empty rule set), not an error.
+    #[test]
+    fn load_remap_absent_is_empty() {
+        let base = std::env::temp_dir().join(format!("hl-remap-absent-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        assert!(load_remap(&base).is_empty(), "a missing .host-remap yields no rules, not an exit");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // issue #7: a present-but-blank (or comments-only) `.host-remap` is also an empty rule set —
+    // the same fail-safe no-op as an absent one, distinct from a malformed line which still errors.
+    #[test]
+    fn load_remap_blank_or_comments_only_is_empty() {
+        let base = std::env::temp_dir().join(format!("hl-remap-blank-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join(REMAP), "\n# only a comment\n\n").unwrap();
+        assert!(load_remap(&base).is_empty(), "a blank/comments-only .host-remap yields no rules");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // issue #7: an empty dictionary renames nothing and writes nothing, without demanding a
+    // clean git tree (the no-op returns before the clean-tree guard).
+    #[test]
+    fn empty_apply_is_a_noop_that_writes_nothing() {
+        let base = std::env::temp_dir().join(format!("hl-remap-noop-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("doc.md"), "a Phase 2 note\n").unwrap();
+        remap_apply(&base, &[], &[], false);
+        assert_eq!(fs::read_to_string(base.join("doc.md")).unwrap(), "a Phase 2 note\n", "no rules -> file untouched");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // issue #7 anti-hollow guard: `--check` with zero rules must still scan every target and
+    // report a tell, so an empty (or absent) dictionary never yields a clean verdict without a
+    // scan. A clean tree with zero rules still exits 0.
+    #[test]
+    fn check_over_empty_rules_still_audits() {
+        let base = std::env::temp_dir().join(format!("hl-remap-audit-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("tell.md"), "# Phase 2\n\nthe next phase begins\n").unwrap();
+        assert_ne!(
+            remap_check_code(&base, &[], &[], &[]),
+            0,
+            "zero rules must still surface the phase tell (anti-hollow)"
+        );
+        fs::remove_file(base.join("tell.md")).unwrap();
+        fs::write(base.join("clean.md"), "the cat sat on the mat\n").unwrap();
+        assert_eq!(
+            remap_check_code(&base, &[], &[], &[]),
+            0,
+            "zero rules over a clean tree is a clean verdict"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     // issue #24: collect_files takes the entry type from the DirEntry (no symlink following)
@@ -9168,12 +9492,27 @@ mod software_tests {
         }];
         software_materialize(&host, &recipe);
 
-        assert!(host.join("software").join("demo").join(".git").is_dir(), "bare store created");
+        // The bare store is `.bare`, with a `.git` gitdir-link file beside it (call/0039).
+        assert!(host.join("software").join("demo").join(".bare").is_dir(), "bare store created at .bare");
+        assert_eq!(
+            fs::read_to_string(host.join("software").join("demo").join(".git")).unwrap(),
+            "gitdir: ./.bare\n",
+            "the .git gitdir-link points at .bare"
+        );
         let canon = host.join("software").join("demo").join("main");
         assert!(canon.is_dir(), "canonical worktree created");
         assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
         // A clean check is clean (VerdictClean): a matching pin yields no hazard.
         assert_eq!(software_check(&host, &recipe), 0, "matching pin is clean");
+
+        // issue #8 review: the gitdir-link gate FIRES when `.git` is missing, and a re-materialize
+        // self-heals the link (call/0039) — the negative path the pass-only assertions missed.
+        let gitlink = host.join("software").join("demo").join(".git");
+        fs::remove_file(&gitlink).unwrap();
+        assert!(software_check(&host, &recipe) > 0, "a missing .git gitdir-link hazards the check");
+        software_materialize(&host, &recipe);
+        assert_eq!(fs::read_to_string(&gitlink).unwrap(), "gitdir: ./.bare\n", "re-materialize self-heals the .git link");
+        assert_eq!(software_check(&host, &recipe), 0, "self-healed link is clean again");
 
         // Re-materialize after the worktree is removed: `worktree prune` clears the
         // stale admin entry, so the canonical is re-created rather than hard-failing
@@ -9184,6 +9523,174 @@ mod software_tests {
         assert!(canon.is_dir(), "canonical re-created after removal + prune");
         assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // issue #8 HIGH (review): --materialize migrates an existing plan/0029-layout component (a bare
+    // repo named `.git`) to call/0039's `.bare` store + `.git` gitdir-link, repairing the worktree,
+    // rather than exiting EISDIR and leaving a stray `.bare`. The recorded pin reproduces, so the
+    // migration is a rename plus a `worktree repair`, no network or teardown.
+    #[test]
+    fn materialize_migrates_old_git_dir_layout() {
+        let base = std::env::temp_dir().join(format!("hl-miglayout-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let host = base.join("host");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        let g = |cwd: &Path, args: &[&str]| assert!(git_ok(cwd, args), "git {args:?} failed in {}", cwd.display());
+        g(&src, &["init", "-q", "-b", "main"]);
+        g(&src, &["config", "user.email", "t@t"]);
+        g(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("readme.txt"), "seed").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "seed"]);
+        let pin = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+
+        // Build the OLD layout by hand: a bare repo named `.git` inside the component dir, with the
+        // canonical worktree beside it (what plan/0029 materialize produced).
+        let comp = host.join("software").join("demo");
+        fs::create_dir_all(&comp).unwrap();
+        let old_git = comp.join(".git");
+        g(&host, &["clone", "-q", "--bare", &src.to_string_lossy(), &old_git.to_string_lossy()]);
+        g(&old_git, &["worktree", "add", "-q", "-B", "main", &comp.join("main").to_string_lossy(), &pin]);
+        assert!(old_git.is_dir(), "old .git bare store is a directory");
+
+        let recipe = vec![Software {
+            name: "demo".to_string(),
+            url: src.to_string_lossy().to_string(),
+            pin: pin.clone(),
+            branch: "main".to_string(),
+            worktrees: Vec::new(),
+            lines: Vec::new(),
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        }];
+        // Before migration the new-layout check hazards (no `.bare`).
+        assert!(software_check(&host, &recipe) > 0, "old layout hazards the new check");
+        // Migrate.
+        software_materialize(&host, &recipe);
+        assert!(comp.join(".bare").is_dir(), "migrated to .bare");
+        assert!(comp.join(".git").is_file(), ".git is now a gitdir-link file");
+        assert_eq!(fs::read_to_string(comp.join(".git")).unwrap(), "gitdir: ./.bare\n");
+        // The worktree survives the migration at its pin (`worktree repair` fixed its gitdir link).
+        assert_eq!(git_out(&comp.join("main"), &["rev-parse", "HEAD"]).unwrap(), pin, "worktree repaired to its pin");
+        assert_eq!(software_check(&host, &recipe), 0, "migrated component is clean");
+        // Idempotent: a second materialize neither re-migrates nor fails.
+        software_materialize(&host, &recipe);
+        assert_eq!(software_check(&host, &recipe), 0, "second materialize stays clean");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // issue #9 / call/0038: the pure reader that extracts what the template's prose CI pins
+    // host-lifecycle at, in three states.
+    #[test]
+    fn template_hostlc_pin_reads_the_pinned_sha() {
+        let yaml = "      - name: install\n        run: cargo install --git https://github.com/connollydavid/host-lifecycle --rev deadbeefcafe0 --root \"$HOME/.local\"\n";
+        assert!(matches!(template_hostlc_pin(yaml), TemplatePin::Rev(ref s) if s == "deadbeefcafe0"));
+        // the `--rev=<sha>` form is also read
+        assert!(matches!(template_hostlc_pin("run: cargo install --git x/host-lifecycle --rev=abc1234def\n"), TemplatePin::Rev(ref s) if s == "abc1234def"));
+        // no host-lifecycle install -> NoInstall (legitimately inert)
+        assert!(matches!(template_hostlc_pin("run: cargo build\n"), TemplatePin::NoInstall));
+        assert!(matches!(template_hostlc_pin("# uses host-lifecycle prose\n"), TemplatePin::NoInstall));
+        // installs host-lifecycle but names no --rev -> fail closed
+        assert!(matches!(template_hostlc_pin("run: cargo install --git x/host-lifecycle --tag v1\n"), TemplatePin::InstallNoRev));
+    }
+
+    // issue #9 review: SHA equality is a case-insensitive prefix match (git abbreviates), floored
+    // at 7 chars so a stub does not match everything.
+    #[test]
+    fn sha_eq_matches_abbreviations_not_stubs() {
+        assert!(sha_eq("deadbeefcafe", "deadbeefcafe0123")); // abbreviation of the same commit
+        assert!(sha_eq("DEADBEEF0", "deadbeef0000")); // case-insensitive
+        assert!(!sha_eq("deadbeef0", "beefdead0000")); // genuinely different
+        assert!(!sha_eq("abc", "abc1234")); // too short (< 7) never matches
+    }
+
+    // issue #9 review: the release emits the template-pin-bump steps for host-lifecycle only, each
+    // a concrete command (including the submodule-pointer bump).
+    #[test]
+    fn template_pin_bump_lines_are_host_lifecycle_only() {
+        let lines = template_pin_bump_lines("host-lifecycle", "0.36.0");
+        assert!(lines.iter().any(|l| l.contains("prose.yml") && l.contains("0.36.0")), "names the prose.yml --rev bump");
+        assert!(lines.iter().any(|l| l.contains("git add host-template")), "names the submodule pointer bump as a command");
+        assert!(template_pin_bump_lines("host-lint", "1.0.0").is_empty(), "no steps for a component the template does not pin");
+    }
+
+    // issue #9 / call/0038: the template-pin gate HAZARDs when the template's prose CI pins a
+    // host-lifecycle commit other than the recorded pin (or pins none while installing it), is
+    // clean when they match (prefix-tolerant), and is inert where this repo does not develop
+    // host-lifecycle or carries no template.
+    #[test]
+    fn template_pin_gate_hazards_a_stale_prose_pin() {
+        let base = std::env::temp_dir().join(format!("hl-tmplpin-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wf = base.join("host-template").join(".github").join("workflows");
+        fs::create_dir_all(&wf).unwrap();
+        fs::write(base.join("host-template").join("UPGRADING.md"), "# ledger\n").unwrap();
+        let prose = |rev: &str| format!("run: cargo install --git https://github.com/connollydavid/host-lifecycle --rev {rev} --root x\n");
+        let mk = |name: &str, pin: &str| Software {
+            name: name.into(), url: "u".into(), pin: pin.into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        };
+        let hostlc = vec![mk("host-lifecycle", "abc123def4567")];
+        // stale: prose pins a different commit than the recipe -> HAZARD
+        fs::write(wf.join("prose.yml"), prose("0000staleaaaaa")).unwrap();
+        assert_eq!(template_pin_problems(&base, &hostlc), 1, "a drifted template pin hazards");
+        // equal by prefix: prose pins an abbreviation of the recorded commit -> clean
+        fs::write(wf.join("prose.yml"), prose("abc123def")).unwrap();
+        assert_eq!(template_pin_problems(&base, &hostlc), 0, "a matching (abbreviated) template pin is clean");
+        // installs host-lifecycle but names no --rev -> fail closed
+        fs::write(wf.join("prose.yml"), "run: cargo install --git x/host-lifecycle --tag v1\n").unwrap();
+        assert_eq!(template_pin_problems(&base, &hostlc), 1, "an unpinned host-lifecycle install hazards");
+        // inert when this repo does not develop host-lifecycle, even with a stale prose pin
+        fs::write(wf.join("prose.yml"), prose("0000staleaaaaa")).unwrap();
+        assert_eq!(template_pin_problems(&base, &[mk("host-prove", "abc123def4567")]), 0, "inert without a host-lifecycle recipe entry");
+        // inert when there is no template at all
+        let _ = fs::remove_dir_all(base.join("host-template"));
+        assert_eq!(template_pin_problems(&base, &hostlc), 0, "inert without a template submodule");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // issue #9 / call/0038 (gap fix): the gate also checks host-template's submodule gitlinks
+    // (`tools/host-lifecycle`, `tools/host-lint`), not just prose.yml — these were the most stale
+    // pins in practice (a host-lifecycle submodule at v0.15.1). A drifted gitlink HAZARDs; a
+    // matching one is clean; an absent submodule is inert.
+    #[test]
+    fn template_submodule_pin_gate_hazards_drift() {
+        let base = std::env::temp_dir().join(format!("hl-tmplsub-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let tdir = base.join("host-template");
+        fs::create_dir_all(&tdir).unwrap();
+        fs::write(tdir.join("UPGRADING.md"), "# ledger\n").unwrap(); // find_template_dir locates it
+        let g = |args: &[&str]| assert!(git_ok(&tdir, args), "git {args:?} failed in {}", tdir.display());
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        let recorded = "486add7227d1cf86f16ea4462a08d4efe0fca159"; // the recorded .host-software pin
+        let stale = "2a24deb0e5bcb3b3c09f50c39d7cfb84c445eafa"; // an older commit
+        let mk = |name: &str, pin: &str| Software {
+            name: name.into(), url: "u".into(), pin: pin.into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        };
+        // a stale tools/host-lifecycle gitlink -> HAZARD (no prose.yml here, so this isolates it)
+        g(&["update-index", "--add", "--cacheinfo", &format!("160000,{stale},tools/host-lifecycle")]);
+        g(&["commit", "-qm", "gitlink stale"]);
+        assert_eq!(template_pin_problems(&base, &[mk("host-lifecycle", recorded)]), 1, "a drifted submodule gitlink hazards");
+        // bump the gitlink to the recorded pin -> clean
+        g(&["update-index", "--add", "--cacheinfo", &format!("160000,{recorded},tools/host-lifecycle")]);
+        g(&["commit", "-qm", "gitlink current"]);
+        assert_eq!(template_pin_problems(&base, &[mk("host-lifecycle", recorded)]), 0, "a matching submodule gitlink is clean");
+        // add a stale tools/host-lint gitlink -> that one HAZARDs while host-lifecycle stays clean
+        g(&["update-index", "--add", "--cacheinfo", &format!("160000,{stale},tools/host-lint")]);
+        g(&["commit", "-qm", "host-lint gitlink stale"]);
+        assert_eq!(
+            template_pin_problems(&base, &[mk("host-lifecycle", recorded), mk("host-lint", recorded)]),
+            1,
+            "a drifted host-lint submodule hazards"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -9478,6 +9985,21 @@ mod software_tests {
         assert!(dup_drivers.problems.iter().any(|p| p.contains("drivers") && p.contains("more than once")), "{:?}", dup_drivers.problems);
         let empty_drivers = parse_project_facts("[software \"host\"]\n\turl = u\n[verification]\n\tdrivers =\n");
         assert!(empty_drivers.problems.iter().any(|p| p.contains("drivers") && p.contains("empty")), "{:?}", empty_drivers.problems);
+    }
+
+    // issue #6: ASCII quotes an operator wraps around value tokens are stripped in this twin parser
+    // too — the entrance member/document and the drivers list — never leaked downstream. Reverting
+    // the unquote calls fails here: `document = "README.md"` would keep the quotes and pass the
+    // escape check, and `member = "host"` would not match the declared member.
+    #[test]
+    fn parse_project_facts_strips_value_quotes() {
+        let text = "[software \"host\"]\n\turl = u\n[entrance]\n\tmember = \"host\"\n\tdocument = \"README.md\"\n\trestates = \"phases\" \"tools\"\n[verification]\n\tdrivers = \"host-lint\" \"allium\"\n";
+        let f = parse_project_facts(text);
+        assert!(f.problems.is_empty(), "quoted values parse cleanly: {:?}", f.problems);
+        assert_eq!(f.drivers, vec!["host-lint", "allium"]);
+        let e = f.entrance.expect("an entrance");
+        assert_eq!((e.member.as_str(), e.document.as_str()), ("host", "README.md"));
+        assert!(e.restates.checks("phases") && e.restates.checks("tools"));
     }
 
     #[test]
@@ -10281,6 +10803,38 @@ mod book_tests {
         );
         let without = parse_software("[software \"host-prove\"]\n url=u\n pin=p\n");
         assert!(without[0].deps_bundle.is_none());
+    }
+
+    // issue #6: the value normalizer strips a `"..."` wrapper and rejects a stray quote. The
+    // exit-2 path in parse_software is the thin wrapper over this pure `None`.
+    #[test]
+    fn unquote_recipe_token_units() {
+        assert_eq!(unquote_recipe_token("main").as_deref(), Some("main"));
+        assert_eq!(unquote_recipe_token("\"main\"").as_deref(), Some("main"));
+        assert_eq!(unquote_recipe_token("").as_deref(), Some("")); // empty is a value, not malformed
+        assert_eq!(unquote_recipe_token("\"\"").as_deref(), Some(""));
+        assert_eq!(unquote_recipe_token("\"main"), None); // unbalanced (opening only)
+        assert_eq!(unquote_recipe_token("main\""), None); // stray (closing only, no wrapper)
+        assert_eq!(unquote_recipe_token("\""), None); // a lone quote
+        assert_eq!(unquote_recipe_token("\"a\"b\""), None); // interior quote
+    }
+
+    // issue #6: ordinary ASCII quotes an operator wraps around value lines are stripped, across a
+    // single-token field, a whitespace list, and a two-token field — never leaked into the ref,
+    // path, or hash.
+    #[test]
+    fn parse_software_strips_value_quotes() {
+        let s = parse_software(
+            "[software \"host-lint\"]\n url = \"https://x/y.git\"\n pin = \"abc123\"\n worktrees = \"main\" \"dev\"\n artifact = \"target/bin\" \"deadbeef\"\n",
+        );
+        assert_eq!(s[0].url, "https://x/y.git");
+        assert_eq!(s[0].pin, "abc123");
+        assert_eq!(s[0].worktrees, vec!["main".to_string(), "dev".to_string()]);
+        assert_eq!(s[0].artifact, Some(("target/bin".to_string(), "deadbeef".to_string())));
+        // a bare recipe is unchanged (no over-stripping)
+        let bare = parse_software("[software \"host-prove\"]\n url=u\n pin=p\n");
+        assert_eq!(bare[0].url, "u");
+        assert_eq!(bare[0].pin, "p");
     }
 
     // plan/0032: merging the vendored-sources snippet keeps the existing config (the
