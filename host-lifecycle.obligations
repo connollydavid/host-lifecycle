@@ -13,6 +13,7 @@ entity-fields.Component              => structural
 entity-fields.Receipt                => structural
 entity-fields.Finding                => structural
 entity-fields.Check                  => structural
+entity-fields.Owed                   => structural
 surface-actor.SoftwareCheck          => structural
 surface-provides.SoftwareCheck       => structural
 transition-rejected.Check.status     => structural
@@ -39,6 +40,9 @@ rule-entity-creation.DetectStaleReceipt.1        => test:staleness_detects_an_in
 rule-success.DetectDepsBundleDrift               => test:deps_bundle_drift_is_detected exercises=provenance_problems
 rule-failure.DetectDepsBundleDrift.1             => test:deps_bundle_drift_is_detected exercises=provenance_problems
 rule-entity-creation.DetectDepsBundleDrift.1     => test:deps_bundle_drift_is_detected exercises=provenance_problems
+rule-success.DetectOwedGraduation                => test:deps_bundle_onboarding_is_owed_not_locked_or_drifted exercises=provenance_problems_owed
+rule-failure.DetectOwedGraduation.1              => test:deps_bundle_onboarding_is_owed_not_locked_or_drifted exercises=provenance_problems_owed
+rule-entity-creation.DetectOwedGraduation.1      => test:deps_bundle_onboarding_is_owed_not_locked_or_drifted exercises=provenance_problems_owed
 
 # --- Verdict lifecycle (behavioural — clean/hazarded exit) ---
 transition-edge.Check.checking.clean    => test:materialize_then_check_roundtrip exercises=software_check
@@ -54,3 +58,4 @@ rule-success.StartCheck                 => waived: lifecycle entry — a check u
 invariant.ArtifactImpliesToolchain      => test:provenance_attestation_and_exemption exercises=provenance_problems
 invariant.ReceiptsReDerive              => test:staleness_detects_an_input_change exercises=staleness_problems
 invariant.HazardBlocksClean             => test:off_pin_worktree_hazards_the_check exercises=software_check
+invariant.OwedNeverHazards              => test:deps_bundle_onboarding_is_owed_not_locked_or_drifted exercises=provenance_problems_owed

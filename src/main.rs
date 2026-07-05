@@ -3318,6 +3318,10 @@ fn software(args: &[String]) {
     // `--item <name>[@<branch>]` narrows the operation to one component (plan/0029);
     // a flag, not a positional, so it never collides with the `<dir>` positional.
     let mut item: Option<&str> = None;
+    // `--lock <name>` graduates one onboarding component: writes its `deps-bundle.lock`
+    // from the recorded pin and drives its release (plan/0057). The name is the flag's
+    // value, not a positional, so it never collides with the `<dir>` positional.
+    let mut lock_name: Option<&str> = None;
     // `--teardown` removes a component's materialized worktrees + bare store;
     // `--force` overrides the unsaved-work guard (plan/0029).
     let mut force = false;
@@ -3329,6 +3333,15 @@ fn software(args: &[String]) {
             "--verify-build" => mode = Some("verify-build"),
             "--install-hooks" => mode = Some("install-hooks"),
             "--teardown" => mode = Some("teardown"),
+            "--lock" => {
+                mode = Some("lock");
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("host-lifecycle: --lock needs <name>");
+                    process::exit(2);
+                };
+                lock_name = Some(v.as_str());
+                i += 1;
+            }
             "--force" => force = true,
             "--item" => {
                 let Some(v) = args.get(i + 1) else {
@@ -3343,11 +3356,11 @@ fn software(args: &[String]) {
         i += 1;
     }
     let Some(dir) = pos.first() else {
-        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks|--teardown> [--item <name>[@<branch>]] [--force] <dir>");
+        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks|--teardown|--lock <name>> [--item <name>[@<branch>]] [--force] <dir>");
         process::exit(2);
     };
     let Some(mode) = mode else {
-        eprintln!("host-lifecycle software needs --materialize, --check, --verify-build, --install-hooks, or --teardown");
+        eprintln!("host-lifecycle software needs --materialize, --check, --verify-build, --install-hooks, --teardown, or --lock <name>");
         process::exit(2);
     };
     let root = match fs::canonicalize(Path::new(dir.as_str())) {
@@ -3368,18 +3381,85 @@ fn software(args: &[String]) {
     match mode {
         "materialize" => software_materialize(&root, &recipe),
         "check" => {
-            let bad = software_check(&root, &recipe);
+            let mut owed: Vec<String> = Vec::new();
+            let bad = software_check_owed(&root, &recipe, &mut owed);
             if bad > 0 {
                 eprintln!("-- {bad} item(s) need attention");
                 process::exit(1);
+            }
+            // Owed graduations are advisory, not a fault (turning onboarding red is the
+            // retro-red trap plan/0051 rejected, and it would block a release gate that
+            // re-runs `--check`). But the owed work must not hide behind a bare green: a
+            // counted, enumerated summary that names the next action re-lists it every
+            // run, so a cold read surfaces it (plan/0057, Bly's over-report direction).
+            if !owed.is_empty() {
+                println!(
+                    "-- {} deps-bundle graduation(s) owed: {}; run: host-lifecycle software --lock <name> {dir}",
+                    owed.len(),
+                    owed.join(", ")
+                );
             }
             println!("-- all components at their pinned SHA; no worktree-symlink hazards");
         }
         "verify-build" => software_verify_build(&root, &recipe),
         "install-hooks" => software_install_hooks(&root, &recipe),
         "teardown" => software_teardown(&root, &recipe, force),
+        "lock" => software_lock(&root, &recipe, lock_name.expect("--lock sets lock_name")),
         _ => unreachable!(),
     }
+}
+
+/// `software --lock <name>` graduates one onboarding component to attested (plan/0057):
+/// it writes the producer's `deps-bundle.lock` from the recorded pin (never hand-typed),
+/// stages it, and drives a fix-only release. The authority is release-grade: the committed lock
+/// advances the producer HEAD, so `.host-software` keeps pinning a released, tagged commit
+/// (dual-release-authority unchanged). Fails loud on the wrong state; a no-op on an
+/// already-locked component, so the verb is idempotent.
+fn software_lock(root: &Path, recipe: &[Software], name: &str) {
+    let Some(s) = recipe.iter().find(|s| s.name == name) else {
+        eprintln!("host-lifecycle: no component `{name}` in {SOFTWARE}");
+        process::exit(2);
+    };
+    let Some((url, sha)) = &s.deps_bundle else {
+        eprintln!("host-lifecycle: {name} declares no deps-bundle — nothing to lock");
+        process::exit(2);
+    };
+    let work = worktree_dir(root, &s.name, &s.branch);
+    if !work.is_dir() {
+        eprintln!(
+            "host-lifecycle: {name} is not materialized at {} — run `software --materialize` first",
+            work.display()
+        );
+        process::exit(2);
+    }
+    // Fail loud on the wrong state; the onboarding (no-lock) case is the one that proceeds.
+    let lock = work.join("deps-bundle.lock");
+    if let Ok(text) = fs::read_to_string(&lock) {
+        let f: Vec<&str> = text.split_whitespace().collect();
+        if f.len() >= 2 && f[0] == url && f[1] == sha {
+            println!("ok       {name} deps-bundle.lock already matches the pin — already locked, nothing to do");
+            return;
+        }
+        eprintln!("host-lifecycle: {name} deps-bundle.lock differs from the recorded pin (producer drift) — resolve the drift; --lock will not overwrite a disagreeing lock");
+        process::exit(1);
+    }
+    // Write the lock from the recorded pin (so the content is never hand-typed) and stage it.
+    let content = format!("{url} {sha}\n");
+    if let Err(e) = fs::write(&lock, &content) {
+        eprintln!("host-lifecycle: cannot write {}: {e}", lock.display());
+        process::exit(2);
+    }
+    println!("  wrote {name}/deps-bundle.lock ({url} {})", short(sha));
+    if !git_ok(&work, &["add", "deps-bundle.lock"]) {
+        eprintln!("host-lifecycle: could not stage deps-bundle.lock in {}", work.display());
+        process::exit(1);
+    }
+    println!("  staged deps-bundle.lock");
+    println!("\n{name}: locking is release-grade; the committed lock advances the producer, so it ships as a fix-only release. The release commit below includes the staged lock.");
+    // Drive the fix-only release: the verify gate, the version bump, the container rebuild
+    // (the artifact re-derives byte-identically — the lock is never compiled in), and the
+    // operator-run outward steps (commit the lock + bump, tag, push, re-pin, receipt).
+    run_release(root, name, Some("neither"), false);
 }
 
 /// `--install-hooks`: for each component with a `hooks` script, copy it into
@@ -4474,7 +4554,17 @@ fn upgrade_claim_problems(root: &Path) -> usize {
 /// Returning the count rather than calling `process::exit` here makes the hazarded
 /// verdict observable in a test (plan/0051 finding 3 — the off-pin HAZARD was untestable
 /// while this exited in place).
+/// Thin wrapper for the tests that only assert the fault count; the owed-list is
+/// discarded.
+#[cfg(test)]
 fn software_check(root: &Path, recipe: &[Software]) -> usize {
+    software_check_owed(root, recipe, &mut Vec::new())
+}
+
+/// As `software_check`, but pushes every onboarding component (declares a `deps-bundle`,
+/// no committed lock) onto `owed` so the caller can surface the graduations owed
+/// (plan/0057). Owed is advisory — it never adds to the returned fault count.
+fn software_check_owed(root: &Path, recipe: &[Software], owed: &mut Vec<String>) -> usize {
     let mut bad = 0usize;
     for s in recipe {
         let bare = store_dir(root, &s.name);
@@ -4594,7 +4684,7 @@ fn software_check(root: &Path, recipe: &[Software]) -> usize {
         }
         // Reproducible-build provenance: deploy line recorded, exemption cited,
         // deployed artifact attested (issue #10).
-        bad += provenance_problems(root, s);
+        bad += provenance_problems_owed(root, s, owed);
         // Verification lanes are mandatory when a spec of their kind exists: a
         // materialized component carrying a `.allium`/`.tla` must run its lane.
         bad += spec_lane_problems(root, s);
@@ -4820,7 +4910,18 @@ fn cited_decision_exists(root: &Path, cite: &str) -> bool {
 
 /// Attestation + exemption checks for a component's build provenance (the cheap pass;
 /// the rebuild *proof* is `--verify-build`). Returns the count of failures.
+/// Thin wrapper for the tests that only assert the fault count; the onboarding owed-list
+/// is discarded.
+#[cfg(test)]
 fn provenance_problems(root: &Path, s: &Software) -> usize {
+    provenance_problems_owed(root, s, &mut Vec::new())
+}
+
+/// Reproducible-build provenance for one component. Returns the fault count (`bad`). A
+/// component that declares a `deps-bundle` but has not yet committed its lock is an
+/// onboarding component: not a fault (it stays green), but its name is pushed onto
+/// `owed` so `software --check` can surface the graduation it owes (plan/0057).
+fn provenance_problems_owed(root: &Path, s: &Software, owed: &mut Vec<String>) -> usize {
     let mut bad = 0;
     let host = std::env::consts::OS;
     for b in s.builds_view() {
@@ -4908,6 +5009,7 @@ fn provenance_problems(root: &Path, s: &Software) -> usize {
                     bad += 1;
                 } else {
                     println!("note     {} deps-bundle pinned; deps-bundle.lock not yet committed (onboarding)", s.name);
+                    owed.push(s.name.clone());
                 }
             }
         }
@@ -10907,6 +11009,39 @@ mod book_tests {
         // delete the tracked lock from the worktree → the cross-check is bypassed → HAZARD.
         fs::remove_file(wt.join("deps-bundle.lock")).unwrap();
         assert_eq!(provenance_problems(&base, &mk()), 1, "a deleted tracked lock hazards");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0057: an onboarding component (declares a bundle, no committed lock) is pushed onto
+    // the owed list and is not a fault; a matching lock and a drifted lock are never owed (a
+    // locked component is done, a drifted one is a HAZARD — neither owes a graduation).
+    #[test]
+    fn deps_bundle_onboarding_is_owed_not_locked_or_drifted() {
+        let base = std::env::temp_dir().join(format!("hl-owed-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software").join("comp").join("main");
+        fs::create_dir_all(&wt).unwrap();
+        let mk = || Software {
+            name: "comp".into(), url: "u".into(), pin: "p".into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None,
+            repro_exempt: None, hooks: None,
+            deps_bundle: Some(("https://x/v.tgz".into(), "abc".into())), builds: vec![],
+        };
+        // onboarding: no lock on disk → owed, not a fault.
+        let mut owed = Vec::new();
+        assert_eq!(provenance_problems_owed(&base, &mk(), &mut owed), 0, "onboarding is not a fault");
+        assert_eq!(owed, vec!["comp".to_string()], "onboarding is owed");
+        // a matching lock → clean, not owed.
+        fs::write(wt.join("deps-bundle.lock"), "https://x/v.tgz abc\n").unwrap();
+        let mut owed = Vec::new();
+        assert_eq!(provenance_problems_owed(&base, &mk(), &mut owed), 0, "matching lock is clean");
+        assert!(owed.is_empty(), "a locked component is not owed");
+        // a drifted lock → HAZARD, still not owed (a fault is not a graduation).
+        fs::write(wt.join("deps-bundle.lock"), "https://x/v.tgz DIFFERENT\n").unwrap();
+        let mut owed = Vec::new();
+        assert_eq!(provenance_problems_owed(&base, &mk(), &mut owed), 1, "drift is a HAZARD");
+        assert!(owed.is_empty(), "a drifted component is a fault, not owed");
         let _ = fs::remove_dir_all(&base);
     }
 

@@ -30,7 +30,9 @@ entity Project {
 -- a `--verify-build` establishes; `repro_exempt` is a call/NNNN authorizing a
 -- not-yet-reproducible migrated build. `declares_deps_bundle`/`bundle_pin_matches` are
 -- the plan/0032 hermeticity axes: a component pinning a dependency bundle keeps a
--- committed `deps-bundle.lock` whose pin must equal the recorded one.
+-- committed `deps-bundle.lock` whose pin must equal the recorded one. `bundle_owed` is the
+-- onboarding case (plan/0057): a bundle is declared but no lock is committed yet, an
+-- advisory graduation debt that `software --lock` discharges and that never hazards.
 entity Component {
     name: String
     declares_artifact: Boolean
@@ -41,6 +43,7 @@ entity Component {
     repro_exempt: Boolean
     declares_deps_bundle: Boolean
     bundle_pin_matches: Boolean
+    bundle_owed: Boolean
 }
 
 -- A recorded lifecycle receipt for one component and phase. Valid only when its evidence
@@ -56,6 +59,13 @@ entity Receipt {
 entity Finding {
     component: Component
     kind: String
+}
+
+-- plan/0057: a bundled component that has not yet committed its lock owes a graduation.
+-- Owed is advisory: it is never a Finding, so an onboarding component never turns the
+-- check red; the graduation it owes is surfaced, counted, and named for `software --lock`.
+entity Owed {
+    component: Component
 }
 
 -- One `software --check` run. Starts checking; the findings it accumulates drive the
@@ -127,6 +137,15 @@ rule DetectDepsBundleDrift {
     ensures: Finding.created(component: component, kind: "deps-bundle-drift")
 }
 
+-- plan/0057: a bundled component with no committed lock owes a graduation (run
+-- `software --lock`). It is advisory, an Owed record rather than a Finding, so the check
+-- stays green — plan/0051's onboarding-is-not-a-fault, now a first-class surfaced state.
+rule DetectOwedGraduation {
+    when: component: Component.created
+    requires: component.bundle_owed
+    ensures: Owed.created(component: component)
+}
+
 -- === Verdict lifecycle: findings drive the exit-code decision ===
 
 rule StartCheck {
@@ -174,4 +193,12 @@ invariant ReceiptsReDerive {
 invariant HazardBlocksClean {
     for c in Checks where c.saw_hazard and c.status != checking:
         c.status = hazarded
+}
+
+-- plan/0057: an owed graduation is advisory and never hazards. An onboarding component is
+-- not in the drift condition (its pin vacuously matches, there being no lock to disagree),
+-- so a project whose only outstanding work is owed graduations still settles clean (exit 0).
+invariant OwedNeverHazards {
+    for c in Components where c.bundle_owed:
+        c.bundle_pin_matches
 }
