@@ -734,7 +734,12 @@ fn remap(args: &[String]) {
         process::exit(2);
     }
     let rules = load_remap(root);
-    let allow = load_allow(root);
+    let allow = remap_allow(root);
+    // `.host-lint-allow` is a deprecated alias for the LEXICON (host-lifecycle#13); note it
+    // when present so an adopter migrates the declaration to host-lint's LEXICON.
+    if !load_allow(root).is_empty() {
+        eprintln!("host-lifecycle: note: {ALLOW} is a deprecated alias; declare sanctioned tokens in the LEXICON instead");
+    }
     let ignore = load_ignore(root);
     match mode {
         "check" => remap_check(root, &rules, &allow, &ignore),
@@ -796,6 +801,16 @@ fn load_allow(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The sanctioned vocabulary `remap` honours: host-lint's LEXICON (canonical) merged
+/// with the legacy `.host-lint-allow` alias (host-lifecycle#13). Unifying the two means
+/// a token declared for host-lint is not a tell to remap, and one declared to remap is
+/// not a tell to host-lint — one source, not two that drift.
+fn remap_allow(root: &Path) -> Vec<String> {
+    let mut allow = host_lint::load_lexicon(root).phrases_lc;
+    allow.extend(load_allow(root));
+    allow
+}
+
 /// The repo's `.host-lintignore` patterns (paths excluded from the audit), so the
 /// remap leaves the same paths alone. Absent file → empty.
 fn load_ignore(root: &Path) -> Vec<String> {
@@ -845,10 +860,34 @@ fn apply_rules(line: &str, rules: &[Rule]) -> String {
     cur
 }
 
+/// The info string of a markdown fence line (the text after ``` / ~~~), with the
+/// marker char and run length, or None if not a fence: 3+ backticks or tildes with at
+/// most 3 leading spaces. Replicates host-lint's scan-side rule so `remap --apply`
+/// skips the exact `host-lint:ignore` blocks the scan skips (host-lifecycle#12),
+/// self-contained so M2 needs no host-lint change.
+fn fence_info(line: &str) -> Option<(char, usize, &str)> {
+    if line.chars().take_while(|c| *c == ' ').count() >= 4 {
+        return None;
+    }
+    let t = line.trim_start();
+    let marker = t.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let run = t.chars().take_while(|c| *c == marker).count();
+    if run < 3 {
+        return None;
+    }
+    Some((marker, run, t[run..].trim()))
+}
+
 /// Apply the rules across a whole file's text, preserving exact line structure
-/// (LF/CRLF and whether the file ends in a newline).
-fn apply_text(text: &str, rules: &[Rule]) -> String {
+/// (LF/CRLF and whether the file ends in a newline). In a markdown source a
+/// `host-lint:ignore` fenced block is emitted verbatim (its lines and fences), so
+/// `remap --apply` never rewrites inside the box the scan already skips
+/// (host-lifecycle#12); a regular code fence stays substituted, matching the scan, and
+/// a non-markdown source has no fence semantics.
+fn apply_text(text: &str, rules: &[Rule], markdown: bool) -> String {
     let mut out = String::with_capacity(text.len());
+    // The open `host-lint:ignore` fence's marker char and run length, or None outside.
+    let mut ignore_fence: Option<(char, usize)> = None;
     for chunk in text.split_inclusive('\n') {
         let (body, nl) = match chunk.strip_suffix('\n') {
             Some(b) => (b, "\n"),
@@ -858,7 +897,28 @@ fn apply_text(text: &str, rules: &[Rule]) -> String {
             Some(b) => (b, "\r"),
             None => (body, ""),
         };
-        out.push_str(&apply_rules(body, rules));
+        let emit = if !markdown {
+            apply_rules(body, rules)
+        } else if let Some((mch, mlen)) = ignore_fence {
+            // Inside the fence (its close line included): emit verbatim; a bare
+            // same-marker fence at least as long closes it (CommonMark).
+            if let Some((c, len, info)) = fence_info(body) {
+                if info.is_empty() && c == mch && len >= mlen {
+                    ignore_fence = None;
+                }
+            }
+            body.to_string()
+        } else if let Some((c, len, info)) = fence_info(body) {
+            if info == "host-lint:ignore" {
+                ignore_fence = Some((c, len));
+                body.to_string() // the open fence line is skipped by the scan
+            } else {
+                apply_rules(body, rules) // a regular fence is scanned, so substituted too
+            }
+        } else {
+            apply_rules(body, rules)
+        };
+        out.push_str(&emit);
         out.push_str(cr);
         out.push_str(nl);
     }
@@ -979,7 +1039,7 @@ fn remap_check_code(root: &Path, rules: &[Rule], allow: &[String], ignore: &[Str
         if is_spec_ext(f.extension().and_then(|e| e.to_str()).unwrap_or("")) {
             specs += 1;
         }
-        let applied = apply_text(&content, rules);
+        let applied = apply_text(&content, rules, src.to_lowercase().ends_with(".md"));
         if applied != content {
             changed += 1;
         }
@@ -1038,7 +1098,7 @@ fn remap_apply(root: &Path, rules: &[Rule], ignore: &[String], dry: bool) {
         let Ok(content) = fs::read_to_string(f) else {
             continue;
         };
-        let applied = apply_text(&content, rules);
+        let applied = apply_text(&content, rules, rel.to_lowercase().ends_with(".md"));
         if applied == content {
             continue;
         }
@@ -1918,6 +1978,7 @@ fn reconcile(args: &[String]) {
     // The inline annotation form is deprecated (plan/0039) but still checked during the
     // transition, so its bite holds until it is retired; warn on any survivor.
     hazards.extend(reconcile_scan(&docs, &facts));
+    hazards.extend(plan_index_problems(&docs));
     let inline = count_inline_annotations(&docs);
     if inline > 0 {
         eprintln!("host-lifecycle: reconcile: note — {inline} inline `<!-- host-reconcile -->` annotation(s) are deprecated (plan/0039); migrate each restatement to a concept pointer `[text](STRUCTURE.md#id)`");
@@ -2196,6 +2257,75 @@ fn plan_id_of(rel: &str) -> Option<String> {
     }
 }
 
+/// The milestone DIRECTORY of a `plan/NNNN-slug/README.md` rel path (`plan/NNNN-slug`),
+/// the form a PLAN.md row links. `plan_id_of` yields the numeric id; this yields the
+/// linkable directory, so plan-index coverage keys on the exact link target.
+fn milestone_dir_of(rel: &str) -> Option<String> {
+    let mut parts = rel.split('/');
+    if parts.next()? != "plan" {
+        return None;
+    }
+    let dir = parts.next()?;
+    if parts.next()? != "README.md" || parts.next().is_some() {
+        return None;
+    }
+    let num = dir.split('-').next()?;
+    if num.len() == 4 && num.bytes().all(|b| b.is_ascii_digit()) {
+        Some(format!("plan/{dir}"))
+    } else {
+        None
+    }
+}
+
+/// Every `plan/NNNN-slug/README.md` link target inside a PLAN.md body.
+fn plan_readme_link_targets(index: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, _) in index.match_indices("](plan/") {
+        let start = i + 2; // skip the "]("
+        if let Some(close) = index[start..].find(')') {
+            let target = &index[start..start + close];
+            if target.starts_with("plan/") && target.ends_with("/README.md") {
+                out.push(target.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// plan/0062: PLAN.md must index every milestone directory. The audited-plan rule
+/// (each milestone gets a PLAN.md row) is asserted in the spine but gated by nothing,
+/// so plan directories drifted unindexed. This derives the owed set from repo state
+/// each run — every tracked `plan/NNNN-slug/README.md` owes a linked row — and HAZARDs
+/// any directory with no live row, plus the reverse (a row linking a directory that
+/// does not exist). Fail-safe and self-re-listing like the component-coverage check,
+/// keyed on the table-row LINK TARGET rather than a bare prose mention, since the
+/// defect was directories discussed in prose yet absent from the table. A row link
+/// inside a fenced block is masked out, so an example link never counts as live.
+fn plan_index_problems(docs: &[(String, String)]) -> Vec<String> {
+    let owed: Vec<String> = docs.iter().filter_map(|(rel, _)| milestone_dir_of(rel)).collect();
+    let Some((_, plan)) = docs.iter().find(|(r, _)| r == "PLAN.md") else {
+        return Vec::new();
+    };
+    let index = mask_fenced_lines(plan).join("\n");
+    let mut hz = Vec::new();
+    for dir in &owed {
+        if !index.contains(&format!("]({dir}/README.md)")) {
+            hz.push(format!(
+                "PLAN.md: the milestone index omits {dir} (a plan/ directory with no linked row)"
+            ));
+        }
+    }
+    for target in plan_readme_link_targets(&index) {
+        let dir = target.trim_end_matches("/README.md");
+        if !owed.iter().any(|d| d == dir) {
+            hz.push(format!(
+                "PLAN.md: a milestone row links {target} but no such plan/ directory exists"
+            ));
+        }
+    }
+    hz
+}
+
 /// The slug `{#anchor}` at the END of a heading line (the placement mdBook honors), if any.
 /// The anchor is a `[a-z0-9-]+` slug. A `{#...}` inside an inline-code span is skipped (it is
 /// the syntax quoted, not a live anchor).
@@ -2333,19 +2463,21 @@ fn parse_tasks(docs: &[(String, String)]) -> (Vec<Task>, Vec<String>) {
                 i += 1;
                 continue;
             }
-            let Some(anchor) = anchor else {
-                problems.push(format!("{rel}:{}: a `## Build sequence` task heading needs an anchor at its end (`### Title {{#anchor}}`)", i + 1));
-                i += 1;
-                continue;
-            };
-            let key = format!("{plan}#{anchor}");
+            // Scan this heading's bullets once. A standalone `- band` marker makes it a
+            // BAND: a content-named grouping over the anchored tasks that follow it
+            // (host-lifecycle#4, plan/0066). The marker attaches only to its own
+            // immediately-preceding heading, so a bare `- band` line, not a look-ahead,
+            // is the signal (the qwen3.5-4b scoring flagged look-ahead as the mis-read).
+            let mut band = false;
             let mut depends: Option<Vec<String>> = None;
             let mut verify: Option<TaskVerify> = None;
             let mut inputs: Vec<String> = Vec::new();
             let mut j = i + 1;
             while j < lines.len() && heading_level(lines[j]) == 0 {
                 let b = lines[j].trim();
-                if let Some(v) = b.strip_prefix("- depends:") {
+                if b == "- band" {
+                    band = true;
+                } else if let Some(v) = b.strip_prefix("- depends:") {
                     depends = Some(parse_depends(v, &plan));
                 } else if let Some(v) = b.strip_prefix("- verify:") {
                     match parse_verify(v) {
@@ -2357,6 +2489,20 @@ fn parse_tasks(docs: &[(String, String)]) -> (Vec<Task>, Vec<String>) {
                 }
                 j += 1;
             }
+            // A band groups but is not a task: it pushes no node, carries no receipt or
+            // edge, and does NOT reset the linear default, so task-to-task chaining
+            // continues across the band heading. Order lives in the depends edges, never
+            // in the band's name or position.
+            if band {
+                i = j;
+                continue;
+            }
+            let Some(anchor) = anchor else {
+                problems.push(format!("{rel}:{}: a `## Build sequence` task heading needs an anchor at its end (`### Title {{#anchor}}`), or a `- band` marker to make it a group", i + 1));
+                i = j;
+                continue;
+            };
+            let key = format!("{plan}#{anchor}");
             // Linear default: no explicit `depends` means the previous task in this plan's
             // build sequence (the first task is a root).
             let depends = depends.unwrap_or_else(|| prev_in_plan.iter().cloned().collect());
@@ -3233,6 +3379,25 @@ mod task_tests {
     }
 
     #[test]
+    fn parse_tasks_treats_a_band_as_a_group_and_keeps_the_linear_default_across_it() {
+        let docs = vec![doc(
+            "plan/0090-x/README.md",
+            "# t\n\n## Build sequence\n\n### Reader normalisers {#readers}\n\n- band\n\n### First task {#first}\n\n- verify: cargo test\n\n### Release {#release}\n\n- band\n\n### Second task {#second}\n\n- verify: cargo test\n",
+        )];
+        let (tasks, problems) = parse_tasks(&docs);
+        assert!(problems.is_empty(), "a band-bearing plan is clean: {problems:?}");
+        // the two bands push no task; only the two anchored tasks are nodes
+        let keys: Vec<&str> = tasks.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys, vec!["plan/0090#first", "plan/0090#second"], "bands are not tasks: {keys:?}");
+        // the linear default chains #second onto #first across the Release band heading
+        let second = tasks.iter().find(|t| t.key.ends_with("#second")).unwrap();
+        assert_eq!(second.depends, vec!["plan/0090#first"], "chaining continues across a band: {:?}", second.depends);
+        let first = tasks.iter().find(|t| t.key.ends_with("#first")).unwrap();
+        assert!(first.depends.is_empty(), "the first task is a root even with a band before it: {:?}", first.depends);
+        assert!(task_graph_problems(&tasks).is_empty());
+    }
+
+    #[test]
     fn linear_default_chains_consecutive_tasks() {
         let docs = vec![doc(
             "plan/0060-x/README.md",
@@ -3325,6 +3490,11 @@ fn software(args: &[String]) {
     // `--teardown` removes a component's materialized worktrees + bare store;
     // `--force` overrides the unsaved-work guard (plan/0029).
     let mut force = false;
+    // `--partial` clones the bare store with `--filter=blob:none` (host-lifecycle#14):
+    // a partial clone still lands every commit and tree, so the pin reproduces, but
+    // blobs are fetched on demand at worktree checkout instead of the whole history up
+    // front. Opt-in, so an adopter on a remote without partial-clone support is unaffected.
+    let mut partial = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -3333,6 +3503,7 @@ fn software(args: &[String]) {
             "--verify-build" => mode = Some("verify-build"),
             "--install-hooks" => mode = Some("install-hooks"),
             "--teardown" => mode = Some("teardown"),
+            "--partial" => partial = true,
             "--lock" => {
                 mode = Some("lock");
                 let Some(v) = args.get(i + 1) else {
@@ -3356,7 +3527,7 @@ fn software(args: &[String]) {
         i += 1;
     }
     let Some(dir) = pos.first() else {
-        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks|--teardown|--lock <name>> [--item <name>[@<branch>]] [--force] <dir>");
+        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks|--teardown|--lock <name>> [--item <name>[@<branch>]] [--force] [--partial] <dir>");
         process::exit(2);
     };
     let Some(mode) = mode else {
@@ -3379,7 +3550,7 @@ fn software(args: &[String]) {
         recipe = filter_item(recipe, spec);
     }
     match mode {
-        "materialize" => software_materialize(&root, &recipe),
+        "materialize" => software_materialize(&root, &recipe, partial),
         "check" => {
             let mut owed: Vec<String> = Vec::new();
             let bad = software_check_owed(&root, &recipe, &mut owed);
@@ -4280,7 +4451,7 @@ fn add_worktree(bare: &Path, path: &Path, args: &[&str]) -> bool {
 /// already exist. The bare clone needs its remote-tracking refspec set by hand —
 /// `git clone --bare` does not write one — before a `fetch`/`worktree` resolves a
 /// remote branch.
-fn software_materialize(root: &Path, recipe: &[Software]) {
+fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
     let mut made = 0usize;
     for s in recipe {
         // Where-room invariant (issue #2): refuse to materialize a recipe whose name, branch,
@@ -4317,7 +4488,16 @@ fn software_materialize(root: &Path, recipe: &[Software]) {
         if bare.exists() {
             println!("skip     {bare_rel} (exists)");
         } else {
-            if !git_ok(root, &["clone", "--bare", &s.url, &bare_rel]) {
+            // A partial clone (`--filter=blob:none`) lands every commit and tree but no
+            // blobs, so the pin still reproduces while the whole-history blob download is
+            // deferred to worktree checkout (host-lifecycle#14). Opt-in via `--partial`.
+            let mut clone_args: Vec<&str> = vec!["clone", "--bare"];
+            if partial {
+                clone_args.push("--filter=blob:none");
+            }
+            clone_args.push(s.url.as_str());
+            clone_args.push(bare_rel.as_str());
+            if !git_ok(root, &clone_args) {
                 eprintln!("host-lifecycle: git clone --bare failed for {}", s.name);
                 process::exit(2);
             }
@@ -5092,27 +5272,49 @@ fn spec_lane_problems(root: &Path, s: &Software) -> usize {
     bad
 }
 
-/// Concatenate every `.obligations` manifest in the worktree (for tier-declaration
-/// substring checks). Skips `.git`, `target`, `node_modules`, like `find_specs`.
-fn read_obligations_text(dir: &Path) -> String {
-    let mut text = String::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
+/// Every regular file under `root`, walked symlink-safely and depth-bounded. A
+/// symlink is treated as a leaf and never followed, so a symlink cycle in
+/// gitignored scratch (a Wine prefix, `node_modules`, a venv) cannot make the walk
+/// hang (host-lifecycle#15, which wedged `software --check` in uninterruptible I/O
+/// on a 9P mount); the depth cap is defence-in-depth against a non-symlink cycle (a
+/// bind mount). A directory named in `skip` is pruned, and an unreadable directory
+/// is skipped rather than fatal. Every recursive worktree lane shares this so none
+/// re-introduces the unguarded walk. Symlink handling matches `collect_files`.
+fn walk_files_safe(root: &Path, skip: &[&str]) -> Vec<PathBuf> {
+    const MAX_DEPTH: usize = 256;
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((d, depth)) = stack.pop() {
         let Ok(rd) = fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                if name == ".git" || name == "target" || name == "node_modules" {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                continue; // a symlink is a leaf; never followed (breaks a cycle, #15)
+            }
+            if ft.is_dir() {
+                if skip.iter().any(|s| *s == e.file_name().to_string_lossy()) {
                     continue;
                 }
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()) == Some("obligations") {
-                if let Ok(t) = fs::read_to_string(&p) {
-                    text.push_str(&t);
-                    text.push('\n');
+                if depth < MAX_DEPTH {
+                    stack.push((e.path(), depth + 1));
                 }
+            } else {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
+/// Concatenate every `.obligations` manifest in the worktree (for tier-declaration
+/// substring checks). Skips `.git`, `target`, `node_modules`.
+fn read_obligations_text(dir: &Path) -> String {
+    let mut text = String::new();
+    for p in walk_files_safe(dir, &[".git", "target", "node_modules"]) {
+        if p.extension().and_then(|x| x.to_str()) == Some("obligations") {
+            if let Ok(t) = fs::read_to_string(&p) {
+                text.push_str(&t);
+                text.push('\n');
             }
         }
     }
@@ -5194,29 +5396,12 @@ fn find_specs(dir: &Path) -> (bool, bool, bool) {
     let mut allium = false;
     let mut tla = false;
     let mut obligations = false;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                if name == ".git" || name == "target" || name == "node_modules" {
-                    continue;
-                }
-                stack.push(p);
-            } else {
-                match p.extension().and_then(|x| x.to_str()) {
-                    Some("allium") => allium = true,
-                    Some("tla") => tla = true,
-                    Some("obligations") => obligations = true,
-                    _ => {}
-                }
-            }
-        }
-        if allium && tla && obligations {
-            break;
+    for p in walk_files_safe(dir, &[".git", "target", "node_modules"]) {
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("allium") => allium = true,
+            Some("tla") => tla = true,
+            Some("obligations") => obligations = true,
+            _ => {}
         }
     }
     (allium, tla, obligations)
@@ -5840,20 +6025,15 @@ fn parse_obligation_manifest(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Concatenate every file under `dir` (recursively), for substring checks.
+/// Concatenate every file under `dir` (recursively), for substring checks. Walks
+/// symlink-safely (host-lifecycle#15); an empty skip list preserves the exact file
+/// set the input digest is taken over.
 fn read_dir_recursive(dir: &Path) -> String {
     let mut text = String::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if let Ok(t) = fs::read_to_string(&p) {
-                text.push_str(&t);
-                text.push('\n');
-            }
+    for p in walk_files_safe(dir, &[]) {
+        if let Ok(t) = fs::read_to_string(&p) {
+            text.push_str(&t);
+            text.push('\n');
         }
     }
     text
@@ -6498,16 +6678,18 @@ enum PageBody {
 fn book(args: &[String]) {
     let mut check = false;
     let mut dry = false;
+    let mut print_mount = false;
     let mut pos: Vec<&String> = Vec::new();
     for a in args {
         match a.as_str() {
             "--check" => check = true,
             "--dry-run" => dry = true,
+            "--print-mount" => print_mount = true,
             _ => pos.push(a),
         }
     }
     let Some(dir) = pos.first() else {
-        eprintln!("host-lifecycle book <dir> [--check] [--dry-run]");
+        eprintln!("host-lifecycle book <dir> [--check] [--dry-run] [--print-mount]");
         process::exit(2);
     };
     let root = match fs::canonicalize(Path::new(dir.as_str())) {
@@ -6517,6 +6699,12 @@ fn book(args: &[String]) {
             process::exit(2);
         }
     };
+    // host#17: the reference Site workflow reads the declared mount from the tool
+    // (the internalise-tool-orchestration doctrine), rather than shell-grepping `.host`.
+    if print_mount {
+        println!("{}", stamp_book_mount(&root));
+        return;
+    }
     let sections = plan_book(&root);
     if check {
         book_check(&sections);
@@ -6854,10 +7042,30 @@ fn book_toml(root: &Path) -> String {
     let mut s = format!(
         "[book]\nlanguage = \"en\"\nsrc = \"mdBook/src\"\ntitle = \"{title}\"\n\n[build]\nbuild-dir = \"mdBook/out\"\n\n[output.html]\ndefault-theme = \"light\"\npreferred-dark-theme = \"navy\"\n"
     );
+    // host#17: a project serving a product site at the Pages root declares a `book-mount`
+    // sub-path in `.host`; the generated book then carries mdBook's `site-url` so its
+    // absolute links (the 404 and print pages) resolve under that sub-path. The line is
+    // emitted only for a non-default mount, so book.toml stays byte-identical for every
+    // project that publishes at the root.
+    let mount = stamp_book_mount(root);
+    if mount != "/" {
+        s.push_str(&format!("site-url = \"{mount}\"\n"));
+    }
     if root.join("custom.css").is_file() {
         s.push_str("additional-css = [\"custom.css\"]\n");
     }
     s
+}
+
+/// The optional `book-mount` from the `.host` stamp: the sub-path the published book is
+/// served under (host#17), defaulting to "/". Read via the existing stamp reader, so it
+/// needs no new parser and survives a baseline re-stamp.
+fn stamp_book_mount(root: &Path) -> String {
+    fs::read_to_string(root.join(STAMP))
+        .ok()
+        .and_then(|t| stamp_field(&t, "book-mount"))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "/".to_string())
 }
 
 /// The project name for the book title: the `.host` stamp's `name`, falling back to
@@ -8373,9 +8581,40 @@ mod remap_tests {
     #[test]
     fn preserves_line_structure() {
         let r = vec![rule("phase 4", "command-execution")];
-        assert_eq!(apply_text("a Phase 4\nb\n", &r), "a command-execution\nb\n");
-        assert_eq!(apply_text("Phase 4", &r), "command-execution");
-        assert_eq!(apply_text("x\r\nPhase 4\r\n", &r), "x\r\ncommand-execution\r\n");
+        assert_eq!(apply_text("a Phase 4\nb\n", &r, false), "a command-execution\nb\n");
+        assert_eq!(apply_text("Phase 4", &r, false), "command-execution");
+        assert_eq!(apply_text("x\r\nPhase 4\r\n", &r, false), "x\r\ncommand-execution\r\n");
+    }
+
+    // host-lifecycle#12: remap --apply must not rewrite inside a `host-lint:ignore`
+    // fence (markdown), the box the naming scan already skips, or it corrupts the very
+    // verbatim record the box preserves. Outside it (and on a regular code fence) the
+    // rule still applies.
+    #[test]
+    fn apply_text_skips_host_lint_ignore_fence() {
+        let r = vec![rule("phase 4", "command-execution")];
+        let md = "outside Phase 4\n```host-lint:ignore\nfrozen Phase 4 citation\n```\nafter Phase 4\n";
+        let got = apply_text(md, &r, true);
+        assert!(got.contains("frozen Phase 4 citation"), "fenced tell preserved: {got}");
+        assert!(got.contains("outside command-execution"), "before the fence substituted: {got}");
+        assert!(got.contains("after command-execution"), "after the fence substituted: {got}");
+        assert!(!apply_text(md, &r, false).contains("frozen Phase 4 citation"), "non-md: fence not honored");
+    }
+
+    // host-lifecycle#13: remap's sanctioned vocabulary is host-lint's LEXICON (canonical),
+    // with the legacy `.host-lint-allow` merged in as a deprecated alias, so the two never
+    // drift into a token that one honours and the other flags.
+    #[test]
+    fn remap_allow_unifies_lexicon_and_legacy() {
+        let base = std::env::temp_dir().join(format!("hl-remapallow-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("LEXICON"), "sanctioned widget 5\n").unwrap();
+        fs::write(base.join(ALLOW), "legacy token 3\n").unwrap();
+        let allow = remap_allow(&base);
+        assert!(allow.iter().any(|p| p == "sanctioned widget 5"), "LEXICON phrase is honoured (single source): {allow:?}");
+        assert!(allow.iter().any(|p| p == "legacy token 3"), "legacy .host-lint-allow merged as an alias: {allow:?}");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -8468,6 +8707,26 @@ mod remap_tests {
         assert!(names.contains(&"real.md".to_string()) && names.contains(&"target.md".to_string()) && names.contains(&"inner.md".to_string()), "real files collected: {names:?}");
         assert!(!names.contains(&"link.md".to_string()), "a file symlink is skipped");
         assert_eq!(names.iter().filter(|n| n.as_str() == "inner.md").count(), 1, "a dir symlink is not descended (inner.md appears once)");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // host-lifecycle#15: the shared worktree walker never follows a symlink, so a
+    // symlink cycle in gitignored scratch (a Wine prefix) cannot make it hang. Under
+    // the old `is_dir()`-follows-symlink walk this test would not terminate.
+    #[cfg(unix)]
+    #[test]
+    fn walk_files_safe_does_not_follow_a_symlink_cycle() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("hl-walkcycle-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("junk")).unwrap();
+        fs::write(base.join("junk/real.obligations"), "x").unwrap();
+        symlink(&base, base.join("junk/loop")).unwrap(); // loop -> an ancestor: a cycle
+        let files = walk_files_safe(&base, &[]);
+        let names: Vec<String> =
+            files.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert!(names.contains(&"real.obligations".to_string()), "real files under the cycle are walked: {names:?}");
+        assert!(!files.iter().any(|p| p.to_string_lossy().contains("loop")), "the symlink is never descended: {files:?}");
         let _ = fs::remove_dir_all(&base);
     }
 }
@@ -9403,7 +9662,7 @@ mod software_tests {
             }],
             build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
 
         let line = host.join("software").join("demo").join("feature");
         assert!(line.is_dir(), "parallel worktree created");
@@ -9548,7 +9807,7 @@ mod software_tests {
             }],
             build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
 
         let handle = host.join("software").join("demo").join("win");
         // the in-tree handle exists and is a symlink to the external store
@@ -9559,6 +9818,43 @@ mod software_tests {
         assert_eq!(git_out(&store, &["rev-parse", "HEAD"]).unwrap(), line_pin);
         software_check(&host, &recipe); // passes: handle resolves to store, pin+branch match
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // host-lifecycle#14: `--partial` clones the bare store with --filter=blob:none, and
+    // the pin still round-trips — the worktree fetches the pinned tree's blobs from the
+    // promisor remote at checkout (a `file://` url so git honours the filter).
+    #[cfg(unix)]
+    #[test]
+    fn materialize_partial_clone_still_pins() {
+        let base = std::env::temp_dir().join(format!("hl-software-partial-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let host = base.join("host");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        let g = |cwd: &Path, args: &[&str]| assert!(git_ok(cwd, args), "git {args:?} failed");
+        g(&src, &["init", "-q", "-b", "main"]);
+        g(&src, &["config", "user.email", "t@t"]);
+        g(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("readme.txt"), "seed").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "seed"]);
+        let pin = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+        let recipe = vec![Software {
+            name: "demo".to_string(),
+            url: format!("file://{}", src.display()),
+            pin: pin.clone(),
+            branch: "main".to_string(),
+            worktrees: Vec::new(),
+            lines: Vec::new(),
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        }];
+        software_materialize(&host, &recipe, true);
+        let canon = host.join("software").join("demo").join("main");
+        assert!(canon.is_dir(), "canonical worktree created from a partial clone");
+        assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin, "the pin round-trips through a partial clone");
+        assert_eq!(fs::read_to_string(canon.join("readme.txt")).unwrap(), "seed", "the pinned blob was fetched on checkout");
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -9592,7 +9888,7 @@ mod software_tests {
             lines: Vec::new(),
             build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
 
         // The bare store is `.bare`, with a `.git` gitdir-link file beside it (call/0039).
         assert!(host.join("software").join("demo").join(".bare").is_dir(), "bare store created at .bare");
@@ -9612,7 +9908,7 @@ mod software_tests {
         let gitlink = host.join("software").join("demo").join(".git");
         fs::remove_file(&gitlink).unwrap();
         assert!(software_check(&host, &recipe) > 0, "a missing .git gitdir-link hazards the check");
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
         assert_eq!(fs::read_to_string(&gitlink).unwrap(), "gitdir: ./.bare\n", "re-materialize self-heals the .git link");
         assert_eq!(software_check(&host, &recipe), 0, "self-healed link is clean again");
 
@@ -9621,7 +9917,7 @@ mod software_tests {
         // with "missing but already registered" (plan/0029).
         fs::remove_dir_all(&canon).unwrap();
         assert!(!canon.is_dir());
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
         assert!(canon.is_dir(), "canonical re-created after removal + prune");
         assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
 
@@ -9670,7 +9966,7 @@ mod software_tests {
         // Before migration the new-layout check hazards (no `.bare`).
         assert!(software_check(&host, &recipe) > 0, "old layout hazards the new check");
         // Migrate.
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
         assert!(comp.join(".bare").is_dir(), "migrated to .bare");
         assert!(comp.join(".git").is_file(), ".git is now a gitdir-link file");
         assert_eq!(fs::read_to_string(comp.join(".git")).unwrap(), "gitdir: ./.bare\n");
@@ -9678,7 +9974,7 @@ mod software_tests {
         assert_eq!(git_out(&comp.join("main"), &["rev-parse", "HEAD"]).unwrap(), pin, "worktree repaired to its pin");
         assert_eq!(software_check(&host, &recipe), 0, "migrated component is clean");
         // Idempotent: a second materialize neither re-migrates nor fails.
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
         assert_eq!(software_check(&host, &recipe), 0, "second materialize stays clean");
 
         let _ = fs::remove_dir_all(&base);
@@ -9826,7 +10122,7 @@ mod software_tests {
             lines: Vec::new(),
             build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
         let canon = host.join("software").join("demo").join("main");
         // At the pin: clean (the rule's precondition is not met — DetectOffPin.1 failure).
         assert_eq!(software_check(&host, &recipe), 0, "a matching pin is clean");
@@ -9879,7 +10175,7 @@ mod software_tests {
             lines: Vec::new(),
             build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
         let comp = host.join("software").join("demo");
         assert!(comp.is_dir(), "materialized");
         // canonical worktree is at the pin (== origin/main): clean and pushed
@@ -9915,7 +10211,7 @@ mod software_tests {
             lines: Vec::new(),
             build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
         }];
-        software_materialize(&host, &recipe);
+        software_materialize(&host, &recipe, false);
         let canon = host.join("software").join("demo").join("main");
         fs::write(canon.join("scratch.txt"), "uncommitted").unwrap();
         assert!(worktree_unsaved(&canon).is_some(), "uncommitted change makes teardown unsafe");
@@ -10120,6 +10416,54 @@ mod software_tests {
         assert_eq!(reconcile_kind("| Where | software/ | <!-- host-reconcile: where-root -->").as_deref(), Some("where-root"));
         assert_eq!(reconcile_kind("plain line, no annotation"), None);
         assert_eq!(reconcile_kind("<!-- host-reconcile:  -->"), None);
+    }
+
+    #[test]
+    fn plan_index_problems_flags_unindexed_ghost_and_ignores_prose_and_fences() {
+        let doc = |r: &str, c: &str| (r.to_string(), c.to_string());
+        // gap: plan/0002-y has a tracked README, PLAN.md indexes only 0001
+        let gap = vec![
+            doc("PLAN.md", "# Plan\n| [x](plan/0001-x/README.md) | done |\n"),
+            doc("plan/0001-x/README.md", "x"),
+            doc("plan/0002-y/README.md", "y"),
+        ];
+        assert!(
+            plan_index_problems(&gap).iter().any(|h| h.contains("omits") && h.contains("plan/0002-y")),
+            "an unindexed directory hazards: {:?}",
+            plan_index_problems(&gap)
+        );
+        // clean: both directories linked
+        let clean = vec![
+            doc("PLAN.md", "# Plan\n| [x](plan/0001-x/README.md) |\n| [y](plan/0002-y/README.md) |\n"),
+            doc("plan/0001-x/README.md", "x"),
+            doc("plan/0002-y/README.md", "y"),
+        ];
+        assert!(plan_index_problems(&clean).is_empty(), "a fully-indexed set is clean: {:?}", plan_index_problems(&clean));
+        // a bare prose mention is not a live row
+        let prose = vec![
+            doc("PLAN.md", "# Plan\n| [x](plan/0001-x/README.md) |\nplan/0002-y is cut but carries no linked row\n"),
+            doc("plan/0001-x/README.md", "x"),
+            doc("plan/0002-y/README.md", "y"),
+        ];
+        assert!(plan_index_problems(&prose).iter().any(|h| h.contains("plan/0002-y")), "a prose mention is not a row");
+        // reverse: a row links a directory that does not exist
+        let ghost = vec![
+            doc("PLAN.md", "# Plan\n| [x](plan/0001-x/README.md) |\n| [g](plan/0099-ghost/README.md) |\n"),
+            doc("plan/0001-x/README.md", "x"),
+        ];
+        assert!(
+            plan_index_problems(&ghost).iter().any(|h| h.contains("no such plan/ directory") && h.contains("plan/0099-ghost")),
+            "a row linking a nonexistent directory hazards"
+        );
+        // a link inside a fenced block is masked out, so it is not a live row
+        let fenced = vec![
+            doc("PLAN.md", "# Plan\n| [x](plan/0001-x/README.md) |\n```\n[ex](plan/0002-y/README.md)\n```\n"),
+            doc("plan/0001-x/README.md", "x"),
+            doc("plan/0002-y/README.md", "y"),
+        ];
+        assert!(plan_index_problems(&fenced).iter().any(|h| h.contains("plan/0002-y")), "a fenced link is not a live row");
+        // no PLAN.md: inert
+        assert!(plan_index_problems(&[doc("plan/0001-x/README.md", "x")]).is_empty(), "no PLAN.md is inert");
     }
 
     #[test]
@@ -10546,6 +10890,22 @@ mod book_tests {
         fs::write(base.join(STAMP), "template = \"x\"\nrevision = \"abc\"\nname = \"agentic-host\"\n").unwrap();
         assert!(book_toml(&base).contains("title = \"agentic-host\""));
         assert!(!book_toml(&base).contains(&format!("title = \"{dir}\"")));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn book_toml_emits_site_url_only_for_a_non_default_mount() {
+        let base = std::env::temp_dir().join(format!("hl-mount-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        // no book-mount declared -> default "/", and book.toml carries no site-url line
+        fs::write(base.join(STAMP), "template = \"x\"\nrevision = \"abc\"\nname = \"proj\"\n").unwrap();
+        assert_eq!(stamp_book_mount(&base), "/");
+        assert!(!book_toml(&base).contains("site-url"), "the default mount emits no site-url");
+        // a declared sub-path mount -> mdBook site-url under [output.html]
+        fs::write(base.join(STAMP), "template = \"x\"\nrevision = \"abc\"\nname = \"proj\"\nbook-mount = \"/book/\"\n").unwrap();
+        assert_eq!(stamp_book_mount(&base), "/book/");
+        assert!(book_toml(&base).contains("site-url = \"/book/\""), "a non-default mount emits site-url: {}", book_toml(&base));
         let _ = fs::remove_dir_all(&base);
     }
 
