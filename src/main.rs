@@ -5990,6 +5990,59 @@ fn read_workflows(worktree: &Path) -> String {
 /// on any obligation with no disposition, any stale manifest id no longer derived,
 /// any `test:<name>` absent from the `--tests` sources, and any tier proof name
 /// absent from the `--prove` sources (the crate / `.tla`).
+/// Run `allium plan <spec>` and return its stdout, or an error message. Shared by the
+/// `obligations` CLI and the release-gate discharge (plan/0069).
+fn allium_plan(spec: &Path) -> Result<String, String> {
+    match process::Command::new("allium").arg("plan").arg(spec).output() {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(o) => Err(format!("`allium plan` failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Err(format!("cannot run `allium plan` (is allium-cli installed?): {e}")),
+    }
+}
+
+/// The `.allium` spec paths under `dir` (symlink-safe; skips build/cache dirs), for the
+/// release gate (plan/0069) to find the released component's specs.
+fn find_allium_specs(dir: &Path) -> Vec<PathBuf> {
+    walk_files_safe(dir, &[".git", "target", "node_modules"])
+        .into_iter()
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("allium"))
+        .collect()
+}
+
+/// The STALE-input-digest problems for one obligations manifest: the release gate's
+/// allium-free arm (plan/0069). Reads the dispositions and the sibling `.digests` ledger
+/// and reports any rung whose declared inputs drifted since the recorded re-derivation
+/// (the born-red-tag class). Empty means clean.
+fn manifest_staleness_problems(manifest: &Path) -> Vec<String> {
+    let dispositions = match fs::read_to_string(manifest) {
+        Ok(t) => parse_obligation_manifest(&t),
+        Err(_) => return Vec::new(),
+    };
+    let ledger = digest_ledger_path(manifest);
+    let base = manifest.parent().unwrap_or(Path::new("."));
+    staleness_problems(&dispositions, base, &ledger)
+}
+
+/// The offline discharge problems for one spec, run by the release gate (plan/0069):
+/// MISSING/STALE dispositions (`allium plan` + `obligation_gaps`) and STALE input
+/// digests (`manifest_staleness_problems`). Empty is clean. No `--tests` (test-name
+/// resolution stays in component CI) and no `--rederive` (proof re-derivation stays in
+/// component CI, where the heavy verifiers live).
+fn discharge_problems(spec: &Path, manifest: &Path) -> Result<Vec<String>, String> {
+    let plan = allium_plan(spec)?;
+    let plan_ids = extract_obligation_ids(&plan);
+    if plan_ids.is_empty() {
+        return Err(format!("`allium plan` produced no obligations for {}", spec.display()));
+    }
+    let dispositions = match fs::read_to_string(manifest) {
+        Ok(t) => parse_obligation_manifest(&t),
+        Err(e) => return Err(format!("cannot read manifest {} ({e}); a .allium needs a sibling .obligations", manifest.display())),
+    };
+    let mut problems = obligation_gaps(&plan_ids, &dispositions, None, None);
+    problems.extend(manifest_staleness_problems(manifest));
+    Ok(problems)
+}
+
 fn obligations(args: &[String]) {
     let mut pos: Vec<&String> = Vec::new();
     let mut manifest_arg: Option<&String> = None;
@@ -6037,14 +6090,10 @@ fn obligations(args: &[String]) {
         None => spec_path.with_extension("obligations"),
     };
     // 1. Derive the obligations from the spec.
-    let plan = match process::Command::new("allium").arg("plan").arg(spec_path).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Ok(o) => {
-            eprintln!("host-lifecycle: `allium plan` failed: {}", String::from_utf8_lossy(&o.stderr).trim());
-            process::exit(2);
-        }
+    let plan = match allium_plan(spec_path) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("host-lifecycle: cannot run `allium plan` (is allium-cli installed?): {e}");
+            eprintln!("host-lifecycle: {e}");
             process::exit(2);
         }
     };
@@ -8853,6 +8902,35 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
         println!("  verify: green");
     }
 
+    // Step 1b (plan/0069) — discharge the released component's obligations offline. A
+    // release must not ship its own component red on a local lane: run the obligations
+    // check (no --tests, no --rederive) for each .allium the component carries, and
+    // block on MISSING/STALE dispositions or STALE input digests (the born-red-tag
+    // class, plan/0045/plan/0048/host-lint v0.14.0). Test-name resolution and proof
+    // re-derivation stay in component CI; allium-cli must be on PATH (plan/0069 Q1).
+    for spec_path in find_allium_specs(&work) {
+        let rel = spec_path.strip_prefix(&work).unwrap_or(&spec_path);
+        println!("release {component}: discharging {} …", rel.display());
+        let manifest = spec_path.with_extension("obligations");
+        let problems = match discharge_problems(&spec_path, &manifest) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("host-lifecycle: {component} discharge error: {e} — release blocked");
+                process::exit(1);
+            }
+        };
+        if !problems.is_empty() {
+            for p in &problems {
+                eprintln!("    {p}");
+            }
+            eprintln!(
+                "host-lifecycle: {component} obligations discharge has {} problem(s) — release blocked. Fix the discharge, then re-run.",
+                problems.len()
+            );
+            process::exit(1);
+        }
+    }
+
     // Step 2 — change class. The one decision the agent supplies; the tool maps it.
     let Some(class_str) = change_class else {
         println!("next: host-lifecycle release {component} --change-class <{CHANGE_CLASSES}>");
@@ -9012,16 +9090,29 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
 /// is incomplete until host-template's prose-CI pin equals the released commit, or `software
 /// --check` HAZARDs the drift. Empty for any other component, since only host-lifecycle is pinned
 /// by the template today. Pure, so the exact steps are unit-tested.
+/// The host-template carried-pin bump steps a release must run (call/0038). A host-* tool the
+/// host carries as a `host-template/tools/<component>` submodule is pinned there too, so its
+/// release is incomplete until that submodule points at the released commit, or `software
+/// --check` HAZARDs the drift. host-lifecycle is also pinned via the prose-CI `--rev`
+/// install, so it carries an extra step. plan/0069 generalized this beyond host-lifecycle
+/// (host-lint release now prompts its bump too). Pure, so the steps are unit-tested; the
+/// explicit enumeration mirrors `template_pin_problems`.
 fn template_pin_bump_lines(component: &str, new: &str) -> Vec<String> {
-    if component != "host-lifecycle" {
+    let carried: &[(&str, &str)] = &[("host-lifecycle", "tools/host-lifecycle"), ("host-lint", "tools/host-lint")];
+    let Some(subpath) = carried.iter().find_map(|(c, p)| (*c == component).then_some(*p)) else {
         return Vec::new();
+    };
+    let mut lines = vec![format!("  then bump host-template's pins for {component} (call/0038):")];
+    if component == "host-lifecycle" {
+        lines.push(format!(
+            "    set --rev in host-template/.github/workflows/prose.yml to <the pushed commit SHA> (and the v{new} comment)"
+        ));
     }
-    vec![
-        "  then bump host-template's host-lifecycle pin (call/0038):".to_string(),
-        format!("    set --rev in host-template/.github/workflows/prose.yml to <the pushed commit SHA> (and the v{new} comment)"),
-        format!("    cd host-template && git commit -am 'pin host-lifecycle v{new}' && git push && cd .."),
-        "    git add host-template && git commit -m 'bump host-template pointer' && git push".to_string(),
-    ]
+    lines.push(format!(
+        "    cd host-template && git submodule update --init {subpath} && git -C {subpath} fetch origin && git -C {subpath} checkout <the pushed commit SHA> && git add {subpath} && git commit -am 'pin {component} v{new}' && git push && cd .."
+    ));
+    lines.push("    git add host-template && git commit -m 'bump host-template pointer' && git push".to_string());
+    lines
 }
 
 /// The `verify` phase's closed `recheck` command from the live manifest (the verify
@@ -10222,6 +10313,30 @@ mod software_tests {
     }
 
     #[test]
+    fn manifest_staleness_problems_catch_a_staled_digest() {
+        // The release gate's allium-free arm (plan/0069): parse an obligations manifest,
+        // resolve its sibling digest ledger, and report a STALE rung. This is the born-red
+        // class caught at release time without needing allium plan or the test sources.
+        let dir = std::env::temp_dir().join(format!("hl-mstale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("foo.rs"), "fn a() {}\n").unwrap();
+        let manifest = dir.join("m.obligations");
+        fs::write(&manifest, "# c\nrule-success.X => kani:h inputs=foo.rs\n").unwrap();
+        // Fresh record: clean.
+        let disp = parse_obligation_manifest(&fs::read_to_string(&manifest).unwrap());
+        let ledger = digest_ledger_path(&manifest);
+        assert_eq!(record_digests(&disp, &dir, &ledger).unwrap(), 1);
+        assert!(manifest_staleness_problems(&manifest).is_empty(), "fresh record must not be stale");
+        // Change the proven input: STALE through the manifest path.
+        fs::write(dir.join("foo.rs"), "fn b() {}\n").unwrap();
+        let probs = manifest_staleness_problems(&manifest);
+        assert_eq!(probs.len(), 1, "{probs:?}");
+        assert!(probs[0].contains("STALE"), "{probs:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn seed_lexicon_writes_a_warn_free_scaffold() {
         let dir = std::env::temp_dir().join(format!("hl-seed-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -10731,11 +10846,19 @@ mod software_tests {
     // issue #9 review: the release emits the template-pin-bump steps for host-lifecycle only, each
     // a concrete command (including the submodule-pointer bump).
     #[test]
-    fn template_pin_bump_lines_are_host_lifecycle_only() {
-        let lines = template_pin_bump_lines("host-lifecycle", "0.36.0");
-        assert!(lines.iter().any(|l| l.contains("prose.yml") && l.contains("0.36.0")), "names the prose.yml --rev bump");
-        assert!(lines.iter().any(|l| l.contains("git add host-template")), "names the submodule pointer bump as a command");
-        assert!(template_pin_bump_lines("host-lint", "1.0.0").is_empty(), "no steps for a component the template does not pin");
+    fn template_pin_bump_lines_cover_every_carried_tool() {
+        // host-lifecycle is pinned two ways: the prose-CI --rev install AND the tools/host-lifecycle submodule.
+        let hl = template_pin_bump_lines("host-lifecycle", "0.36.0");
+        assert!(hl.iter().any(|l| l.contains("prose.yml") && l.contains("0.36.0")), "host-lifecycle names the prose.yml --rev bump");
+        assert!(hl.iter().any(|l| l.contains("tools/host-lifecycle")), "host-lifecycle names the tools/host-lifecycle submodule bump");
+        assert!(hl.iter().any(|l| l.contains("git add host-template")), "names the host submodule-pointer bump");
+        // host-lint is pinned one way: the tools/host-lint submodule (plan/0069 added this).
+        let lint = template_pin_bump_lines("host-lint", "1.0.0");
+        assert!(lint.iter().any(|l| l.contains("tools/host-lint")), "host-lint names the tools/host-lint submodule bump");
+        assert!(!lint.iter().any(|l| l.contains("prose.yml")), "host-lint has no prose.yml pin");
+        assert!(lint.iter().any(|l| l.contains("git add host-template")), "names the host submodule-pointer bump");
+        // A component the template does not carry gets no steps.
+        assert!(template_pin_bump_lines("host-reference", "0.1.6").is_empty(), "no steps for a component the template does not pin");
     }
 
     // issue #9 / call/0038: the template-pin gate HAZARDs when the template's prose CI pins a
