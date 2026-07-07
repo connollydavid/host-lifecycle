@@ -101,13 +101,6 @@ fn tool_result(text: &str, is_error: bool) -> Value {
 /// source folder positionally; both map name (an override wins), purpose, and at.
 fn verb_argv(verb: &str, args: &Value, name_override: Option<&str>) -> Vec<String> {
     let mut argv = vec![verb.to_string()];
-    if verb == "adopt" {
-        if let Some(src) = args.get("source").and_then(Value::as_str) {
-            if !src.trim().is_empty() {
-                argv.push(src.to_string());
-            }
-        }
-    }
     let name = name_override
         .or_else(|| args.get("name").and_then(Value::as_str))
         .map(str::trim)
@@ -121,6 +114,16 @@ fn verb_argv(verb: &str, args: &Value, name_override: Option<&str>) -> Vec<Strin
             if !v.trim().is_empty() {
                 argv.push(flag.into());
                 argv.push(v.to_string());
+            }
+        }
+    }
+    // The adopt source follows an end-of-options `--`, so a `source` value beginning with `-` cannot
+    // be read as a flag by the subprocess. This closes argument injection from the MCP source field.
+    if verb == "adopt" {
+        if let Some(src) = args.get("source").and_then(Value::as_str) {
+            if !src.trim().is_empty() {
+                argv.push("--".into());
+                argv.push(src.to_string());
             }
         }
     }
@@ -168,7 +171,12 @@ async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Option<Value> 
         if t.is_empty() {
             continue;
         }
-        return serde_json::from_str(t).ok();
+        match serde_json::from_str(t) {
+            Ok(v) => return Some(v),
+            // A non-JSON line is logged-and-ignored per the spec, not end-of-input, so skip it
+            // rather than conflating a parse failure with a closed pipe (which would kill the server).
+            Err(_) => continue,
+        }
     }
 }
 
@@ -257,14 +265,19 @@ where
         let eid = *next_id;
         *next_id += 1;
         write_value(writer, &elicitation_request(eid)).await;
-        if let Some(resp) = read_message(reader).await {
-            if resp.get("id").and_then(Value::as_i64) == Some(eid) {
-                if let Some(name) = name_from_elicitation(&resp) {
-                    let (t, c) = run_verb(&verb_argv(verb, &args, Some(&name)));
-                    text = t;
-                    code = c;
-                }
+        // Read until the response for our elicitation id arrives, skipping any interleaved
+        // notification or unrelated message rather than assuming it is the very next line.
+        loop {
+            let Some(resp) = read_message(reader).await else { break };
+            if resp.get("id").and_then(Value::as_i64) != Some(eid) {
+                continue; // a notification or stray message; keep waiting for our response
             }
+            if let Some(name) = name_from_elicitation(&resp) {
+                let (t, c) = run_verb(&verb_argv(verb, &args, Some(&name)));
+                text = t;
+                code = c;
+            }
+            break;
         }
     }
     tool_result(&text, code != 0)
@@ -305,9 +318,32 @@ mod tests {
         let a = json!({"purpose": "reader", "at": "/tmp"});
         assert_eq!(verb_argv("init", &a, Some("acme")), vec!["init", "--name", "acme", "--purpose", "reader", "--at", "/tmp"]);
         let b = json!({"source": "/home/user/notes"});
-        assert_eq!(verb_argv("adopt", &b, Some("bar")), vec!["adopt", "/home/user/notes", "--name", "bar"]);
+        assert_eq!(verb_argv("adopt", &b, Some("bar")), vec!["adopt", "--name", "bar", "--", "/home/user/notes"]);
+        // a source beginning with `-` is guarded behind `--`, not read as a flag by the subprocess
+        let inj = json!({"source": "--at"});
+        assert_eq!(verb_argv("adopt", &inj, None), vec!["adopt", "--", "--at"]);
         // no name and no override -> the subprocess will hit its own backstop
         assert_eq!(verb_argv("init", &json!({}), None), vec!["init"]);
+    }
+
+    // F2: an interleaved notification between elicitation/create and the response must not be
+    // mistaken for the response; the server skips it and still gets the name.
+    #[tokio::test]
+    async fn serve_skips_an_interleaved_notification_during_elicitation() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"elicitation":{}}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"init","arguments":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"action":"accept","content":{"name":"acme"}}}"#, "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        let run = |argv: &[String]| {
+            if argv.iter().any(|a| a == "--name") { (format!("ok {}", argv.join(" ")), 0) }
+            else { ("name-required\n".to_string(), crate::EXIT_NAME_REQUIRED) }
+        };
+        serve(BufReader::new(input.as_bytes()), &mut out, run).await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("--name acme"), "the interleaved notification was skipped and the elicited name resolved");
     }
 
     // The full turn-based flow with elicitation: init is called with no name, the stub verb

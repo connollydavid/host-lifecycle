@@ -585,15 +585,29 @@ fn git_init_commit(dir: &Path, message: &str) -> Result<(), String> {
         let _ = git(&["config", "user.email", "host-lifecycle@localhost"]);
         let _ = git(&["config", "user.name", "host-lifecycle"]);
     }
-    let o = git(&["add", "-A"])?;
+    // Stage only the scaffold artifacts (not a blanket `-A`), so a `--force` reuse of a populated
+    // repo never sweeps unrelated working-tree files into the scaffold commit.
+    const SCAFFOLD: [&str; 7] = ["cast", "plan", "call", ".host", "LEXICON", "README.md", "MEMORY.md"];
+    let present: Vec<&str> = SCAFFOLD.iter().copied().filter(|p| dir.join(p).exists()).collect();
+    if present.is_empty() {
+        return Ok(()); // nothing scaffolded to commit
+    }
+    let mut add_args: Vec<&str> = vec!["add", "--"];
+    add_args.extend_from_slice(&present);
+    let o = git(&add_args)?;
     if !o.status.success() {
         return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
     }
     let o = git(&["commit", "-q", "-m", message])?;
     if !o.status.success() {
-        let err = String::from_utf8_lossy(&o.stderr);
-        if !err.contains("nothing to commit") {
-            return Err(err.trim().to_string());
+        // A "nothing to commit" outcome (git prints it to stdout) is a clean no-op, not a failure.
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        if !combined.contains("nothing to commit") {
+            return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
         }
     }
     Ok(())
@@ -645,11 +659,8 @@ fn github_create_push(dir: &Path, name: &str, public: bool) -> Result<String, St
 /// leaves the project intact, prints the manual remote steps, and exits 5. Returns the remote URL
 /// when one was created.
 fn finalize_onboarding(target: &Path, name: &str, no_git: bool, github: bool, public: bool) -> Option<String> {
+    // The --no-git + --github conflict is caught at the verb's preflight, before any scaffold.
     if no_git {
-        if github {
-            eprintln!("host-lifecycle: --github needs a commit; drop --no-git");
-            process::exit(2);
-        }
         return None;
     }
     if let Err(e) = git_init_commit(target, &format!("scaffold agentic-{name}")) {
@@ -720,6 +731,11 @@ fn init(args: &[String]) {
         eprintln!("host-lifecycle init [<name>] [--at <dir>] [--purpose <line>] [--revision <rev>] [--force] [--github [--public]] [--no-git]");
         process::exit(2);
     }
+    // Preflight the conflicting-flags case before any write (plan/0065: preflight before scaffold).
+    if no_git && github {
+        eprintln!("host-lifecycle init: --github needs a commit; drop --no-git");
+        process::exit(2);
+    }
     let name_arg = explicit_name.or_else(|| pos.into_iter().next());
     let name = resolve_name(name_arg.as_deref());
     if let Err(msg) = validate_slug(&name) {
@@ -751,9 +767,18 @@ fn adopt(args: &[String]) {
     let mut public = false;
     let mut no_git = false;
     let mut pos: Vec<String> = Vec::new();
+    let mut end_of_opts = false;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        let a = args[i].as_str();
+        if end_of_opts {
+            pos.push(a.to_string());
+            i += 1;
+            continue;
+        }
+        match a {
+            // an explicit end-of-options, so a source path that begins with `-` is not read as a flag
+            "--" => end_of_opts = true,
             "--at" => { i += 1; at = args.get(i).cloned(); }
             "--purpose" => { i += 1; purpose = args.get(i).cloned(); }
             "--name" => { i += 1; explicit_name = args.get(i).cloned(); }
@@ -762,7 +787,6 @@ fn adopt(args: &[String]) {
             "--github" => github = true,
             "--public" => public = true,
             "--no-git" => no_git = true,
-            "--dry-run" => {} // meaningful only for the deprecated primitive form, forwarded below
             other if other.starts_with("--") => {
                 eprintln!("host-lifecycle adopt: unknown flag {other}");
                 process::exit(2);
@@ -772,15 +796,19 @@ fn adopt(args: &[String]) {
         i += 1;
     }
 
-    // Deprecate-then-retire shim (call/0041): the old primitive form `adopt <dir> <revision>` is
-    // exactly two positional arguments. Warn and forward to `scaffold`, retiring a release later.
-    if pos.len() == 2 {
-        eprintln!("host-lifecycle: `adopt <dir> <revision>` is deprecated; use `host-lifecycle scaffold <dir> <revision>` (call/0041)");
-        scaffold(args);
-        return;
-    }
+    // `adopt` takes at most one positional (the source folder). Two or more is a hard error, never a
+    // silent forward: the onboarding grammar cannot safely disambiguate the retired
+    // `adopt <dir> <revision>` primitive from a mistaken `adopt <source> <name>`, and forwarding the
+    // latter to `scaffold` would write into the source, breaking the source-read-only invariant. The
+    // primitive lives on under its own name (call/0041; the review found the forward unsafe).
     if pos.len() > 1 {
-        eprintln!("host-lifecycle adopt [<source>] [--at <dir>] [--purpose <line>] [--name <name>] [--force]");
+        eprintln!("host-lifecycle adopt takes at most one positional <source>.");
+        eprintln!("  for the renamed scaffold+stamp primitive, use: host-lifecycle scaffold <dir> <revision>");
+        eprintln!("  to name the new host, use --name: host-lifecycle adopt [<source>] --name <name>");
+        process::exit(2);
+    }
+    if no_git && github {
+        eprintln!("host-lifecycle adopt: --github needs a commit; drop --no-git");
         process::exit(2);
     }
 
@@ -792,19 +820,23 @@ fn adopt(args: &[String]) {
     let source = source_raw.canonicalize().unwrap_or_else(|_| source_raw.to_path_buf());
 
     match adopt_route(&source, force) {
-        // Route one: a software repository is refused in place, with the embed-elsewhere steps.
+        // Route one: a software repository is refused in place, with the embed-elsewhere steps. The
+        // refuse outcome is exit 4 (the ruled contract's "target-exists or refuse"), distinct from a
+        // usage error (2), so a scripted caller can tell a principled refusal from a bad invocation.
         AdoptRoute::Refuse(manifest) => {
             eprint!("{}", refuse_adopt_in_place(&source.display().to_string(), manifest));
-            process::exit(2);
+            process::exit(EXIT_TARGET_EXISTS);
         }
-        // Route two: an empty `agentic-<name>` folder is adopted in place, its name from the folder.
+        // Route two: an effectively-empty `agentic-<name>` folder is adopted in place, its name from
+        // the folder. The oneshot finalize (git commit, optional remote) applies here too.
         AdoptRoute::InPlace(name) => {
             let rev = revision.unwrap_or_else(resolve_template_revision);
             println!("adopt in place: {} (name {name}, taken from the folder)", source.display());
             scaffold_rooms_stamp(&source, &rev, false);
             seed_memory(&source, purpose.as_deref());
             print_scaffold_checklist(&rev);
-            print!("\n{}", handoff_block(&source.display().to_string(), None));
+            let remote = finalize_onboarding(&source, &name, no_git, github, public);
+            print!("\n{}", handoff_block(&source.display().to_string(), remote.as_deref()));
         }
         // Route three: an arbitrary folder — elicit a name, create the host elsewhere, source untouched.
         AdoptRoute::Elsewhere => {
@@ -817,6 +849,17 @@ fn adopt(args: &[String]) {
                 Some(a) => PathBuf::from(a),
                 None => source.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("..")),
             };
+            // The source is read-only on route three, so the new host must land outside it. Resolve
+            // the parent (best effort for a not-yet-existing --at) and refuse a target within source.
+            let parent_abs = parent
+                .canonicalize()
+                .or_else(|_| env::current_dir().map(|c| c.join(&parent)))
+                .unwrap_or_else(|_| parent.clone());
+            let target_preview = parent_abs.join(format!("agentic-{name}"));
+            if target_preview == source || target_preview.starts_with(&source) {
+                eprintln!("host-lifecycle adopt: the new host would land inside the source {}; route three keeps the source untouched, so choose an --at outside it", source.display());
+                process::exit(2);
+            }
             let rev = revision.unwrap_or_else(resolve_template_revision);
             let target = create_project(&name, &parent, purpose.as_deref(), &rev, force);
             let remote = finalize_onboarding(&target, &name, no_git, github, public);
@@ -842,13 +885,28 @@ fn adopt_route(source: &Path, force: bool) -> AdoptRoute {
         return AdoptRoute::Refuse(manifest);
     }
     if let Some(name) = agentic_basename(source) {
-        let unstamped_empty = !source.join(STAMP).is_file()
-            && fs::read_dir(source).map(|mut d| d.next().is_none()).unwrap_or(false);
+        let unstamped_empty = !source.join(STAMP).is_file() && dir_effectively_empty(source);
         if unstamped_empty || force {
             return AdoptRoute::InPlace(name);
         }
     }
     AdoptRoute::Elsewhere
+}
+
+/// Whether a folder is empty enough to adopt in place (plan/0065 route two): it carries no entries
+/// beyond the artifacts a freshly created or cloned repo brings (`.git`, `.gitignore`, a README, a
+/// LICENSE), so a `git init agentic-<name>` or a fresh `gh repo create --clone` still routes in place.
+fn dir_effectively_empty(dir: &Path) -> bool {
+    const CARRIED: [&str; 5] = [".git", ".gitignore", "README.md", "LICENSE", "LICENSE.md"];
+    match fs::read_dir(dir) {
+        Ok(entries) => entries.filter_map(Result::ok).all(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| CARRIED.contains(&n))
+                .unwrap_or(false)
+        }),
+        Err(_) => false,
+    }
 }
 
 /// `version <dir>` — print the template revision recorded in the stamp.
@@ -9289,6 +9347,7 @@ mod tests {
             "--at".into(), base.to_string_lossy().into_owned(),
             "--purpose".into(), "reference compiler".into(),
             "--revision".into(), "deadbeef1234".into(),
+            "--no-git".into(),
         ]);
         let proj = base.join("agentic-acme");
         assert!(proj.join(".host").is_file(), "stamp written");
@@ -9326,8 +9385,12 @@ mod tests {
         let named = base.join("agentic-acme");
         fs::create_dir_all(&named).unwrap();
         assert!(matches!(adopt_route(&named, false), AdoptRoute::InPlace(ref n) if n == "acme"), "empty agentic-<name> in place");
+        // a freshly git-inited/cloned folder (only .git + a README) still routes in place (F6)
+        fs::create_dir_all(named.join(".git")).unwrap();
+        fs::write(named.join("README.md"), "# x\n").unwrap();
+        assert!(matches!(adopt_route(&named, false), AdoptRoute::InPlace(_)), "a .git+README agentic folder is effectively empty");
         fs::write(named.join("stray.txt"), "x").unwrap();
-        assert!(matches!(adopt_route(&named, false), AdoptRoute::Elsewhere), "non-empty agentic folder is not in-place");
+        assert!(matches!(adopt_route(&named, false), AdoptRoute::Elsewhere), "real content -> not in-place");
         assert!(matches!(adopt_route(&named, true), AdoptRoute::InPlace(_)), "--force claims a non-empty agentic folder");
 
         let notes = base.join("notes");
@@ -9352,16 +9415,20 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    // call/0041 deprecate-then-retire: the old `adopt <dir> <rev>` primitive form still works,
-    // forwarding to scaffold, so the migration breaks no existing caller on the release.
+    // call/0041: the renamed scaffold primitive still writes rooms + the stamp. (The old
+    // `adopt <dir> <rev>` two-positional form now hard-errors to protect the source-read-only
+    // invariant, so it is exercised through the integration test, not here where exit would abort.)
     #[test]
-    fn adopt_deprecated_primitive_form_forwards_to_scaffold() {
-        let base = std::env::temp_dir().join(format!("hl-depr-{}", process::id()));
+    fn scaffold_primitive_writes_rooms_and_stamp() {
+        let base = std::env::temp_dir().join(format!("hl-scaffold-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
-        adopt(&[base.to_string_lossy().into_owned(), "oldrev99".into()]);
-        assert!(base.join(".host").is_file(), "deprecated adopt <dir> <rev> still scaffolds");
-        assert!(fs::read_to_string(base.join(".host")).unwrap().contains("oldrev99"));
+        scaffold(&[base.to_string_lossy().into_owned(), "primrev".into()]);
+        assert!(base.join(".host").is_file(), "scaffold writes the stamp");
+        assert!(fs::read_to_string(base.join(".host")).unwrap().contains("primrev"));
+        for room in ROOMS {
+            assert!(base.join(room).is_dir(), "room {room} scaffolded");
+        }
         let _ = fs::remove_dir_all(&base);
     }
 
