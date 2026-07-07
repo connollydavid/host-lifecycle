@@ -7194,6 +7194,52 @@ fn submodule_pin_problem(template: &Path, subpath: &str, tool: &str, want: &str)
 /// carries no template submodule, or names no such recipe pin. The whole-suite `software --check`
 /// (no `--item`) is the enforcing gate; a component-narrowed check legitimately skips this global
 /// invariant.
+/// The submodule names under `tools/` in the template's `.gitmodules` — the distribution
+/// surface the template ships to adopters (host-* tools plus the external referenced tools
+/// allium/specula). `find_template_dir` already gated on materialization, so a direct read.
+fn tools_submodule_names(template: &Path) -> Vec<String> {
+    let text = match fs::read_to_string(template.join(".gitmodules")) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    text.lines()
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("path")
+                .and_then(|r| r.trim_start().strip_prefix('='))
+                .map(|v| v.trim())
+                .and_then(|p| p.strip_prefix("tools/").map(|n| n.to_string()))
+        })
+        .collect()
+}
+
+/// The carried template tools (call/0038): each `.host-software` component that also
+/// appears as a `host-template/tools/<name>` submodule — a tool developed here that the
+/// template also distributes. External referenced tools (allium, specula) are in `tools/`
+/// but not `.host-software`, so they are excluded; a component not in `tools/` is not
+/// distributed. Inert (empty) for a consumer that develops no host-* tool or carries no
+/// template. plan/0069: this derived intersection replaces the prior hardcoded list.
+fn carried_template_tools(root: &Path, recipe: &[Software]) -> Vec<String> {
+    let Some(tdir) = find_template_dir(root) else {
+        return Vec::new();
+    };
+    let names = tools_submodule_names(&tdir);
+    recipe
+        .iter()
+        .map(|s| s.name.clone())
+        .filter(|n| names.iter().any(|x| x == n))
+        .collect()
+}
+
+/// call/0038: the host-template must pin every host-* tool it carries at the same commit
+/// the host gates on, so a tool release that does not fully upgrade the template is caught.
+/// The carried set is derived (`carried_template_tools`: `.host-software` ∩ `tools/`), so a
+/// new family tool lands in both lanes with no code change. host-lifecycle carries a second
+/// surface — the prose-CI `--rev` install (a mechanical pin, not prose) — checked as a
+/// labelled special case; every carried tool's `tools/<name>` submodule gitlink is checked
+/// in the loop. Returns the drift count (0 clean). Inert (0) when this repo carries no
+/// template submodule. The whole-suite `software --check` (no `--item`) is the enforcing
+/// gate; a component-narrowed check legitimately skips this global invariant.
 fn template_pin_problems(root: &Path, recipe: &[Software]) -> usize {
     let Some(tdir) = find_template_dir(root) else {
         return 0;
@@ -7201,7 +7247,9 @@ fn template_pin_problems(root: &Path, recipe: &[Software]) -> usize {
     let pin_of = |name: &str| recipe.iter().find(|s| s.name == name).map(|s| s.pin.as_str());
     let mut bad = 0usize;
 
-    // host-lifecycle: the prose-CI `--rev` install and the tools/host-lifecycle submodule.
+    // host-lifecycle is also installed via the prose-CI `--rev` (the prose-gate tool — a
+    // methodology fact, the one workflow-pin surface). A labelled special case; the loop
+    // below checks host-lifecycle's tools/host-lifecycle submodule like any carried tool.
     if let Some(hl) = pin_of("host-lifecycle") {
         if let Ok(yaml) = fs::read_to_string(tdir.join(".github").join("workflows").join("prose.yml")) {
             match template_hostlc_pin(&yaml) {
@@ -7224,12 +7272,13 @@ fn template_pin_problems(root: &Path, recipe: &[Software]) -> usize {
                 }
             }
         }
-        bad += submodule_pin_problem(&tdir, "tools/host-lifecycle", "host-lifecycle", hl);
     }
 
-    // host-lint: the tools/host-lint submodule.
-    if let Some(hlint) = pin_of("host-lint") {
-        bad += submodule_pin_problem(&tdir, "tools/host-lint", "host-lint", hlint);
+    // Every carried tool: its tools/<name> submodule gitlink must match the recorded pin.
+    for tool in carried_template_tools(root, recipe) {
+        if let Some(want) = pin_of(&tool) {
+            bad += submodule_pin_problem(&tdir, &format!("tools/{tool}"), &tool, want);
+        }
     }
 
     bad
@@ -9080,7 +9129,8 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     println!("  then re-pin {SOFTWARE} for [software \"{component}\"]:");
     println!("    pin      = <the pushed commit SHA>");
     println!("    artifact = {artifact_path} {hash}");
-    for line in template_pin_bump_lines(component, &new) {
+    let carried = carried_template_tools(root, &recipe);
+    for line in template_pin_bump_lines(component, &new, &carried) {
         println!("{line}");
     }
     println!("    host-lifecycle receipt --record release --component {component} --disposition done --evidence v{new}@{hash}");
@@ -9090,18 +9140,18 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
 /// is incomplete until host-template's prose-CI pin equals the released commit, or `software
 /// --check` HAZARDs the drift. Empty for any other component, since only host-lifecycle is pinned
 /// by the template today. Pure, so the exact steps are unit-tested.
-/// The host-template carried-pin bump steps a release must run (call/0038). A host-* tool the
-/// host carries as a `host-template/tools/<component>` submodule is pinned there too, so its
-/// release is incomplete until that submodule points at the released commit, or `software
-/// --check` HAZARDs the drift. host-lifecycle is also pinned via the prose-CI `--rev`
-/// install, so it carries an extra step. plan/0069 generalized this beyond host-lifecycle
-/// (host-lint release now prompts its bump too). Pure, so the steps are unit-tested; the
-/// explicit enumeration mirrors `template_pin_problems`.
-fn template_pin_bump_lines(component: &str, new: &str) -> Vec<String> {
-    let carried: &[(&str, &str)] = &[("host-lifecycle", "tools/host-lifecycle"), ("host-lint", "tools/host-lint")];
-    let Some(subpath) = carried.iter().find_map(|(c, p)| (*c == component).then_some(*p)) else {
+/// The host-template carried-pin bump steps a release must run (call/0038). `carried` is
+/// the derived set (`carried_template_tools`: `.host-software` ∩ `tools/`); a release of any
+/// carried tool must bump its `tools/<component>` submodule, or `software --check` HAZARDs
+/// the drift. host-lifecycle is also pinned via the prose-CI `--rev` install (the prose-gate
+/// tool), so it carries an extra step. The carried set is passed in (derived by the caller),
+/// keeping this pure and unit-testable; `template_pin_problems` consumes the same set, so the
+/// detection and the prompt cannot skew. plan/0069.
+fn template_pin_bump_lines(component: &str, new: &str, carried: &[String]) -> Vec<String> {
+    if !carried.iter().any(|c| c == component) {
         return Vec::new();
-    };
+    }
+    let subpath = format!("tools/{component}");
     let mut lines = vec![format!("  then bump host-template's pins for {component} (call/0038):")];
     if component == "host-lifecycle" {
         lines.push(format!(
@@ -10847,18 +10897,46 @@ mod software_tests {
     // a concrete command (including the submodule-pointer bump).
     #[test]
     fn template_pin_bump_lines_cover_every_carried_tool() {
+        let carried = vec!["host-lifecycle".to_string(), "host-lint".to_string()];
         // host-lifecycle is pinned two ways: the prose-CI --rev install AND the tools/host-lifecycle submodule.
-        let hl = template_pin_bump_lines("host-lifecycle", "0.36.0");
+        let hl = template_pin_bump_lines("host-lifecycle", "0.36.0", &carried);
         assert!(hl.iter().any(|l| l.contains("prose.yml") && l.contains("0.36.0")), "host-lifecycle names the prose.yml --rev bump");
         assert!(hl.iter().any(|l| l.contains("tools/host-lifecycle")), "host-lifecycle names the tools/host-lifecycle submodule bump");
         assert!(hl.iter().any(|l| l.contains("git add host-template")), "names the host submodule-pointer bump");
-        // host-lint is pinned one way: the tools/host-lint submodule (plan/0069 added this).
-        let lint = template_pin_bump_lines("host-lint", "1.0.0");
+        // host-lint is pinned one way: the tools/host-lint submodule.
+        let lint = template_pin_bump_lines("host-lint", "1.0.0", &carried);
         assert!(lint.iter().any(|l| l.contains("tools/host-lint")), "host-lint names the tools/host-lint submodule bump");
         assert!(!lint.iter().any(|l| l.contains("prose.yml")), "host-lint has no prose.yml pin");
-        assert!(lint.iter().any(|l| l.contains("git add host-template")), "names the host submodule-pointer bump");
-        // A component the template does not carry gets no steps.
-        assert!(template_pin_bump_lines("host-reference", "0.1.6").is_empty(), "no steps for a component the template does not pin");
+        // A tool in the derived carried set the template did not historically pin (host-foo) gets its bump — the Fen bar.
+        let foo = template_pin_bump_lines("host-foo", "0.1.0", &["host-foo".to_string()]);
+        assert!(foo.iter().any(|l| l.contains("tools/host-foo")), "a new carried tool gets its tools/<name> bump");
+        // A component not in the carried set gets no steps.
+        assert!(template_pin_bump_lines("host-reference", "0.1.6", &carried).is_empty(), "no steps for a component the template does not pin");
+    }
+
+    #[test]
+    fn carried_template_tools_returns_the_intersection() {
+        // Fen bar (plan/0069): a producer repo that develops a new family tool (host-foo) AND
+        // carries it in host-template/tools/ is carried, with no code change. External
+        // referenced tools (allium) and non-distributed components (host-reference) are excluded.
+        let base = std::env::temp_dir().join(format!("hl-carried-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let tdir = base.join("host-template");
+        fs::create_dir_all(&tdir).unwrap();
+        fs::write(tdir.join("UPGRADING.md"), "# ledger\n").unwrap();
+        fs::write(tdir.join(".gitmodules"),
+            "[submodule \"allium\"]\n\tpath = tools/allium\n\n[submodule \"host-lint\"]\n\tpath = tools/host-lint\n\n[submodule \"host-lifecycle\"]\n\tpath = tools/host-lifecycle\n\n[submodule \"host-foo\"]\n\tpath = tools/host-foo\n").unwrap();
+        let mk = |name: &str| Software {
+            name: name.into(), url: "u".into(), pin: "p".into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        };
+        let recipe = vec![mk("host-lint"), mk("host-lifecycle"), mk("host-foo"), mk("host-reference")];
+        let mut carried = carried_template_tools(&base, &recipe);
+        carried.sort();
+        assert_eq!(carried, vec!["host-foo".to_string(), "host-lifecycle".to_string(), "host-lint".to_string()],
+            "carried = .host-software ∩ tools/ (excludes allium the external tool and host-reference the non-distributed component)");
+        let _ = fs::remove_dir_all(&base);
     }
 
     // issue #9 / call/0038: the template-pin gate HAZARDs when the template's prose CI pins a
@@ -10912,6 +10990,12 @@ mod software_tests {
         g(&["init", "-q", "-b", "main"]);
         g(&["config", "user.email", "t@t"]);
         g(&["config", "user.name", "t"]);
+        // The carried set is derived from host-template/.gitmodules ∩ .host-software (plan/0069),
+        // so the fixture's .gitmodules must list the tools whose gitlinks drift below.
+        fs::write(tdir.join(".gitmodules"),
+            "[submodule \"host-lifecycle\"]\n\tpath = tools/host-lifecycle\n[submodule \"host-lint\"]\n\tpath = tools/host-lint\n").unwrap();
+        g(&["add", ".gitmodules"]);
+        g(&["commit", "-qm", "gitmodules"]);
         let recorded = "486add7227d1cf86f16ea4462a08d4efe0fca159"; // the recorded .host-software pin
         let stale = "2a24deb0e5bcb3b3c09f50c39d7cfb84c445eafa"; // an older commit
         let mk = |name: &str, pin: &str| Software {
