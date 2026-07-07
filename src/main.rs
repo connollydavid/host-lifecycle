@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use host_grammar::{format_number, is_valid_name};
+use host_grammar::{format_number, is_valid_name, is_valid_slug};
 use host_lint::{is_ci_file, is_scannable, path_ignored, scan_text_with_allow, Match, Severity};
 
 /// The canonical template a project adopts from; recorded in the stamp.
@@ -45,6 +45,18 @@ const TOOL_SUBMODULES: [(&str, &str); 4] = [
     ("specula", "https://github.com/specula-org/Specula"),
 ];
 
+// The onboarding verbs (`init`/`adopt`, plan/0065) extend the exit-code convention with a
+// machine-parseable contract for a scripted or agent caller, grounded in plan/0065 gather-data.md
+// (a Fen acceptance run): 3 name-required (no name and no controlling terminal to prompt; a stderr
+// line names the missing field so the caller re-invokes with --name), 4 target-exists (the
+// `agentic-<name>` destination is present and non-empty; --force overrides), 5
+// remote-failed-after-local-commit (the local project is intact and the manual remote command is
+// printed). Usage stays 2, success 0.
+const EXIT_NAME_REQUIRED: i32 = 3;
+const EXIT_TARGET_EXISTS: i32 = 4;
+#[allow(dead_code)] // consumed by the optional-GitHub path, a later plan/0065 increment
+const EXIT_REMOTE_FAILED: i32 = 5;
+
 // Exit-code convention: 0 is clean or success; 1 is the red outcome a command exists to
 // surface (a drift, a HAZARD, a failed gate); 2 is a command that cannot proceed on the input
 // it was given (a usage error, or a missing, unreadable, or malformed input the user named: a
@@ -57,6 +69,7 @@ fn main() {
         Some("validate") => validate(args.get(2)),
         Some("next") => next(args.get(2)),
         Some("adopt") => adopt(&args[2..]),
+        Some("init") => init(&args[2..]),
         Some("version") => version(args.get(2)),
         Some("classify") => classify(args.get(2)),
         Some("remap") => remap(&args[2..]),
@@ -73,10 +86,11 @@ fn main() {
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|init|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
+            eprintln!("  init [<name>] [--at <dir>] [--purpose <line>] [--force] — create agentic-<name> as a fresh project (name backstop: flag/HOST_NAME/prompt, else exit 3)");
             eprintln!("  version <dir>                 — print the adopted template revision");
             eprintln!("  classify <dir>                — print the migration case (a|b|c); refuse a software repo");
             eprintln!("  remap --check <dir>           — tells left after the .host-remap dictionary applies");
@@ -262,6 +276,14 @@ fn adopt(args: &[String]) {
         process::exit(2);
     }
 
+    scaffold_rooms_stamp(root, revision, dry);
+    print_adopt_checklist(revision);
+}
+
+/// Scaffold the rooms, the `.host` stamp, and the LEXICON scaffold into `root`, shared by
+/// `adopt` (into an existing repo) and `init` (into a fresh `agentic-<name>`). Prints one
+/// line per artifact and honours `dry`.
+fn scaffold_rooms_stamp(root: &Path, revision: &str, dry: bool) {
     for room in ROOMS {
         let p = root.join(room);
         if p.is_dir() {
@@ -291,7 +313,6 @@ fn adopt(args: &[String]) {
     }
 
     seed_lexicon(root, dry);
-    print_adopt_checklist(revision);
 }
 
 /// The starter `LEXICON` seeded at adoption: a comment-only scaffold documenting
@@ -351,6 +372,171 @@ fn print_adopt_checklist(revision: &str) {
     println!("       host-lifecycle software --materialize .");
     println!("  4. build the gating tool, then install its commit hooks + binary:");
     println!("       host-lifecycle software --install-hooks .");
+}
+
+/// Resolve the project name from an explicit value or the `HOST_NAME` environment variable
+/// (plan/0065 backstop, the pure half). Returns `None` when neither supplies a non-empty
+/// name, so the caller falls back to a terminal prompt or the name-required exit.
+fn resolve_name_from(explicit: Option<&str>, env_name: Option<&str>) -> Option<String> {
+    [explicit, env_name]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// Resolve the project name per the full backstop contract (plan/0065): an explicit value
+/// or `HOST_NAME` wins; else prompt on a controlling terminal; else exit 3 (name-required)
+/// with a machine-parseable stderr line, so a scripted or agent caller re-invokes with --name.
+fn resolve_name(explicit: Option<&str>) -> String {
+    let env_name = env::var("HOST_NAME").ok();
+    if let Some(n) = resolve_name_from(explicit, env_name.as_deref()) {
+        return n;
+    }
+    use std::io::{IsTerminal as _, Write as _};
+    if std::io::stdin().is_terminal() {
+        eprint!("project name: ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() {
+            if let Some(n) = resolve_name_from(Some(&line), None) {
+                return n;
+            }
+        }
+    }
+    eprintln!("name-required: supply the project name with --name <name> or the HOST_NAME environment variable");
+    process::exit(EXIT_NAME_REQUIRED);
+}
+
+/// Validate the project name as a host-grammar slug (the naming authority): the same slug
+/// shape `host-lint` accepts, so what `init` coins is what the checker allows.
+fn validate_slug(name: &str) -> Result<(), String> {
+    if is_valid_slug(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{name}` is not a valid slug (lowercase a-z, 0-9, single internal hyphens; no leading, trailing, or doubled hyphen)"
+        ))
+    }
+}
+
+/// The MEMORY.md a fresh `init` writes, seeding the one-line purpose (plan/0065 ruled seed).
+/// A `None` or empty purpose leaves a default MEMORY.md with no purpose line.
+fn memory_seed_body(purpose: Option<&str>) -> String {
+    let mut body = String::from("# MEMORY.md\n\n## Session Log\n");
+    if let Some(p) = purpose {
+        let p = p.trim();
+        if !p.is_empty() {
+            body.push_str(&format!("\n- Project purpose: {p}\n"));
+        }
+    }
+    body
+}
+
+/// The machine-readable handoff block (plan/0065 line-based contract): the created path,
+/// the remote if any, and the next command. The same output serves a scripted or agent caller.
+fn handoff_block(host_path: &str, remote: Option<&str>) -> String {
+    let mut s = format!("host-path: {host_path}\n");
+    if let Some(r) = remote {
+        s.push_str(&format!("remote: {r}\n"));
+    }
+    s.push_str(&format!("next: cd {host_path}\n"));
+    s
+}
+
+/// Resolve the latest host-template revision to stamp a fresh project, via `git ls-remote`.
+/// Onboarding is an online operation (it also wires the remote), so an unreachable template
+/// is a clear error naming the `--revision` override rather than a silent default.
+fn resolve_template_revision() -> String {
+    match process::Command::new("git")
+        .args(["ls-remote", TEMPLATE_URL, "HEAD"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            match text.split_whitespace().next() {
+                Some(sha) if sha.len() >= 7 => sha.to_string(),
+                _ => {
+                    eprintln!("host-lifecycle init: could not parse the template revision; pass --revision <rev>");
+                    process::exit(2);
+                }
+            }
+        }
+        _ => {
+            eprintln!("host-lifecycle init: could not reach the template ({TEMPLATE_URL}); pass --revision <rev>");
+            process::exit(2);
+        }
+    }
+}
+
+/// `init [<name>] [--at <dir>] [--purpose <line>] [--revision <rev>] [--force]` — the
+/// fresh-folder onboarding path (plan/0065, the `cargo new` shape). Create `agentic-<name>`
+/// as a new directory under `--at` (default the working directory), scaffold its rooms and
+/// stamp, seed the one-line purpose into MEMORY.md, and print the machine-readable handoff.
+/// The name follows the backstop contract; a present, non-empty target refuses (exit 4).
+fn init(args: &[String]) {
+    let mut explicit_name: Option<String> = None;
+    let mut at: Option<String> = None;
+    let mut purpose: Option<String> = None;
+    let mut revision: Option<String> = None;
+    let mut force = false;
+    let mut pos: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => { i += 1; explicit_name = args.get(i).cloned(); }
+            "--at" => { i += 1; at = args.get(i).cloned(); }
+            "--purpose" => { i += 1; purpose = args.get(i).cloned(); }
+            "--revision" => { i += 1; revision = args.get(i).cloned(); }
+            "--force" => force = true,
+            other if other.starts_with("--") => {
+                eprintln!("host-lifecycle init: unknown flag {other}");
+                process::exit(2);
+            }
+            other => pos.push(other.to_string()),
+        }
+        i += 1;
+    }
+    if pos.len() > 1 {
+        eprintln!("host-lifecycle init [<name>] [--at <dir>] [--purpose <line>] [--revision <rev>] [--force]");
+        process::exit(2);
+    }
+    let name_arg = explicit_name.or_else(|| pos.into_iter().next());
+    let name = resolve_name(name_arg.as_deref());
+    if let Err(msg) = validate_slug(&name) {
+        eprintln!("host-lifecycle init: {msg}");
+        process::exit(2);
+    }
+    let parent = at.as_deref().unwrap_or(".");
+    let target = Path::new(parent).join(format!("agentic-{name}"));
+    if target.exists() {
+        let empty = fs::read_dir(&target).map(|mut d| d.next().is_none()).unwrap_or(false);
+        if !(force || empty) {
+            eprintln!("target-exists: {} already exists and is not empty (use --force)", target.display());
+            process::exit(EXIT_TARGET_EXISTS);
+        }
+    }
+    if let Err(e) = fs::create_dir_all(&target) {
+        eprintln!("host-lifecycle: cannot create {}: {e}", target.display());
+        process::exit(2);
+    }
+    let rev = revision.unwrap_or_else(resolve_template_revision);
+    scaffold_rooms_stamp(&target, &rev, false);
+    // A README heading so the project has an entrance; the one-line purpose lives in MEMORY.
+    let readme = target.join("README.md");
+    if !readme.exists() {
+        let _ = fs::write(&readme, format!("# agentic-{name}\n"));
+        println!("write  README.md");
+    }
+    let mem = target.join("MEMORY.md");
+    if let Err(e) = fs::write(&mem, memory_seed_body(purpose.as_deref())) {
+        eprintln!("host-lifecycle: cannot write {}: {e}", mem.display());
+        process::exit(2);
+    }
+    let seeded = purpose.as_deref().map(|p| !p.trim().is_empty()).unwrap_or(false);
+    println!("write  MEMORY.md{}", if seeded { " (purpose)" } else { "" });
+    print!("\n{}", handoff_block(&target.display().to_string(), None));
 }
 
 /// `version <dir>` — print the template revision recorded in the stamp.
@@ -8734,6 +8920,74 @@ mod remap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // plan/0065 onboarding: the name backstop resolves an explicit value or HOST_NAME,
+    // trims whitespace, and returns None only when neither supplies a non-empty name.
+    #[test]
+    fn resolve_name_from_prefers_explicit_then_env() {
+        assert_eq!(resolve_name_from(Some(" acme "), Some("other")).as_deref(), Some("acme"));
+        assert_eq!(resolve_name_from(None, Some("fromenv")).as_deref(), Some("fromenv"));
+        assert_eq!(resolve_name_from(Some("  "), Some("fromenv")).as_deref(), Some("fromenv"));
+        assert_eq!(resolve_name_from(None, None), None);
+        assert_eq!(resolve_name_from(Some(""), Some("")), None);
+    }
+
+    // The name is held to the host-grammar slug shape, the same the checker accepts.
+    #[test]
+    fn validate_slug_matches_grammar() {
+        assert!(validate_slug("acme").is_ok());
+        assert!(validate_slug("my-project").is_ok());
+        assert!(validate_slug("app2").is_ok());
+        assert!(validate_slug("Acme").is_err(), "uppercase rejected");
+        assert!(validate_slug("-x").is_err(), "leading hyphen rejected");
+        assert!(validate_slug("x-").is_err(), "trailing hyphen rejected");
+        assert!(validate_slug("a--b").is_err(), "double hyphen rejected");
+        assert!(validate_slug("").is_err(), "empty rejected");
+    }
+
+    // The ruled seed (plan/0065): a purpose line in MEMORY.md, or a default MEMORY when declined.
+    #[test]
+    fn memory_seed_carries_the_purpose_or_defaults() {
+        let seeded = memory_seed_body(Some("  read CAD files for an agent  "));
+        assert!(seeded.contains("- Project purpose: read CAD files for an agent\n"));
+        assert!(seeded.starts_with("# MEMORY.md"));
+        let bare = memory_seed_body(None);
+        assert!(!bare.contains("Project purpose"), "no purpose line when declined");
+        assert_eq!(memory_seed_body(Some("   ")), bare, "an empty purpose is a decline");
+    }
+
+    // The line-based handoff (plan/0065): host-path and next always; remote only when present.
+    #[test]
+    fn handoff_block_is_line_based() {
+        let none = handoff_block("../agentic-acme", None);
+        assert_eq!(none, "host-path: ../agentic-acme\nnext: cd ../agentic-acme\n");
+        let with = handoff_block("../agentic-acme", Some("git@github.com:me/agentic-acme"));
+        assert!(with.contains("remote: git@github.com:me/agentic-acme\n"));
+    }
+
+    // init scaffolds a fresh agentic-<name>: the rooms, the stamp at the given revision,
+    // the seeded MEMORY purpose, and a README heading. --revision avoids the network.
+    #[test]
+    fn init_scaffolds_a_fresh_project() {
+        let base = std::env::temp_dir().join(format!("hl-init-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        init(&[
+            "acme".into(),
+            "--at".into(), base.to_string_lossy().into_owned(),
+            "--purpose".into(), "reference compiler".into(),
+            "--revision".into(), "deadbeef1234".into(),
+        ]);
+        let proj = base.join("agentic-acme");
+        assert!(proj.join(".host").is_file(), "stamp written");
+        assert!(fs::read_to_string(proj.join(".host")).unwrap().contains("deadbeef1234"), "stamp records the revision");
+        for room in ROOMS {
+            assert!(proj.join(room).is_dir(), "room {room} scaffolded");
+        }
+        assert!(fs::read_to_string(proj.join("MEMORY.md")).unwrap().contains("- Project purpose: reference compiler"));
+        assert!(fs::read_to_string(proj.join("README.md")).unwrap().contains("# agentic-acme"));
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn stamp_round_trips() {
