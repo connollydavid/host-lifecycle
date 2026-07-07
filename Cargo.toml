@@ -8,6 +8,11 @@ license = "Unlicense"
 [dependencies]
 host-grammar = { git = "https://github.com/connollydavid/host-grammar", rev = "9470b81c9c851b0fedc872203437ea0de60b7f62" }
 host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "6105008a8f55af7756171c49445bf0fba45677d0" }
+# The MCP stdio surface (plan/0065, call/0042): hand-rolled JSON-RPC on tokio + serde_json.
+# tokio is required (operator directive); features are held to a current-thread stdio server
+# (no net, no multi-thread) to keep the vendored reproducible-build set as small as the surface allows.
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util"] }
 
 # Reproducible builds: strip symbols and the .comment section (which embed the build
 # host's toolchain/distro). Combined with --build-id=none (.cargo/config.toml), the

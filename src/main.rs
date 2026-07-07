@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use host_grammar::{format_number, is_valid_name, is_valid_slug};
 use host_lint::{is_ci_file, is_scannable, path_ignored, scan_text_with_allow, Match, Severity};
 
+mod mcp;
+
 /// The canonical template a project adopts from; recorded in the stamp.
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/host-template";
 /// The migration stamp: records which template revision a repo adopted.
@@ -99,6 +101,7 @@ fn main() {
         Some("adopt") => adopt(&args[2..]),
         Some("init") => init(&args[2..]),
         Some("scaffold") => scaffold(&args[2..]),
+        Some("mcp") => mcp::mcp(&args[2..]),
         Some("version") => version(args.get(2)),
         Some("classify") => classify(args.get(2)),
         Some("remap") => remap(&args[2..]),
@@ -115,12 +118,13 @@ fn main() {
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  scaffold <dir> <rev> [--dry-run] — scaffold rooms + write the stamp (the primitive; call/0041)");
             eprintln!("  adopt [<source>] [--at <dir>] [--purpose <line>] [--name <name>] — three-route onboarding (refuse a software repo, adopt an empty agentic-<name> in place, else create the host elsewhere)");
             eprintln!("  init [<name>] [--at <dir>] [--purpose <line>] [--force] — create agentic-<name> as a fresh project (name backstop: flag/HOST_NAME/prompt, else exit 3)");
+            eprintln!("  mcp — serve the onboarding tools (init/adopt) over an MCP stdio session, eliciting the name when the client supports it");
             eprintln!("  version <dir>                 — print the adopted template revision");
             eprintln!("  classify <dir>                — print the migration case (a|b|c); refuse a software repo");
             eprintln!("  remap --check <dir>           — tells left after the .host-remap dictionary applies");
