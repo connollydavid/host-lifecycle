@@ -56,7 +56,6 @@ const TOOL_SUBMODULES: [(&str, &str); 4] = [
 // printed). Usage stays 2, success 0.
 const EXIT_NAME_REQUIRED: i32 = 3;
 const EXIT_TARGET_EXISTS: i32 = 4;
-#[allow(dead_code)] // consumed by the optional-GitHub path, a later plan/0065 increment
 const EXIT_REMOTE_FAILED: i32 = 5;
 
 // Exit-code convention: 0 is clean or success; 1 is the red outcome a command exists to
@@ -561,6 +560,128 @@ fn agentic_basename(path: &Path) -> Option<String> {
     is_valid_slug(name).then(|| name.to_string())
 }
 
+/// Initialise a git repo in `dir` and commit the scaffold (plan/0065 oneshot: commit before
+/// wiring the remote). Prefers the user's git identity; sets a local fallback only when none is
+/// configured, so a fresh machine still commits. A clean "nothing to commit" is not a failure.
+fn git_init_commit(dir: &Path, message: &str) -> Result<(), String> {
+    let git = |args: &[&str]| -> Result<std::process::Output, String> {
+        process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map_err(|e| format!("git: {e}"))
+    };
+    if !dir.join(".git").exists() {
+        let o = git(&["init", "-q"])?;
+        if !o.status.success() {
+            return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+        }
+    }
+    let has_id = git(&["config", "user.email"])
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false);
+    if !has_id {
+        let _ = git(&["config", "user.email", "host-lifecycle@localhost"]);
+        let _ = git(&["config", "user.name", "host-lifecycle"]);
+    }
+    let o = git(&["add", "-A"])?;
+    if !o.status.success() {
+        return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+    }
+    let o = git(&["commit", "-q", "-m", message])?;
+    if !o.status.success() {
+        let err = String::from_utf8_lossy(&o.stderr);
+        if !err.contains("nothing to commit") {
+            return Err(err.trim().to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Whether the GitHub CLI is present and authenticated. A false here degrades onboarding to a
+/// committed-local-only success rather than an error (the remote is optional and fully flagged).
+fn gh_available() -> bool {
+    process::Command::new("gh")
+        .args(["auth", "status"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Create the `agentic-<name>` GitHub repository from `dir` and push, returning the remote URL.
+/// Private unless `public`. Errors carry gh's stderr for the caller's remote-failed handling.
+fn github_create_push(dir: &Path, name: &str, public: bool) -> Result<String, String> {
+    let vis = if public { "--public" } else { "--private" };
+    let o = process::Command::new("gh")
+        .arg("repo")
+        .arg("create")
+        .arg(format!("agentic-{name}"))
+        .arg(vis)
+        .arg("--source")
+        .arg(dir)
+        .arg("--push")
+        .output()
+        .map_err(|e| format!("gh: {e}"))?;
+    if !o.status.success() {
+        return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+    }
+    let remote = process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("agentic-{name}"));
+    Ok(remote)
+}
+
+/// Wire the new project's git repo and optional remote (plan/0065 oneshot: scaffold, commit,
+/// then create-and-push the remote last). Commits the scaffold unless `no_git`. With `github`,
+/// creates the repo (private unless `public`) and pushes; a remote failure after the local commit
+/// leaves the project intact, prints the manual remote steps, and exits 5. Returns the remote URL
+/// when one was created.
+fn finalize_onboarding(target: &Path, name: &str, no_git: bool, github: bool, public: bool) -> Option<String> {
+    if no_git {
+        if github {
+            eprintln!("host-lifecycle: --github needs a commit; drop --no-git");
+            process::exit(2);
+        }
+        return None;
+    }
+    if let Err(e) = git_init_commit(target, &format!("scaffold agentic-{name}")) {
+        eprintln!("host-lifecycle: could not initialise the local git repo: {e}");
+        process::exit(2);
+    }
+    println!("git    initialised and committed the scaffold");
+    if !github {
+        return None;
+    }
+    if !gh_available() {
+        println!("note   gh is absent or unauthenticated; the project is committed locally only");
+        return None;
+    }
+    match github_create_push(target, name, public) {
+        Ok(url) => {
+            println!("github created and pushed {url}");
+            Some(url)
+        }
+        Err(e) => {
+            // remote-failed-after-local-commit: the local project is intact (plan/0065 exit 5).
+            eprintln!("host-lifecycle: the remote step failed; the local project is intact: {e}");
+            eprintln!("  create and push the remote by hand, from {}:", target.display());
+            eprintln!(
+                "    gh repo create agentic-{name} --{} --source . --push",
+                if public { "public" } else { "private" }
+            );
+            process::exit(EXIT_REMOTE_FAILED);
+        }
+    }
+}
+
 /// `init [<name>] [--at <dir>] [--purpose <line>] [--revision <rev>] [--force]` — the
 /// fresh-folder onboarding path (plan/0065, the `cargo new` shape). Create `agentic-<name>`
 /// as a new directory under `--at` (default the working directory), scaffold its rooms and
@@ -572,6 +693,9 @@ fn init(args: &[String]) {
     let mut purpose: Option<String> = None;
     let mut revision: Option<String> = None;
     let mut force = false;
+    let mut github = false;
+    let mut public = false;
+    let mut no_git = false;
     let mut pos: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -581,6 +705,9 @@ fn init(args: &[String]) {
             "--purpose" => { i += 1; purpose = args.get(i).cloned(); }
             "--revision" => { i += 1; revision = args.get(i).cloned(); }
             "--force" => force = true,
+            "--github" => github = true,
+            "--public" => public = true,
+            "--no-git" => no_git = true,
             other if other.starts_with("--") => {
                 eprintln!("host-lifecycle init: unknown flag {other}");
                 process::exit(2);
@@ -590,7 +717,7 @@ fn init(args: &[String]) {
         i += 1;
     }
     if pos.len() > 1 {
-        eprintln!("host-lifecycle init [<name>] [--at <dir>] [--purpose <line>] [--revision <rev>] [--force]");
+        eprintln!("host-lifecycle init [<name>] [--at <dir>] [--purpose <line>] [--revision <rev>] [--force] [--github [--public]] [--no-git]");
         process::exit(2);
     }
     let name_arg = explicit_name.or_else(|| pos.into_iter().next());
@@ -602,7 +729,8 @@ fn init(args: &[String]) {
     let parent = PathBuf::from(at.as_deref().unwrap_or("."));
     let rev = revision.unwrap_or_else(resolve_template_revision);
     let target = create_project(&name, &parent, purpose.as_deref(), &rev, force);
-    print!("\n{}", handoff_block(&target.display().to_string(), None));
+    let remote = finalize_onboarding(&target, &name, no_git, github, public);
+    print!("\n{}", handoff_block(&target.display().to_string(), remote.as_deref()));
 }
 
 /// `adopt [<source>] [--at <dir>] [--purpose <line>] [--name <name>] [--revision <rev>] [--force]`
@@ -619,6 +747,9 @@ fn adopt(args: &[String]) {
     let mut explicit_name: Option<String> = None;
     let mut revision: Option<String> = None;
     let mut force = false;
+    let mut github = false;
+    let mut public = false;
+    let mut no_git = false;
     let mut pos: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -628,6 +759,9 @@ fn adopt(args: &[String]) {
             "--name" => { i += 1; explicit_name = args.get(i).cloned(); }
             "--revision" => { i += 1; revision = args.get(i).cloned(); }
             "--force" => force = true,
+            "--github" => github = true,
+            "--public" => public = true,
+            "--no-git" => no_git = true,
             "--dry-run" => {} // meaningful only for the deprecated primitive form, forwarded below
             other if other.starts_with("--") => {
                 eprintln!("host-lifecycle adopt: unknown flag {other}");
@@ -685,8 +819,9 @@ fn adopt(args: &[String]) {
             };
             let rev = revision.unwrap_or_else(resolve_template_revision);
             let target = create_project(&name, &parent, purpose.as_deref(), &rev, force);
+            let remote = finalize_onboarding(&target, &name, no_git, github, public);
             println!("\nadopted from {}: the source folder is untouched. Switch to the new host:", source.display());
-            print!("{}", handoff_block(&target.display().to_string(), None));
+            print!("{}", handoff_block(&target.display().to_string(), remote.as_deref()));
         }
     }
 }
@@ -9227,6 +9362,23 @@ mod tests {
         adopt(&[base.to_string_lossy().into_owned(), "oldrev99".into()]);
         assert!(base.join(".host").is_file(), "deprecated adopt <dir> <rev> still scaffolds");
         assert!(fs::read_to_string(base.join(".host")).unwrap().contains("oldrev99"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0065 oneshot: git_init_commit initialises a repo and commits the scaffold, with a
+    // local identity fallback so a machine with no configured git user still commits.
+    #[test]
+    fn git_init_commit_creates_a_repo_with_a_commit() {
+        let base = std::env::temp_dir().join(format!("hl-gitinit-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("README.md"), "# agentic-x\n").unwrap();
+        git_init_commit(&base, "scaffold agentic-x").expect("git init + commit");
+        assert!(base.join(".git").exists(), ".git created");
+        let log = process::Command::new("git")
+            .arg("-C").arg(&base).args(["log", "--oneline", "-1"]).output().unwrap();
+        assert!(log.status.success() && !log.stdout.is_empty(), "a commit exists");
+        assert!(String::from_utf8_lossy(&log.stdout).contains("scaffold agentic-x"));
         let _ = fs::remove_dir_all(&base);
     }
 
