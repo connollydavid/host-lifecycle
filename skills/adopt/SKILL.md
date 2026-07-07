@@ -18,8 +18,10 @@ template revision.
      in provenance), *project-specific* (keep under project-specifics), or
      *conflicts* (stop, get a human ruling). Preserve attribution/license.
    - **(c)** Upgrade instead — use the `upgrade` skill.
-2. `host-lifecycle adopt <dir> <revision>` — creates `cast/ plan/ call/`
+2. `host-lifecycle scaffold <dir> <revision>` — creates `cast/ plan/ call/`
    idempotently and writes the `.host` stamp (`template`, `revision`, `adopted`).
+   (The bare `adopt <dir> <revision>` primitive was renamed to `scaffold`, call/0041;
+   the `adopt` verb is now the three-route onboarding.)
 
 ## Reflect
 

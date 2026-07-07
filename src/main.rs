@@ -70,6 +70,7 @@ fn main() {
         Some("next") => next(args.get(2)),
         Some("adopt") => adopt(&args[2..]),
         Some("init") => init(&args[2..]),
+        Some("scaffold") => scaffold(&args[2..]),
         Some("version") => version(args.get(2)),
         Some("classify") => classify(args.get(2)),
         Some("remap") => remap(&args[2..]),
@@ -86,10 +87,11 @@ fn main() {
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|init|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
-            eprintln!("  adopt <dir> <rev> [--dry-run] — scaffold rooms + write the stamp");
+            eprintln!("  scaffold <dir> <rev> [--dry-run] — scaffold rooms + write the stamp (the primitive; call/0041)");
+            eprintln!("  adopt [<source>] [--at <dir>] [--purpose <line>] [--name <name>] — three-route onboarding (refuse a software repo, adopt an empty agentic-<name> in place, else create the host elsewhere)");
             eprintln!("  init [<name>] [--at <dir>] [--purpose <line>] [--force] — create agentic-<name> as a fresh project (name backstop: flag/HOST_NAME/prompt, else exit 3)");
             eprintln!("  version <dir>                 — print the adopted template revision");
             eprintln!("  classify <dir>                — print the migration case (a|b|c); refuse a software repo");
@@ -254,10 +256,11 @@ fn dir_has_numbered_entry(dir: &Path) -> bool {
     })
 }
 
-/// `adopt <dir> <revision> [--dry-run]` — scaffold the rooms a host needs and
-/// write the `.host` stamp recording the template revision adopted.
-/// Idempotent: existing rooms are left untouched. `--dry-run` writes nothing.
-fn adopt(args: &[String]) {
+/// `scaffold <dir> <revision> [--dry-run]` — scaffold the rooms a host needs and
+/// write the `.host` stamp recording the template revision adopted (call/0041: the
+/// primitive that `adopt` was renamed from). Idempotent: existing rooms are left
+/// untouched. `--dry-run` writes nothing.
+fn scaffold(args: &[String]) {
     let mut dry = false;
     let mut pos: Vec<&String> = Vec::new();
     for a in args {
@@ -267,7 +270,7 @@ fn adopt(args: &[String]) {
         }
     }
     let (Some(dir), Some(revision)) = (pos.first(), pos.get(1)) else {
-        eprintln!("host-lifecycle adopt <dir> <revision> [--dry-run]");
+        eprintln!("host-lifecycle scaffold <dir> <revision> [--dry-run]");
         process::exit(2);
     };
     let root = Path::new(dir.as_str());
@@ -277,7 +280,7 @@ fn adopt(args: &[String]) {
     }
 
     scaffold_rooms_stamp(root, revision, dry);
-    print_adopt_checklist(revision);
+    print_scaffold_checklist(revision);
 }
 
 /// Scaffold the rooms, the `.host` stamp, and the LEXICON scaffold into `root`, shared by
@@ -351,13 +354,13 @@ fn seed_lexicon(root: &Path, dry: bool) {
     }
 }
 
-/// Print the post-`adopt` checklist. `adopt` scaffolds rooms and the stamp only;
+/// Print the post-`scaffold` checklist. `scaffold` writes rooms and the stamp only;
 /// registering the template + verification tools and installing the hooks is manual
 /// work with no other prompt, so spell it out. The template submodule is step 1: the
 /// `upgrade` phase reads `UPGRADING.md` from it, so an adoption that skips it makes
 /// the very next phase fail with no ledger to read.
-fn print_adopt_checklist(revision: &str) {
-    println!("\nnext steps (adopt scaffolds rooms + the stamp only):");
+fn print_scaffold_checklist(revision: &str) {
+    println!("\nnext steps (scaffold writes rooms + the stamp only):");
     println!("  1. register the methodology template as a submodule at the adopted");
     println!("     revision — `upgrade` reads its `UPGRADING.md` ledger:");
     println!("       git submodule add {TEMPLATE_URL} host-template");
@@ -475,6 +478,62 @@ fn resolve_template_revision() -> String {
 /// as a new directory under `--at` (default the working directory), scaffold its rooms and
 /// stamp, seed the one-line purpose into MEMORY.md, and print the machine-readable handoff.
 /// The name follows the backstop contract; a present, non-empty target refuses (exit 4).
+/// Create a fresh `agentic-<name>` project under `parent`: scaffold its rooms and stamp, a
+/// README heading, and MEMORY.md seeded with the one-line purpose. Returns the target path.
+/// Refuses a present, non-empty target (exit 4) unless `force`. Shared by `init` (a fresh
+/// folder) and `adopt`'s create-elsewhere route (plan/0065).
+fn create_project(name: &str, parent: &Path, purpose: Option<&str>, revision: &str, force: bool) -> PathBuf {
+    let target = parent.join(format!("agentic-{name}"));
+    if target.exists() {
+        let empty = fs::read_dir(&target).map(|mut d| d.next().is_none()).unwrap_or(false);
+        if !(force || empty) {
+            eprintln!("target-exists: {} already exists and is not empty (use --force)", target.display());
+            process::exit(EXIT_TARGET_EXISTS);
+        }
+    }
+    if let Err(e) = fs::create_dir_all(&target) {
+        eprintln!("host-lifecycle: cannot create {}: {e}", target.display());
+        process::exit(2);
+    }
+    scaffold_rooms_stamp(&target, revision, false);
+    // A README heading so the project has an entrance; the one-line purpose lives in MEMORY.
+    let readme = target.join("README.md");
+    if !readme.exists() {
+        let _ = fs::write(&readme, format!("# agentic-{name}\n"));
+        println!("write  README.md");
+    }
+    seed_memory(&target, purpose);
+    target
+}
+
+/// Write MEMORY.md seeded with the one-line purpose (plan/0065 ruled seed), leaving an
+/// existing MEMORY untouched so an in-place adopt never clobbers a project's memory.
+fn seed_memory(root: &Path, purpose: Option<&str>) {
+    let mem = root.join("MEMORY.md");
+    if mem.exists() {
+        println!("skip   MEMORY.md (exists)");
+        return;
+    }
+    if let Err(e) = fs::write(&mem, memory_seed_body(purpose)) {
+        eprintln!("host-lifecycle: cannot write {}: {e}", mem.display());
+        process::exit(2);
+    }
+    let seeded = purpose.map(|p| !p.trim().is_empty()).unwrap_or(false);
+    println!("write  MEMORY.md{}", if seeded { " (purpose)" } else { "" });
+}
+
+/// The `<name>` of a folder named `agentic-<name>` with a valid slug, else `None`. Route 2
+/// of onboarding (plan/0065) takes the name from such a folder rather than prompting.
+fn agentic_basename(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?.strip_prefix("agentic-")?;
+    is_valid_slug(name).then(|| name.to_string())
+}
+
+/// `init [<name>] [--at <dir>] [--purpose <line>] [--revision <rev>] [--force]` — the
+/// fresh-folder onboarding path (plan/0065, the `cargo new` shape). Create `agentic-<name>`
+/// as a new directory under `--at` (default the working directory), scaffold its rooms and
+/// stamp, seed the one-line purpose into MEMORY.md, and print the machine-readable handoff.
+/// The name follows the backstop contract; a present, non-empty target refuses (exit 4).
 fn init(args: &[String]) {
     let mut explicit_name: Option<String> = None;
     let mut at: Option<String> = None;
@@ -508,35 +567,121 @@ fn init(args: &[String]) {
         eprintln!("host-lifecycle init: {msg}");
         process::exit(2);
     }
-    let parent = at.as_deref().unwrap_or(".");
-    let target = Path::new(parent).join(format!("agentic-{name}"));
-    if target.exists() {
-        let empty = fs::read_dir(&target).map(|mut d| d.next().is_none()).unwrap_or(false);
-        if !(force || empty) {
-            eprintln!("target-exists: {} already exists and is not empty (use --force)", target.display());
-            process::exit(EXIT_TARGET_EXISTS);
+    let parent = PathBuf::from(at.as_deref().unwrap_or("."));
+    let rev = revision.unwrap_or_else(resolve_template_revision);
+    let target = create_project(&name, &parent, purpose.as_deref(), &rev, force);
+    print!("\n{}", handoff_block(&target.display().to_string(), None));
+}
+
+/// `adopt [<source>] [--at <dir>] [--purpose <line>] [--name <name>] [--revision <rev>] [--force]`
+/// — the three-route onboarding (plan/0065, call/0061), invoked by a human through the
+/// `host-adopt` shim. Route by the source folder (default the working directory): a software
+/// repository is refused in place with embed-elsewhere steps (route one); an empty
+/// `agentic-<name>` folder is adopted in place, its name taken from the folder (route two); any
+/// other folder is arbitrary, so elicit a name, create the host at `../agentic-<name>` (override
+/// `--at`), and leave the source untouched (route three). The deprecated `adopt <dir> <revision>`
+/// primitive form forwards to `scaffold` with a deprecation notice (call/0041), retiring later.
+fn adopt(args: &[String]) {
+    let mut at: Option<String> = None;
+    let mut purpose: Option<String> = None;
+    let mut explicit_name: Option<String> = None;
+    let mut revision: Option<String> = None;
+    let mut force = false;
+    let mut pos: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--at" => { i += 1; at = args.get(i).cloned(); }
+            "--purpose" => { i += 1; purpose = args.get(i).cloned(); }
+            "--name" => { i += 1; explicit_name = args.get(i).cloned(); }
+            "--revision" => { i += 1; revision = args.get(i).cloned(); }
+            "--force" => force = true,
+            "--dry-run" => {} // meaningful only for the deprecated primitive form, forwarded below
+            other if other.starts_with("--") => {
+                eprintln!("host-lifecycle adopt: unknown flag {other}");
+                process::exit(2);
+            }
+            other => pos.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    // Deprecate-then-retire shim (call/0041): the old primitive form `adopt <dir> <revision>` is
+    // exactly two positional arguments. Warn and forward to `scaffold`, retiring a release later.
+    if pos.len() == 2 {
+        eprintln!("host-lifecycle: `adopt <dir> <revision>` is deprecated; use `host-lifecycle scaffold <dir> <revision>` (call/0041)");
+        scaffold(args);
+        return;
+    }
+    if pos.len() > 1 {
+        eprintln!("host-lifecycle adopt [<source>] [--at <dir>] [--purpose <line>] [--name <name>] [--force]");
+        process::exit(2);
+    }
+
+    let source_raw = Path::new(pos.first().map(String::as_str).unwrap_or("."));
+    if !source_raw.is_dir() {
+        eprintln!("host-lifecycle: not a directory: {}", source_raw.display());
+        process::exit(2);
+    }
+    let source = source_raw.canonicalize().unwrap_or_else(|_| source_raw.to_path_buf());
+
+    match adopt_route(&source, force) {
+        // Route one: a software repository is refused in place, with the embed-elsewhere steps.
+        AdoptRoute::Refuse(manifest) => {
+            eprint!("{}", refuse_adopt_in_place(&source.display().to_string(), manifest));
+            process::exit(2);
+        }
+        // Route two: an empty `agentic-<name>` folder is adopted in place, its name from the folder.
+        AdoptRoute::InPlace(name) => {
+            let rev = revision.unwrap_or_else(resolve_template_revision);
+            println!("adopt in place: {} (name {name}, taken from the folder)", source.display());
+            scaffold_rooms_stamp(&source, &rev, false);
+            seed_memory(&source, purpose.as_deref());
+            print_scaffold_checklist(&rev);
+            print!("\n{}", handoff_block(&source.display().to_string(), None));
+        }
+        // Route three: an arbitrary folder — elicit a name, create the host elsewhere, source untouched.
+        AdoptRoute::Elsewhere => {
+            let name = resolve_name(explicit_name.as_deref());
+            if let Err(msg) = validate_slug(&name) {
+                eprintln!("host-lifecycle adopt: {msg}");
+                process::exit(2);
+            }
+            let parent = match at.as_deref() {
+                Some(a) => PathBuf::from(a),
+                None => source.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("..")),
+            };
+            let rev = revision.unwrap_or_else(resolve_template_revision);
+            let target = create_project(&name, &parent, purpose.as_deref(), &rev, force);
+            println!("\nadopted from {}: the source folder is untouched. Switch to the new host:", source.display());
+            print!("{}", handoff_block(&target.display().to_string(), None));
         }
     }
-    if let Err(e) = fs::create_dir_all(&target) {
-        eprintln!("host-lifecycle: cannot create {}: {e}", target.display());
-        process::exit(2);
+}
+
+/// The onboarding route for a source folder (plan/0065): a software repository is refused
+/// (route one, carrying the manifest reason); an unstamped, empty `agentic-<name>` folder is
+/// adopted in place (route two, carrying the name); anything else creates a host elsewhere
+/// (route three). `--force` lets route two claim a non-empty `agentic-<name>`. Pure, so the
+/// routing decision is unit-tested without the side effects the verb wraps it in.
+enum AdoptRoute {
+    Refuse(&'static str),
+    InPlace(String),
+    Elsewhere,
+}
+
+fn adopt_route(source: &Path, force: bool) -> AdoptRoute {
+    if let Some(manifest) = adopt_in_place_refusal(source) {
+        return AdoptRoute::Refuse(manifest);
     }
-    let rev = revision.unwrap_or_else(resolve_template_revision);
-    scaffold_rooms_stamp(&target, &rev, false);
-    // A README heading so the project has an entrance; the one-line purpose lives in MEMORY.
-    let readme = target.join("README.md");
-    if !readme.exists() {
-        let _ = fs::write(&readme, format!("# agentic-{name}\n"));
-        println!("write  README.md");
+    if let Some(name) = agentic_basename(source) {
+        let unstamped_empty = !source.join(STAMP).is_file()
+            && fs::read_dir(source).map(|mut d| d.next().is_none()).unwrap_or(false);
+        if unstamped_empty || force {
+            return AdoptRoute::InPlace(name);
+        }
     }
-    let mem = target.join("MEMORY.md");
-    if let Err(e) = fs::write(&mem, memory_seed_body(purpose.as_deref())) {
-        eprintln!("host-lifecycle: cannot write {}: {e}", mem.display());
-        process::exit(2);
-    }
-    let seeded = purpose.as_deref().map(|p| !p.trim().is_empty()).unwrap_or(false);
-    println!("write  MEMORY.md{}", if seeded { " (purpose)" } else { "" });
-    print!("\n{}", handoff_block(&target.display().to_string(), None));
+    AdoptRoute::Elsewhere
 }
 
 /// `version <dir>` — print the template revision recorded in the stamp.
@@ -597,7 +742,7 @@ separable and independently versioned.\n\n\
 To proceed:\n\
 \x20 1. Create or choose a host repository, separate from this software\n\
 \x20    (e.g. a new empty repo `agentic-<name>`).\n\
-\x20 2. In the host, run: host-lifecycle adopt <host-dir> <revision>\n\
+\x20 2. In the host, run: host-lifecycle scaffold <host-dir> <revision>\n\
 \x20    (scaffolds the rooms and writes the .host stamp).\n\
 \x20 3. Embed THIS software as the Where room: add a [software \"<name>\"] stanza to\n\
 \x20    the host's .host-software (this repo's URL, a pinned SHA, the worktree set),\n\
@@ -8986,6 +9131,70 @@ mod tests {
         }
         assert!(fs::read_to_string(proj.join("MEMORY.md")).unwrap().contains("- Project purpose: reference compiler"));
         assert!(fs::read_to_string(proj.join("README.md")).unwrap().contains("# agentic-acme"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn agentic_basename_extracts_the_name() {
+        assert_eq!(agentic_basename(Path::new("/x/agentic-acme")).as_deref(), Some("acme"));
+        assert_eq!(agentic_basename(Path::new("agentic-my-proj")).as_deref(), Some("my-proj"));
+        assert_eq!(agentic_basename(Path::new("/x/notes")), None);
+        assert_eq!(agentic_basename(Path::new("/x/agentic-")), None, "empty slug");
+        assert_eq!(agentic_basename(Path::new("/x/agentic-Bad")), None, "invalid slug");
+    }
+
+    // plan/0065 three-route onboarding: a software repo refuses, an empty agentic-<name>
+    // adopts in place (and --force claims a non-empty one), anything else goes elsewhere.
+    #[test]
+    fn adopt_route_picks_by_folder_shape() {
+        let base = std::env::temp_dir().join(format!("hl-route-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let repo = base.join("some-repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("Cargo.toml"), "[package]\n").unwrap();
+        assert!(matches!(adopt_route(&repo, false), AdoptRoute::Refuse(_)), "software repo refused");
+
+        let named = base.join("agentic-acme");
+        fs::create_dir_all(&named).unwrap();
+        assert!(matches!(adopt_route(&named, false), AdoptRoute::InPlace(ref n) if n == "acme"), "empty agentic-<name> in place");
+        fs::write(named.join("stray.txt"), "x").unwrap();
+        assert!(matches!(adopt_route(&named, false), AdoptRoute::Elsewhere), "non-empty agentic folder is not in-place");
+        assert!(matches!(adopt_route(&named, true), AdoptRoute::InPlace(_)), "--force claims a non-empty agentic folder");
+
+        let notes = base.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("a.txt"), "x").unwrap();
+        assert!(matches!(adopt_route(&notes, false), AdoptRoute::Elsewhere), "arbitrary folder -> elsewhere");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn create_project_builds_a_fresh_host() {
+        let base = std::env::temp_dir().join(format!("hl-create-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let target = create_project("acme", &base, Some("reference compiler"), "rev123", false);
+        assert_eq!(target, base.join("agentic-acme"));
+        assert!(target.join(".host").is_file());
+        assert!(target.join("cast").is_dir() && target.join("plan").is_dir() && target.join("call").is_dir());
+        assert!(fs::read_to_string(target.join("MEMORY.md")).unwrap().contains("- Project purpose: reference compiler"));
+        assert!(fs::read_to_string(target.join("README.md")).unwrap().contains("# agentic-acme"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // call/0041 deprecate-then-retire: the old `adopt <dir> <rev>` primitive form still works,
+    // forwarding to scaffold, so the migration breaks no existing caller on the release.
+    #[test]
+    fn adopt_deprecated_primitive_form_forwards_to_scaffold() {
+        let base = std::env::temp_dir().join(format!("hl-depr-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        adopt(&[base.to_string_lossy().into_owned(), "oldrev99".into()]);
+        assert!(base.join(".host").is_file(), "deprecated adopt <dir> <rev> still scaffolds");
+        assert!(fs::read_to_string(base.join(".host")).unwrap().contains("oldrev99"));
         let _ = fs::remove_dir_all(&base);
     }
 
