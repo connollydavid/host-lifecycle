@@ -63,8 +63,36 @@ const EXIT_REMOTE_FAILED: i32 = 5;
 // directory, a file, the `.host-software`, the manifest). `next` returns 2 on a directory with
 // no numbered entries (plan/0041), the same cannot-proceed class. The split (issues-found
 // versus cannot-proceed) was validated with Qwen-3.5-4B in plan/0043 gather-data.
+
+/// Map a program name (the arg0 basename) to the verb its shim invokes (plan/0065): `host-init`
+/// runs `init`, `host-adopt` runs `adopt`. Any other name, `host-lifecycle` included, falls
+/// through to the normal subcommand dispatch. The shims are the same binary under another name.
+fn shim_verb(arg0_base: &str) -> Option<&'static str> {
+    match arg0_base {
+        "host-init" => Some("init"),
+        "host-adopt" => Some("adopt"),
+        _ => None,
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
+    // Shim dispatch (plan/0065): host-init and host-adopt are the same binary invoked under
+    // another name (a symlink or copy the install places), giving a human a purpose-named
+    // command over the engine verb. The program name maps to the verb; its args follow.
+    let arg0_base = args
+        .first()
+        .and_then(|s| Path::new(s).file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if let Some(verb) = shim_verb(arg0_base) {
+        match verb {
+            "init" => init(&args[1..]),
+            "adopt" => adopt(&args[1..]),
+            _ => unreachable!("shim_verb returns only init/adopt"),
+        }
+        return;
+    }
     match args.get(1).map(String::as_str) {
         Some("validate") => validate(args.get(2)),
         Some("next") => next(args.get(2)),
@@ -9196,6 +9224,15 @@ mod tests {
         assert!(base.join(".host").is_file(), "deprecated adopt <dir> <rev> still scaffolds");
         assert!(fs::read_to_string(base.join(".host")).unwrap().contains("oldrev99"));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0065 shims: the program name maps to the verb; host-lifecycle itself falls through.
+    #[test]
+    fn shim_verb_maps_program_names() {
+        assert_eq!(shim_verb("host-init"), Some("init"));
+        assert_eq!(shim_verb("host-adopt"), Some("adopt"));
+        assert_eq!(shim_verb("host-lifecycle"), None);
+        assert_eq!(shim_verb("git"), None);
     }
 
     #[test]
