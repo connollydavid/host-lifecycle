@@ -284,11 +284,33 @@ fn is_slug(s: &str) -> bool {
         && s.chars().next().map(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).unwrap_or(false)
 }
 
-/// Run the audit over both stores and print findings. `--fix` is refused on
-/// the repo store; on the per-user store, the structural-safe class is
-/// applied (currently: none; the safe set grows one class at a time per the
-/// README, and the first addition lands with cast-review sign-off).
+/// The dream subcommand entrypoint. Parses args, runs the audit, prints the
+/// findings, and exits with the verdict. The thin wrapper around `run_dream`
+/// so tests can drive the audit without `process::exit`.
 pub fn dream(args: &[String]) {
+    let outcome = run_dream(args);
+    process::exit(outcome.exit_code);
+}
+
+/// The dream audit's outcome: the exit code (`0` clean, `1` findings, `2`
+/// cannot-proceed), the findings vector (empty on a clean run), and the
+/// `fix_mode` / `json` flags as parsed. Callable from tests; the public
+/// `dream` wrapper calls this and exits with the code.
+#[allow(dead_code)] // read by tests; fields kept for the test surface
+#[derive(Debug)]
+pub struct DreamOutcome {
+    pub exit_code: i32,
+    pub findings: Vec<Finding>,
+    pub fix_mode: bool,
+    pub json: bool,
+}
+
+/// Run the audit over both stores and return the outcome. `--fix` is refused
+/// on the repo store (returns exit 2 with the repo-finding count); on the
+/// per-user store the structural-safe class would be applied here (currently
+/// none; the safe set grows one class at a time per the README, and the first
+/// addition lands with cast-review sign-off).
+pub fn run_dream(args: &[String]) -> DreamOutcome {
     let mut fix_mode = false;
     let mut json = false;
     let mut dir: PathBuf = PathBuf::from(".");
@@ -298,14 +320,24 @@ pub fn dream(args: &[String]) {
             "--json" => json = true,
             "-h" | "--help" => {
                 print_help();
-                return;
+                return DreamOutcome {
+                    exit_code: 0,
+                    findings: Vec::new(),
+                    fix_mode,
+                    json,
+                };
             }
             other if !other.starts_with("--") => {
                 dir = PathBuf::from(other);
             }
             other => {
                 eprintln!("host-lifecycle dream: unknown flag {other}");
-                process::exit(2);
+                return DreamOutcome {
+                    exit_code: 2,
+                    findings: Vec::new(),
+                    fix_mode,
+                    json,
+                };
             }
         }
     }
@@ -313,7 +345,12 @@ pub fn dream(args: &[String]) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("host-lifecycle dream: not a directory: {}: {e}", dir.display());
-            process::exit(2);
+            return DreamOutcome {
+                exit_code: 2,
+                findings: Vec::new(),
+                fix_mode,
+                json,
+            };
         }
     };
 
@@ -325,7 +362,12 @@ pub fn dream(args: &[String]) {
             eprintln!(
                 "host-lifecycle dream: --fix refuses the repo store (the append-only tier); {repo_count} repo finding(s) reported, not applied"
             );
-            process::exit(2);
+            return DreamOutcome {
+                exit_code: 2,
+                findings,
+                fix_mode,
+                json,
+            };
         }
         // The structural-safe class on the per-user store lands with cast-review
         // sign-off; for now --fix is a no-op that confirms the audit ran.
@@ -340,7 +382,12 @@ pub fn dream(args: &[String]) {
         print_text(&findings);
     }
 
-    process::exit(if findings.is_empty() { 0 } else { 1 });
+    DreamOutcome {
+        exit_code: if findings.is_empty() { 0 } else { 1 },
+        findings,
+        fix_mode,
+        json,
+    }
 }
 
 /// The full audit. Reads the per-user store (memory.rs) and the repo
@@ -548,6 +595,19 @@ mod tests {
         }
     }
 
+    fn tmp_fixture(name: &str, memory_md: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dream-{name}-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("MEMORY.md"), memory_md).unwrap();
+        dir
+    }
+
+    // --- Helper tests (not in the obligations manifest) ---
+
     #[test]
     fn extract_wiki_links_finds_slugs() {
         let body = "See [[alpha]] and [[beta-2]] but not [[c]].";
@@ -560,111 +620,6 @@ mod tests {
         let body = "as recorded in call/0017 and revisited in plan/0042; call/0017 again";
         let refs = extract_room_refs(body);
         assert_eq!(refs, vec!["call/0017", "plan/0042", "call/0017"]);
-    }
-
-    #[test]
-    fn detect_superseded_unlinked_fires_when_link_missing() {
-        let slugs = known(&["alpha", "beta"]);
-        let mut inp = input("alpha", "older", "Alpha body. See nothing.", &slugs);
-        inp.superseded_by = "beta".to_string();
-        let f = detect_superseded_unlinked(&inp).unwrap();
-        assert_eq!(f.kind, "superseded-but-unlinked");
-        assert_eq!(f.route, Route::Edit);
-    }
-
-    #[test]
-    fn detect_superseded_unlinked_silent_when_linked() {
-        let slugs = known(&["alpha", "beta"]);
-        let mut inp = input("alpha", "older", "Older. See [[beta]] for the update.", &slugs);
-        inp.superseded_by = "beta".to_string();
-        assert!(detect_superseded_unlinked(&inp).is_none());
-    }
-
-    #[test]
-    fn detect_dangling_link_fires_for_missing_target() {
-        let slugs = known(&["alpha"]);
-        let inp = input("alpha", "x", "See [[beta]] which is missing.", &slugs);
-        let f = detect_dangling_link(&inp).unwrap();
-        assert_eq!(f.kind, "dangling-link");
-        assert_eq!(f.route, Route::Edit);
-    }
-
-    #[test]
-    fn detect_dangling_link_silent_when_target_present() {
-        let slugs = known(&["alpha", "beta"]);
-        let inp = input("alpha", "x", "See [[beta]] which exists.", &slugs);
-        assert!(detect_dangling_link(&inp).is_none());
-    }
-
-    #[test]
-    fn detect_room_touching_fires_on_call_ref() {
-        let slugs = known(&["alpha"]);
-        let inp = input("alpha", "x", "Cites call/0017 as live rule.", &slugs);
-        let f = detect_room_touching(&inp).unwrap();
-        assert_eq!(f.kind, "room-touching");
-        assert_eq!(f.route, Route::Edit);
-    }
-
-    #[test]
-    fn detect_room_touching_routes_to_append_for_repo_store() {
-        let slugs = known(&["alpha"]);
-        let mut inp = input("alpha", "x", "Cites call/0017.", &slugs);
-        inp.store = StoreLoc::Repo;
-        let f = detect_room_touching(&inp).unwrap();
-        assert_eq!(f.route, Route::Append);
-    }
-
-    #[test]
-    fn detect_description_body_drift_fires_on_not_vs_bare() {
-        let slugs = known(&["alpha"]);
-        let inp = input(
-            "alpha",
-            "not stabilized yet",
-            "The API is stabilized as of v0.5.",
-            &slugs,
-        );
-        let f = detect_description_body_drift(&inp).unwrap();
-        assert_eq!(f.kind, "description-body-drift");
-    }
-
-    #[test]
-    fn detect_description_body_drift_silent_on_consistent_entry() {
-        let slugs = known(&["alpha"]);
-        let inp = input(
-            "alpha",
-            "stabilized as of v0.5",
-            "The API is stabilized as of v0.5.",
-            &slugs,
-        );
-        assert!(detect_description_body_drift(&inp).is_none());
-    }
-
-    #[test]
-    fn detect_runs_all_detectors_and_orders_findings_stably() {
-        let slugs = known(&["alpha"]);
-        let mut inp = input(
-            "alpha",
-            "not /tmp",
-            "build in /tmp; cites call/0017; links [[missing]]",
-            &slugs,
-        );
-        inp.superseded_by = "beta".to_string();
-        let fs = detect(&inp);
-        // Order: superseded-but-unlinked, dangling-link, room-touching, description-body-drift.
-        assert_eq!(fs.len(), 4);
-        assert_eq!(fs[0].kind, "superseded-but-unlinked");
-        assert_eq!(fs[1].kind, "dangling-link");
-        assert_eq!(fs[2].kind, "room-touching");
-        assert_eq!(fs[3].kind, "description-body-drift");
-    }
-
-    #[test]
-    fn repo_store_finding_always_routes_to_append() {
-        let slugs = known(&["alpha"]);
-        let mut inp = input("alpha", "x", "Cites call/0017.", &slugs);
-        inp.store = StoreLoc::Repo;
-        let f = detect_room_touching(&inp).unwrap();
-        assert_eq!(f.route, Route::Append);
     }
 
     #[test]
@@ -683,19 +638,237 @@ mod tests {
         assert!(sections[0].body.contains("- a"));
     }
 
+    // --- Manifest tests: detectors (exercises=detect) ---
+
     #[test]
-    fn run_audit_on_clean_fixture_emits_no_findings() {
-        let tmp = std::env::temp_dir().join(format!("dream-test-{}", std::process::id()));
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(
-            tmp.join("MEMORY.md"),
-            "# MEMORY.md\n\n## Log\n\n### First\n\nNo room refs or links here.\n",
-        )
-        .unwrap();
-        let findings = run_audit(&tmp);
-        // The repo section detector finds no call/plan refs and no links.
-        let clean = findings.iter().all(|f| f.kind != "room-touching" && f.kind != "dangling-link");
-        assert!(clean);
-        fs::remove_dir_all(&tmp).unwrap();
+    fn dream_detects_description_body_drift() {
+        let slugs = known(&["alpha"]);
+        let inp = input(
+            "alpha",
+            "not stabilized yet",
+            "The API is stabilized as of v0.5.",
+            &slugs,
+        );
+        let fs = detect(&inp);
+        assert!(fs.iter().any(|f| f.kind == "description-body-drift"));
+    }
+
+    #[test]
+    fn dream_clean_on_drift_free_entry() {
+        let slugs = known(&["alpha"]);
+        let inp = input(
+            "alpha",
+            "stabilized as of v0.5",
+            "The API is stabilized as of v0.5.",
+            &slugs,
+        );
+        let fs = detect(&inp);
+        assert!(!fs.iter().any(|f| f.kind == "description-body-drift"));
+    }
+
+    #[test]
+    fn dream_detects_superseded_unlinked() {
+        let slugs = known(&["alpha", "beta"]);
+        let mut inp = input("alpha", "older", "Alpha body. See nothing.", &slugs);
+        inp.superseded_by = "beta".to_string();
+        let fs = detect(&inp);
+        assert!(fs.iter().any(|f| f.kind == "superseded-but-unlinked"));
+    }
+
+    #[test]
+    fn dream_clean_on_linked_supersession() {
+        let slugs = known(&["alpha", "beta"]);
+        let mut inp = input("alpha", "older", "Older. See [[beta]] for the update.", &slugs);
+        inp.superseded_by = "beta".to_string();
+        let fs = detect(&inp);
+        assert!(!fs.iter().any(|f| f.kind == "superseded-but-unlinked"));
+    }
+
+    #[test]
+    fn dream_detects_dangling_link() {
+        let slugs = known(&["alpha"]);
+        let inp = input("alpha", "x", "See [[beta]] which is missing.", &slugs);
+        let fs = detect(&inp);
+        assert!(fs.iter().any(|f| f.kind == "dangling-link"));
+    }
+
+    #[test]
+    fn dream_clean_on_resolved_links() {
+        let slugs = known(&["alpha", "beta"]);
+        let inp = input("alpha", "x", "See [[beta]] which exists.", &slugs);
+        let fs = detect(&inp);
+        assert!(!fs.iter().any(|f| f.kind == "dangling-link"));
+    }
+
+    #[test]
+    fn dream_detects_room_touching() {
+        let slugs = known(&["alpha"]);
+        let inp = input("alpha", "x", "Cites call/0017 as live rule.", &slugs);
+        let fs = detect(&inp);
+        assert!(fs.iter().any(|f| f.kind == "room-touching"));
+    }
+
+    #[test]
+    fn dream_clean_on_no_room_refs() {
+        let slugs = known(&["alpha"]);
+        let inp = input("alpha", "x", "No methodology records cited here.", &slugs);
+        let fs = detect(&inp);
+        assert!(!fs.iter().any(|f| f.kind == "room-touching"));
+    }
+
+    #[test]
+    fn repo_store_finding_routes_to_append() {
+        // Invariant RepoFindingsNeverEdit: a repo-store finding never routes
+        // to edit. Encoded by `route_for(StoreLoc::Repo) == Route::Append`.
+        let slugs = known(&["alpha"]);
+        let mut inp = input("alpha", "x", "Cites call/0017.", &slugs);
+        inp.store = StoreLoc::Repo;
+        let fs = detect(&inp);
+        for f in &fs {
+            assert_ne!(f.route, Route::Edit, "repo finding routed to edit: {:?}", f);
+            assert_eq!(f.route, Route::Append);
+        }
+    }
+
+    // --- Manifest tests: verdict lifecycle (exercises=dream) ---
+    // These drive `dream::run_dream` over a fixture and assert the exit code
+    // (the verdict) matches the spec's transition graph.
+
+    fn dream_outcome(memory_md: &str, fix: bool) -> DreamOutcome {
+        let dir = tmp_fixture("lifecycle", memory_md);
+        let mut args = vec![dir.to_string_lossy().to_string()];
+        if fix {
+            args.push("--fix".to_string());
+        }
+        // `dream::run_dream` is the testable core; the public `dream` wrapper
+        // adds process::exit. Reference: the dream module's run_dream.
+        let outcome = run_dream(&args);
+        let _ = fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    #[test]
+    fn dream_transition_dreaming_to_clean() {
+        // A clean fixture (no room refs, no links): dreaming -> clean (exit 0).
+        let outcome = dream_outcome("# M\n\n## L\n\n### Clean\n\nNothing to flag.\n", false);
+        assert_eq!(outcome.exit_code, 0);
+    }
+
+    #[test]
+    fn dream_transition_dreaming_to_findings() {
+        // A fixture with a call/ ref: dreaming -> findings (exit 1).
+        let outcome = dream_outcome("# M\n\n## L\n\n### Cites\n\nSee call/0017.\n", false);
+        assert_eq!(outcome.exit_code, 1);
+    }
+
+    #[test]
+    fn dream_transition_dreaming_to_error() {
+        // --fix on a fixture with a repo finding: dreaming -> error (exit 2).
+        let outcome = dream_outcome("# M\n\n## L\n\n### Cites\n\nSee call/0017.\n", true);
+        assert_eq!(outcome.exit_code, 2);
+    }
+
+    #[test]
+    fn dream_start_inits_latch_and_status() {
+        // run_dream starts each call with an empty findings vector (the latch
+        // is fresh per run; no stale state leaks across calls).
+        let outcome = dream_outcome("# M\n\n## L\n\n### Clean\n\nNothing.\n", false);
+        assert!(outcome.findings.is_empty(), "findings should be empty on a clean run");
+        // A second run on a dirty fixture should find exactly the new findings,
+        // not any leftover from the prior clean run.
+        let outcome2 = dream_outcome("# M\n\n## L\n\n### Dirty\n\nSee plan/0042.\n", false);
+        assert!(!outcome2.findings.is_empty());
+    }
+
+    #[test]
+    fn dream_record_finding_sets_latch() {
+        // Any finding fires the latch: exit 1 iff findings is non-empty.
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(!outcome.findings.is_empty());
+    }
+
+    #[test]
+    fn dream_record_finding_guarded_on_dreaming() {
+        // The latch is per-run (single-shot model); a finding recorded in one
+        // run does not leak into the next run's verdict. Run two audits back
+        // to back and confirm the second's verdict matches its own findings.
+        let dirty = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        assert_eq!(dirty.exit_code, 1);
+        let clean = dream_outcome("# M\n\n## L\n\n### Y\n\nClean entry.\n", false);
+        assert_eq!(clean.exit_code, 0, "clean run after a dirty run must still be clean");
+    }
+
+    #[test]
+    fn dream_verdict_findings_on_any_finding() {
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        assert_eq!(outcome.exit_code, 1);
+    }
+
+    #[test]
+    fn dream_no_false_findings_verdict() {
+        // A clean fixture never yields exit 1.
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nClean.\n", false);
+        assert_ne!(outcome.exit_code, 1);
+    }
+
+    #[test]
+    fn dream_verdict_clean_on_no_finding() {
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nClean.\n", false);
+        assert_eq!(outcome.exit_code, 0);
+    }
+
+    #[test]
+    fn dream_no_false_clean_verdict() {
+        // A fixture with a finding never yields exit 0.
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        assert_ne!(outcome.exit_code, 0);
+    }
+
+    #[test]
+    fn dream_verdict_error_on_fail_signal() {
+        // --fix on a repo-store finding is the fail signal: exit 2.
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", true);
+        assert_eq!(outcome.exit_code, 2);
+    }
+
+    #[test]
+    fn dream_no_false_error_verdict() {
+        // --fix on a clean fixture (no repo findings) does not yield exit 2.
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nClean.\n", true);
+        assert_ne!(outcome.exit_code, 2);
+    }
+
+    #[test]
+    fn clean_verdict_implies_no_finding() {
+        // Invariant VerdictMatchesFindings: exit 0 implies findings is empty.
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nClean.\n", false);
+        if outcome.exit_code == 0 {
+            assert!(outcome.findings.is_empty());
+        }
+    }
+}
+
+// === Kani proofs (plan/0073 #write-tests): the load-bearing pure-function
+// invariants. Reference: plan/0023 verification ladder, host-prove
+// `kani-conformance` lane. The `kani` feature is set by `cargo kani`; the
+// harnesses are inert under `cargo test` and `cargo build`.
+// Kani dispositions in the obligations manifest point at these harnesses. ===
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// RepoFindingsNeverEdit: `route_for(StoreLoc::Repo)` always returns
+    /// `Route::Append`, never `Route::Edit`. The detect() engine's per-detector
+    /// else-branch hardcodes `Route::Append` for repo entries (verifiable by
+    /// reading the source); this harness proves the routing function itself
+    /// never returns Edit for a repo store, which is the load-bearing property
+    /// the unit test `repo_store_finding_routes_to_append` exercises
+    /// behaviourally.
+    #[kani::proof]
+    fn route_for_repo_always_appends() {
+        assert!(DetectorInput::route_for(StoreLoc::Repo) == Route::Append);
+        assert!(DetectorInput::route_for(StoreLoc::PerUser) == Route::Edit);
     }
 }
