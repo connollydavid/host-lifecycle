@@ -7,10 +7,13 @@
 -- findings (1), or error (2). It is read-only; the MCP memory_write tool is the
 -- only mutator, and it refuses the repo store by construction.
 --
--- Scope: the detector set, the routing rules, the verdict lifecycle, the
--- memory_write safety invariant, and the MCP tool surface. Excludes: the
--- stdio JSON-RPC transport (an implementation detail), exact CLI flag names
--- and output strings, the fixture file paths, and the cast/adversarial-review
+-- Scope (post-weed-and-tend, 2026-07-19): the dream audit surface ONLY. The
+-- MemoryWrite / Suggestion / LinkRef entities, the MCP-flavoured rules, and the
+-- invariants that referenced them belong with the MCP layer (#extend-mcp) and
+-- were restored there at that task. The dream-side surface here is: the detector
+-- set, the routing rules, the verdict lifecycle, and the dream-relevant
+-- invariants. Excludes: the stdio JSON-RPC transport (an implementation detail),
+-- exact CLI flag names and output strings, and the cast/adversarial-review
 -- rulings on detector naming (those feed back into the rule set before the
 -- build, per plan/0073 gather-data).
 --
@@ -40,26 +43,6 @@ enum Route {
     append
 }
 
--- The kind of mutation a memory_write performs. create adds a new entry;
--- update edits an existing entry's body in place (per-user store only); delete
--- removes an entry (per-user store only; consolidation prunes). The repo
--- store accepts create only (the append-only rule).
-enum MemoryWriteOp {
-    create
-    update
-    delete
-}
-
--- The originator of a memory_write. The audit itself never writes; every
--- write comes from the MCP surface (the harness invoking a memory tool) or
--- from the consolidation tool (which consumes Suggestions). `audit` is the
--- forbidden origin: the AuditNeverWrites invariant keys on it.
-enum MemoryWriteOrigin {
-    mcp_tool
-    consolidation
-    audit
-}
-
 -- A memory store: one repo store (the project's MEMORY.md) plus zero or more
 -- per-user stores (the host-* per-user tier at ~/.host-memory/<project>/).
 entity MemoryStore {
@@ -81,40 +64,14 @@ entity MemoryEntry {
     is_workaround_not_plan: Boolean
     is_append_only_violation: Boolean
     is_room_touching: Boolean
-}
-
--- A cross-entry [[slug]] reference. Links are same-store by format definition
--- (a per-user entry may reference repo lore by name, but the [[slug]] form
--- resolves only within the entry's own store; a cross-store reference is
--- ordinary prose, not a LinkRef). Same-store resolution keeps the
--- dangling-link detector sound; cross-store linking is out of scope.
-entity LinkRef {
-    src: MemoryEntry
-    target_slug: String
-    resolves: Boolean
+    has_dangling_link: Boolean
 }
 
 -- A detected finding. Each finding carries its detector class and a route.
--- `dream` ties the finding to the run that produced it (single-shot model;
--- see Dream).
 entity Finding {
     entry: MemoryEntry
     kind: String
     route: Route
-    dream: Dream
-}
-
--- A pending suggested action (the verbatim edit / append text the audit
--- prints). `applies` is false for any Suggestion whose target is the repo
--- store under --fix; the FixNeverTouchesRepo invariant discharges it.
--- `target_store` is denormalized from `finding.entry.store`; the
--- SuggestionTargetsItsFinding invariant pins the relation so a future
--- Suggestion creator cannot mis-copy the store and bypass the repo
--- protection while the invariant stays green.
-entity Suggestion {
-    finding: Finding
-    target_store: MemoryStore
-    applies: Boolean
 }
 
 -- One dream run. Starts scanning; the findings it accumulates drive the
@@ -164,9 +121,9 @@ rule DetectDescriptionBodyDrift {
     requires: entry.has_description_body_drift
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "description-body-drift", route: edit, dream: dream)
+            Finding.created(entry: entry, kind: "description-body-drift", route: edit)
         else:
-            Finding.created(entry: entry, kind: "description-body-drift", route: append, dream: dream)
+            Finding.created(entry: entry, kind: "description-body-drift", route: append)
 }
 
 rule DetectSupersededButUnlinked {
@@ -174,9 +131,9 @@ rule DetectSupersededButUnlinked {
     requires: entry.is_superseded_unlinked
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: edit, dream: dream)
+            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: edit)
         else:
-            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: append, dream: dream)
+            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: append)
 }
 
 rule DetectStaleStateOverLore {
@@ -184,9 +141,9 @@ rule DetectStaleStateOverLore {
     requires: entry.is_stale_state
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "stale-state-over-lore", route: edit, dream: dream)
+            Finding.created(entry: entry, kind: "stale-state-over-lore", route: edit)
         else:
-            Finding.created(entry: entry, kind: "stale-state-over-lore", route: append, dream: dream)
+            Finding.created(entry: entry, kind: "stale-state-over-lore", route: append)
 }
 
 rule DetectWorkaroundVsPlan {
@@ -194,19 +151,19 @@ rule DetectWorkaroundVsPlan {
     requires: entry.is_workaround_not_plan
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "workaround-vs-plan", route: edit, dream: dream)
+            Finding.created(entry: entry, kind: "workaround-vs-plan", route: edit)
         else:
-            Finding.created(entry: entry, kind: "workaround-vs-plan", route: append, dream: dream)
+            Finding.created(entry: entry, kind: "workaround-vs-plan", route: append)
 }
 
 rule DetectDanglingLink {
-    when: ref: LinkRef.created
-    requires: not ref.resolves
+    when: entry: MemoryEntry.created
+    requires: entry.has_dangling_link
     ensures:
-        if ref.src.store.loc = per_user:
-            Finding.created(entry: ref.src, kind: "dangling-link", route: edit, dream: dream)
+        if entry.store.loc = per_user:
+            Finding.created(entry: entry, kind: "dangling-link", route: edit)
         else:
-            Finding.created(entry: ref.src, kind: "dangling-link", route: append, dream: dream)
+            Finding.created(entry: entry, kind: "dangling-link", route: append)
 }
 
 -- Append-only violation: an in-place edit to an existing repo store entry. The
@@ -216,7 +173,7 @@ rule DetectDanglingLink {
 rule DetectAppendOnlyViolation {
     when: entry: MemoryEntry.created
     requires: entry.is_append_only_violation and entry.store.loc = repo
-    ensures: Finding.created(entry: entry, kind: "append-only-violation", route: append, dream: dream)
+    ensures: Finding.created(entry: entry, kind: "append-only-violation", route: append)
 }
 
 -- Room-touching finding: a memory entry that cites a call/ or plan/ record
@@ -229,29 +186,17 @@ rule DetectRoomTouching {
     requires: entry.is_room_touching
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "room-touching", route: edit, dream: dream)
+            Finding.created(entry: entry, kind: "room-touching", route: edit)
         else:
-            Finding.created(entry: entry, kind: "room-touching", route: append, dream: dream)
-}
-
--- === Suggestion scoping ===
-
--- A finding's suggestion is scoped to its finding's store. In fix_mode the
--- suggestion applies only when the target is the per-user store; the repo
--- store is never auto-fixed. `target_store` copies `finding.entry.store`;
--- SuggestionTargetsItsFinding pins the relation.
-rule ScopeSuggestion {
-    when: finding: Finding.created
-    ensures: Suggestion.created(finding: finding, target_store: finding.entry.store,
-        applies: dream.fix_mode and finding.entry.store.loc = per_user)
+            Finding.created(entry: entry, kind: "room-touching", route: append)
 }
 
 -- === Verdict lifecycle: findings drive the exit-code decision ===
 
 -- StartDream inits the run: status -> dreaming, saw_finding -> false. The
--- init is what makes VerdictMatchesFindings provable (M1): a stale
--- `saw_finding` latch from a prior run cannot leak in. fix_mode is bound at
--- DreamStarts (the CLI flag) and stays constant for the run (F5).
+-- init is what makes VerdictMatchesFindings provable: a stale `saw_finding`
+-- latch from a prior run cannot leak in. fix_mode is bound at DreamStarts
+-- (the CLI flag) and stays constant for the run.
 rule StartDream {
     when: DreamStarts(project)
     ensures: dream.status = dreaming
@@ -284,133 +229,21 @@ rule VerdictError {
     ensures: dream.status = error
 }
 
--- === The MCP memory tool surface (plan/0073, extending plan/0065) ===
-
--- memory_write is the only mutator. It carries the operation kind, the
--- target entry (for update/delete), the originator, an optional Suggestion
--- it discharges (idempotency), and the accept/complete distinction.
--- `accepted` is the policy decision (the store is writable); `completed` is
--- the durable effect (the entry file and the index both landed). The
--- per-user store is physically two writes; a crash between them is
--- index/entry divergence, so the audit-safe signal is `completed`, not
--- `accepted`.
-entity MemoryWrite {
-    target_store: MemoryStore
-    op: MemoryWriteOp
-    target_entry: MemoryEntry
-    origin: MemoryWriteOrigin
-    suggestion: Suggestion
-    accepted: Boolean
-    completed: Boolean
-}
-
--- Repo store accepts create only (the append-only rule). Update and delete
--- are refused; they are the operationally invalid case for an append-only
--- store.
-rule MemoryWriteRefusesRepoUpdateDelete {
-    when: write: MemoryWrite.created
-    requires: write.target_store.loc = repo and write.op != create
-    ensures: write.accepted = false
-}
-
-rule MemoryWriteRefusesRepoCreateForAudit {
-    when: write: MemoryWrite.created
-    requires: write.target_store.loc = repo and write.origin = audit
-    ensures: write.accepted = false
-}
-
--- The per-user store accepts every op from mcp_tool or consolidation. The
--- audit origin is universally refused (AuditNeverWrites invariant below).
-rule MemoryWriteAcceptsPerUser {
-    when: write: MemoryWrite.created
-    requires: write.target_store.loc = per_user and write.origin != audit
-    ensures: write.accepted = true
-}
-
--- Completion: a write that was accepted reaches the durable state. The
--- implementation guarantees this for the per-user store; the model asserts
--- the policy-to-effect relation so a future regression (accepted but never
--- completed) is visible.
-rule MemoryWriteCompletes {
-    when: write: MemoryWrite.created
-    requires: write.accepted
-    ensures: write.completed = true
-}
-
 -- === Invariants ===
 
--- AuditNeverWrites (M4): the dream audit never produces a MemoryWrite. This
--- is the real content of the read-only property; it needs MemoryWrite.origin
--- to be checkable. dream's detectors create Findings, not writes; the
--- consolidation tool is a MemoryWrite caller with origin = consolidation,
--- never audit.
-invariant AuditNeverWrites {
-    for w in MemoryWrites where w.origin = audit:
-        not w.accepted
-}
-
--- The repo store is append-only at the methodology level (CLAUDE.md section
--- 6). memory_write accepts create only on the repo store, refused for update
--- and delete. The only sanctioned escape from append-only (the archive-first
--- map-only rename) is a separate code path that does not go through
--- memory_write.
-invariant RepoStoreAppendOnly {
-    for w in MemoryWrites where w.target_store.loc = repo and w.accepted:
-        w.op = create
-}
-
--- Fix mode never proposes an edit on the repo store. A Suggestion whose
--- target is the repo store is not applicable in fix_mode. The audit may still
--- report the finding (route: append), but it never auto-applies it.
-invariant FixNeverTouchesRepo {
-    for s in Suggestions where s.target_store.loc = repo:
-        not s.applies
-}
-
--- Suggestion target faithfulness (M3): the denormalized `target_store` field
--- equals the store of the finding the suggestion fixes. Without this, a
--- future Suggestion creator could mis-copy `target_store` and bypass
--- FixNeverTouchesRepo while the invariant stays green.
-invariant SuggestionTargetsItsFinding {
-    for s in Suggestions:
-        s.target_store = s.finding.entry.store
-}
-
 -- A repo-store finding never routes to edit. Encoded at Finding creation time
--- via the if/else in each detector's ensures block.
+-- via the if/else in each detector's ensures block. The Kani harness at
+-- #write-tests proves `route_for(StoreLoc::Repo) == Route::Append` directly.
 invariant RepoFindingsNeverEdit {
     for f in Findings where f.entry.store.loc = repo:
         f.route != edit
 }
 
--- VerdictMatchesFindings (M1): a clean verdict implies no finding was
--- recorded. The RecordFinding dreaming-guard and the StartDream saw_finding
--- init together make this provable. A clean verdict over a run that saw a
--- finding is the "verdict that lied" failure mode this invariant closes.
+-- VerdictMatchesFindings: a clean verdict implies no finding was recorded. The
+-- RecordFinding dreaming-guard and the StartDream saw_finding init together
+-- make this provable. A clean verdict over a run that saw a finding is the
+-- "verdict that lied" failure mode this invariant closes.
 invariant VerdictMatchesFindings {
     for d in Dreams where d.status = clean:
         not d.saw_finding
-}
-
--- Acceptance biconditional (M5): a write is accepted iff its target is the
--- per-user store and its origin is not the audit. Encodes both directions so
--- a regression in either rule, or a third StoreLoc later, is visible.
-invariant AcceptanceBiconditional {
-    for w in MemoryWrites:
-        w.accepted = (w.target_store.loc = per_user and w.origin != audit)
-}
-
--- Completed implies accepted: a write that was never accepted cannot reach
--- the durable state. The converse (accepted -> completed) is the
--- implementation's eventual-delivery guarantee, not an invariant.
-invariant CompletedImpliesAccepted {
-    for w in MemoryWrites where w.completed:
-        w.accepted
-}
-
--- Idempotency: at most one accepted write per Suggestion. An MCP transport
--- retry or a harness re-invocation cannot double-apply a fix.
-invariant IdempotentSuggestionDischarge {
-    for s in Suggestions:
-        Single(MemoryWrites where w.suggestion = s and w.accepted)
 }
