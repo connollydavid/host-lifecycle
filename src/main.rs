@@ -16,6 +16,11 @@ use host_grammar::{format_number, is_valid_name, is_valid_slug};
 use host_lint::{is_ci_file, is_scannable, path_ignored, scan_text_with_allow, Match, Severity};
 
 mod mcp;
+// plan/0073: the memory storage layer ships ahead of its consumers. The
+// `dream` subcommand (#implement-dream) and the MCP `memory_*` tools
+// (#extend-mcp) wire these surfaces; the allow lifts then.
+#[allow(dead_code)]
+mod memory;
 
 /// The canonical template a project adopts from; recorded in the stamp.
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/host-template";
