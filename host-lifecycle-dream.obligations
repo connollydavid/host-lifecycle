@@ -10,9 +10,9 @@
 #
 # Plan/0073 build sequence: this manifest was trimmed at #weed-and-tend to match
 # the post-tend spec scope (dream-only; the MemoryWrite / Suggestion / LinkRef
-# constructs move to #extend-mcp). The deferred-detector obligations are waived
-# pending #implement-remaining; the rest are forward refs that land at
-# #write-tests. Non-strict completeness check passes today (--tests src rc=0);
+# constructs move to #extend-mcp). The deferred detectors landed at
+# #implement-remaining; the rest are forward refs that land at #write-tests.
+# Non-strict completeness check passes today (--tests src rc=0);
 # --strict-discharge catches up at #write-tests.
 
 # --- Spec-integrity (covered by the check/analyse lane) ---
@@ -49,15 +49,15 @@ rule-failure.DetectDanglingLink.1              => test:dream_clean_on_resolved_l
 rule-success.DetectRoomTouching                => test:dream_detects_room_touching exercises=detect
 rule-failure.DetectRoomTouching.1              => test:dream_clean_on_no_room_refs exercises=detect
 
-rule-success.DetectStaleStateOverLore          => waived: pending #implement-remaining (richer heuristic)
-rule-failure.DetectStaleStateOverLore.1        => waived: pending #implement-remaining (richer heuristic)
+rule-success.DetectStaleStateOverLore          => test:dream_detects_stale_state_over_lore exercises=detect
+rule-failure.DetectStaleStateOverLore.1        => test:dream_clean_on_current_state exercises=detect
 
-rule-success.DetectWorkaroundVsPlan            => waived: pending #implement-remaining (richer heuristic)
-rule-failure.DetectWorkaroundVsPlan.1          => waived: pending #implement-remaining (richer heuristic)
+rule-success.DetectWorkaroundVsPlan            => test:dream_detects_workaround_vs_plan exercises=detect
+rule-failure.DetectWorkaroundVsPlan.1          => test:dream_clean_on_workaround_linked_to_plan exercises=detect
 
-rule-success.DetectAppendOnlyViolation         => waived: pending #implement-remaining (needs git history)
-rule-failure.DetectAppendOnlyViolation.1       => waived: pending #implement-remaining (needs git history)
-rule-entity-creation.DetectAppendOnlyViolation.1 => waived: pending #implement-remaining (needs git history)
+rule-success.DetectAppendOnlyViolation         => test:dream_detects_append_only_violation_in_git_history exercises=detect
+rule-failure.DetectAppendOnlyViolation.1       => test:dream_clean_on_clean_repo_store exercises=detect
+rule-entity-creation.DetectAppendOnlyViolation.1 => test:dream_append_only_violation_finding_created exercises=detect
 
 # --- Verdict lifecycle ---
 rule-success.StartDream                        => test:dream_start_inits_latch_and_status exercises=dream

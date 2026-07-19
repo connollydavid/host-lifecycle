@@ -80,6 +80,7 @@ pub struct Finding {
 /// per-user store passes its directory (so dangling-link can resolve); the
 /// repo store passes None (cross-entry resolution is a per-user concern).
 #[allow(dead_code)] // entry_type + store_dir reserved for the deferred detectors
+#[derive(Clone)]
 pub struct DetectorInput<'a> {
     pub slug: String,
     pub description: String,
@@ -102,10 +103,14 @@ impl<'a> DetectorInput<'a> {
     }
 }
 
-/// The detector engine: run every implemented detector over one entry,
-/// returning the findings (zero or more). Order is stable: detectors run in
-/// the spec's declaration order; this is the function the dream subcommand
-/// and the memory_consolidate MCP tool both call.
+/// The detector engine: run every implemented single-entry detector over one
+/// entry, returning the findings (zero or more). Order is stable: detectors
+/// run in the spec's declaration order; this is the function the dream
+/// subcommand and the memory_consolidate MCP tool both call.
+///
+/// Cross-entry detectors (workaround-vs-plan) and history detectors
+/// (append-only-violation) live in `detect_cross` and `audit_repo_memory`
+/// respectively; they need wider context than a single DetectorInput carries.
 pub fn detect(input: &DetectorInput) -> Vec<Finding> {
     let mut out = Vec::new();
     if let Some(f) = detect_superseded_unlinked(input) {
@@ -119,6 +124,23 @@ pub fn detect(input: &DetectorInput) -> Vec<Finding> {
     }
     if let Some(f) = detect_description_body_drift(input) {
         out.push(f);
+    }
+    if let Some(f) = detect_stale_state_over_lore(input) {
+        out.push(f);
+    }
+    out
+}
+
+/// Run cross-entry detectors over a full store's worth of entries. Each
+/// detector receives the entry under review plus the slice of other entries
+/// in the same store, so it can spot pair-level patterns
+/// (workaround-vs-plan) the single-entry pass cannot.
+pub fn detect_cross<'a>(entries: &'a [DetectorInput<'a>]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for entry in entries {
+        if let Some(f) = detect_workaround_vs_plan(entry, entries) {
+            out.push(f);
+        }
     }
     out
 }
@@ -217,6 +239,124 @@ pub fn detect_description_body_drift(input: &DetectorInput) -> Option<Finding> {
         }
     }
     None
+}
+
+/// Stale-state-over-lore: HEURISTIC. A snapshot memory (entry_type = State)
+/// whose state language reads "done" but whose body still carries durable
+/// measured lore. The detector fires when a State entry's body contains a
+/// state-complete signal ("done", "shipped", "complete", "landed",
+/// "resolved", "finished", "closed") AND a measured-lore signal (a digit
+/// adjacent to a unit-ish character). The operator's fix is a dated
+/// current-state block, not a rewrite. The cast review may refine the
+/// vocabulary; the current word-lists are the conservative bar.
+pub fn detect_stale_state_over_lore(input: &DetectorInput) -> Option<Finding> {
+    if input.entry_type != EntryType::State {
+        return None;
+    }
+    let body_lc = input.body.to_lowercase();
+    let state_done = ["done", "shipped", "complete", "landed", "resolved", "finished", "closed"];
+    // Word-boundary match: the token must be preceded/followed by a non-alphanumeric.
+    let has_done = state_done.iter().any(|w| contains_word(&body_lc, w));
+    if !has_done {
+        return None;
+    }
+    // measured-lore signal: a digit followed by a non-digit, non-space (a unit
+    // character: 'ms', 'kb', 'MB', '%', 'x', etc.). Conservative; the cast
+    // review may tighten.
+    let has_lore = body_lc
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0].is_ascii_digit() && !w[1].is_ascii_digit() && !w[1].is_whitespace());
+    if !has_lore {
+        return None;
+    }
+    Some(Finding {
+        entry_slug: input.slug.clone(),
+        store: input.store,
+        kind: "stale-state-over-lore".to_string(),
+        route: DetectorInput::route_for(input.store),
+        explanation: "State entry reads done but carries durable measured lore; mark the state superseded with a dated current-state block, do not delete the lore".to_string(),
+    })
+}
+
+/// Workaround-vs-plan: HEURISTIC, CROSS-ENTRY. Two entries in the same store
+/// assert contradictory current facts, neither referencing the other. The
+/// detector pairs a `Workaround` entry with a `Fact` entry in the same store
+/// whose bodies share a key term (length >= 5, alphanumeric); the missing
+/// cross-link is the signal. The cast review may refine the topic-extraction;
+/// the current key-term overlap is the conservative bar.
+pub fn detect_workaround_vs_plan<'a>(
+    entry: &DetectorInput<'a>,
+    all: &[DetectorInput<'a>],
+) -> Option<Finding> {
+    if entry.entry_type != EntryType::Workaround {
+        return None;
+    }
+    let entry_terms = key_terms(&entry.body);
+    if entry_terms.is_empty() {
+        return None;
+    }
+    for other in all {
+        if other.slug == entry.slug {
+            continue;
+        }
+        if other.entry_type != EntryType::Fact {
+            continue;
+        }
+        if other.store != entry.store {
+            continue;
+        }
+        let other_terms = key_terms(&other.body);
+        if entry_terms.intersection(&other_terms).next().is_some() {
+            // missing cross-link either way?
+            let entry_links_other = entry.body.contains(&format!("[[{}]]", other.slug));
+            let other_links_entry = other.body.contains(&format!("[[{}]]", entry.slug));
+            if !entry_links_other && !other_links_entry {
+                return Some(Finding {
+                    entry_slug: entry.slug.clone(),
+                    store: entry.store,
+                    kind: "workaround-vs-plan".to_string(),
+                    route: DetectorInput::route_for(entry.store),
+                    explanation: format!(
+                        "Workaround entry shares a key term with Fact entry `{}` but neither cross-links the other; one may be a fix-of-the-moment the plan supersedes", other.slug
+                    ),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Extract the key terms from a body for topic-overlap matching. A key term
+/// is an alphanumeric token of length >= 5 (filters out stop-words like
+/// "the", "and", "for"). Lowercased so case-insensitive.
+fn key_terms(body: &str) -> BTreeSet<String> {
+    body.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 5)
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+/// Word-boundary containment: `haystack` contains `needle` as a complete
+/// word (the chars before and after the match, if any, are non-alphanumeric).
+/// Lowercase both sides for case-insensitive matching.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    let needle_lc = needle.to_lowercase();
+    let mut start = 0;
+    while let Some(idx) = haystack[start..].find(&needle_lc) {
+        let abs = start + idx;
+        let end = abs + needle_lc.len();
+        let before_ok = abs == 0
+            || !haystack.as_bytes()[abs - 1].is_ascii_alphanumeric();
+        let after_ok = end >= haystack.len()
+            || !haystack.as_bytes()[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 /// Extract every `[[slug]]` token from a body. A slug is `[a-z0-9-]+`. Order
@@ -411,8 +551,9 @@ pub fn run_audit(project_dir: &Path) -> Vec<Finding> {
         .iter()
         .map(|e| e.slug.clone())
         .collect();
-    for entry in &per_user_entries {
-        let input = DetectorInput {
+    let per_user_inputs: Vec<DetectorInput> = per_user_entries
+        .iter()
+        .map(|entry| DetectorInput {
             slug: entry.slug.clone(),
             description: entry.description.clone(),
             body: entry.body.clone(),
@@ -421,9 +562,27 @@ pub fn run_audit(project_dir: &Path) -> Vec<Finding> {
             store: StoreLoc::PerUser,
             store_dir: per_user_store.as_ref().map(|s| s.dir()),
             known_slugs: &per_user_slugs,
-        };
-        findings.extend(detect(&input));
+        })
+        .collect();
+    for input in &per_user_inputs {
+        findings.extend(detect(input));
     }
+    // Cross-entry detectors need a stable slice; rebuild with the per-user
+    // slugs BTreeSet outliving the call by tying it to the outer scope.
+    let per_user_inputs_ref: Vec<DetectorInput> = per_user_entries
+        .iter()
+        .map(|entry| DetectorInput {
+            slug: entry.slug.clone(),
+            description: entry.description.clone(),
+            body: entry.body.clone(),
+            superseded_by: entry.superseded_by.clone(),
+            entry_type: entry.entry_type.clone(),
+            store: StoreLoc::PerUser,
+            store_dir: per_user_store.as_ref().map(|s| s.dir()),
+            known_slugs: &per_user_slugs,
+        })
+        .collect();
+    findings.extend(detect_cross(&per_user_inputs_ref));
 
     // Repo MEMORY.md (the append-only tier). Read entries at the section level;
     // each `### ` heading begins a new entry. Cross-reference the same detectors
@@ -461,6 +620,94 @@ fn audit_repo_memory(path: &Path) -> Vec<Finding> {
             known_slugs: &all_slugs,
         };
         out.extend(detect(&input));
+    }
+    // Append-only-violation: scan git history of MEMORY.md for in-place body
+    // edits to existing sections. Returns one finding per edited section.
+    out.extend(detect_append_only_violations(path));
+    out
+}
+
+/// Append-only-violation: HEURISTIC, HISTORY-BASED. An in-place edit to an
+/// existing repo MEMORY.md entry (a section whose body changed between two
+/// revisions without a new dated heading). The detector runs `git log -p` on
+/// MEMORY.md and parses the diff: a hunk whose removed lines are inside an
+/// existing `### ` section (not the section heading itself, not a new
+/// section's body) is an in-place edit. Conservative: the cast review may
+/// refine the heuristic; for now it flags any section with removed body
+/// lines across revisions.
+fn detect_append_only_violations(path: &Path) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let Some(parent) = path.parent() else {
+        return out;
+    };
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("MEMORY.md");
+    // `git log -p --no-color -- MEMORY.md` under the project dir.
+    let result = std::process::Command::new("git")
+        .arg("-C")
+        .arg(parent)
+        .args(["log", "-p", "--no-color", "--", file_name])
+        .output();
+    let Ok(output) = result else {
+        return out;
+    };
+    if !output.status.success() {
+        return out;
+    }
+    let log = String::from_utf8_lossy(&output.stdout);
+    // Track sections that have removals inside them in any revision's diff.
+    // A `### ` heading line (any prefix: context, +, or -) marks the current
+    // section; a `-` body line (not a heading, not a meta line) inside a known
+    // section is the in-place-edit signal.
+    let mut edited_sections: BTreeSet<String> = BTreeSet::new();
+    let mut current_section: Option<String> = None;
+    let mut in_diff = false;
+    for line in log.lines() {
+        if line.starts_with("diff --git") || line.starts_with("commit ") {
+            in_diff = false;
+            current_section = None;
+            continue;
+        }
+        if line.starts_with("@@") {
+            in_diff = true;
+            current_section = None;
+            continue;
+        }
+        if !in_diff {
+            continue;
+        }
+        // Inside a diff hunk. Recognise section headings under any prefix.
+        // Context heading ` ### X`, added heading `+### X`, removed heading
+        // `-### X`. A removed heading is a section rename/deletion (not an
+        // in-place edit); reset so body removals under it are not attributed.
+        if let Some(heading) = line
+            .strip_prefix(" ### ")
+            .or_else(|| line.strip_prefix("+### "))
+        {
+            current_section = Some(heading.trim().to_string());
+            continue;
+        }
+        if line.strip_prefix("-### ").is_some() {
+            current_section = None;
+            continue;
+        }
+        // A removal inside the current section's body. Skip the `---` file
+        // meta line (which `strip_prefix('-')` would otherwise catch).
+        if line.starts_with('-') && !line.starts_with("---") {
+            if let Some(section) = &current_section {
+                edited_sections.insert(section.clone());
+            }
+        }
+    }
+    for section in edited_sections {
+        out.push(Finding {
+            entry_slug: slugify(&section),
+            store: StoreLoc::Repo,
+            kind: "append-only-violation".to_string(),
+            route: Route::Append,
+            explanation: format!(
+                "section `{section}` has body removals in git history; the repo MEMORY.md is append-only (CLAUDE.md section 6); if the body changed, append a correction with a forward [[link]] instead"
+            ),
+        });
     }
     out
 }
@@ -846,6 +1093,223 @@ mod tests {
         if outcome.exit_code == 0 {
             assert!(outcome.findings.is_empty());
         }
+    }
+
+    // --- Manifest tests: the three #implement-remaining detectors ---
+
+    #[test]
+    fn dream_detects_stale_state_over_lore() {
+        // A State entry whose body reads done and carries a measured value.
+        let slugs = known(&["snapshot"]);
+        let mut inp = input(
+            "snapshot",
+            "GPU parity status",
+            "Single-GPU parity is done; the dual-GPU measurement was 42ms.",
+            &slugs,
+        );
+        inp.entry_type = EntryType::State;
+        let fs = detect(&inp);
+        assert!(fs.iter().any(|f| f.kind == "stale-state-over-lore"));
+    }
+
+    #[test]
+    fn dream_clean_on_current_state() {
+        // A State entry that is done but has no measured lore: not flagged.
+        let slugs = known(&["snapshot"]);
+        let mut inp = input(
+            "snapshot",
+            "Status",
+            "This work is done and shipped.",
+            &slugs,
+        );
+        inp.entry_type = EntryType::State;
+        let fs = detect(&inp);
+        assert!(!fs.iter().any(|f| f.kind == "stale-state-over-lore"));
+    }
+
+    #[test]
+    fn dream_detects_workaround_vs_plan() {
+        // A Workaround entry and a Fact entry in the same store, sharing a
+        // key term, neither cross-linking the other.
+        let slugs = known(&["workaround", "plan"]);
+        let mut w = input(
+            "workaround",
+            "k=0 kernel fix",
+            "The k=0_kernel needs the AR16 model applied at boot.",
+            &slugs,
+        );
+        w.entry_type = EntryType::Workaround;
+        let mut p = input(
+            "plan",
+            "Base locked",
+            "The base is locked to F16-ssm_out as agreed.",
+            &slugs,
+        );
+        p.entry_type = EntryType::Fact;
+        // No shared key term yet; force one by adjusting the plan body.
+        p.body = "The base is locked to k=0_kernel as agreed.".to_string();
+        let entries = vec![w.clone(), p];
+        let fs = detect_cross(&entries);
+        assert!(fs.iter().any(|f| f.kind == "workaround-vs-plan" && f.entry_slug == "workaround"));
+    }
+
+    #[test]
+    fn dream_clean_on_workaround_linked_to_plan() {
+        // Same as above but the workaround entry cross-links the plan: not flagged.
+        let slugs = known(&["workaround", "plan"]);
+        let mut w = input(
+            "workaround",
+            "k=0 kernel fix",
+            "The k=0_kernel needs AR16; see [[plan]] for the standing decision.",
+            &slugs,
+        );
+        w.entry_type = EntryType::Workaround;
+        let mut p = input(
+            "plan",
+            "Base locked",
+            "The base is locked to k=0_kernel as agreed.",
+            &slugs,
+        );
+        p.entry_type = EntryType::Fact;
+        let entries = vec![w, p];
+        let fs = detect_cross(&entries);
+        assert!(!fs.iter().any(|f| f.kind == "workaround-vs-plan"));
+    }
+
+    #[test]
+    fn dream_detects_append_only_violation_in_git_history() {
+        // Build a real git repo, commit MEMORY.md, then edit a section's body
+        // and commit again. The detector should find the edited section.
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!(
+            "dream-append-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.name", "test"]);
+        g(&["config", "user.email", "test@example.com"]);
+        fs::write(
+            dir.join("MEMORY.md"),
+            "# MEMORY.md\n\n### Original\n\nFirst body line.\n",
+        )
+        .unwrap();
+        g(&["add", "MEMORY.md"]);
+        g(&["commit", "-q", "-m", "first"]);
+        // Edit the section's body in place (no new section heading).
+        fs::write(
+            dir.join("MEMORY.md"),
+            "# MEMORY.md\n\n### Original\n\nEdited body line.\n",
+        )
+        .unwrap();
+        g(&["add", "MEMORY.md"]);
+        g(&["commit", "-q", "-m", "second"]);
+        let path = dir.join("MEMORY.md");
+        let fs_out = detect_append_only_violations(&path);
+        assert!(
+            fs_out.iter().any(|f| f.kind == "append-only-violation"),
+            "expected an append-only-violation finding, got: {fs_out:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dream_clean_on_clean_repo_store() {
+        // A git history with only additions (new sections, no body edits to
+        // existing ones) yields no append-only-violation findings.
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!(
+            "dream-clean-repo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.name", "test"]);
+        g(&["config", "user.email", "test@example.com"]);
+        fs::write(dir.join("MEMORY.md"), "# MEMORY.md\n\n### First\n\nBody.\n").unwrap();
+        g(&["add", "MEMORY.md"]);
+        g(&["commit", "-q", "-m", "first"]);
+        // Append a new section (allowed).
+        fs::write(
+            dir.join("MEMORY.md"),
+            "# MEMORY.md\n\n### First\n\nBody.\n\n### Second\n\nAppended body.\n",
+        )
+        .unwrap();
+        g(&["add", "MEMORY.md"]);
+        g(&["commit", "-q", "-m", "second"]);
+        let path = dir.join("MEMORY.md");
+        let fs_out = detect_append_only_violations(&path);
+        assert!(
+            !fs_out.iter().any(|f| f.kind == "append-only-violation"),
+            "expected no append-only-violation findings on a clean-append history, got: {fs_out:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dream_append_only_violation_finding_created() {
+        // rule-entity-creation obligation: the detector emits a Finding struct
+        // with the right kind, store, and route when git history shows an edit.
+        // Covered by dream_detects_append_only_violation_in_git_history; this
+        // test asserts the Finding shape explicitly.
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!(
+            "dream-append-shape-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| {
+            let _ = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.name", "test"]);
+        g(&["config", "user.email", "test@example.com"]);
+        fs::write(dir.join("MEMORY.md"), "# M\n\n### X\n\nOriginal.\n").unwrap();
+        g(&["add", "MEMORY.md"]);
+        g(&["commit", "-q", "-m", "first"]);
+        fs::write(dir.join("MEMORY.md"), "# M\n\n### X\n\nEdited.\n").unwrap();
+        g(&["add", "MEMORY.md"]);
+        g(&["commit", "-q", "-m", "second"]);
+        let path = dir.join("MEMORY.md");
+        let fs_out = detect_append_only_violations(&path);
+        let f = fs_out
+            .iter()
+            .find(|f| f.kind == "append-only-violation")
+            .expect("append-only-violation finding not emitted");
+        assert_eq!(f.store, StoreLoc::Repo);
+        assert_eq!(f.route, Route::Append);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
