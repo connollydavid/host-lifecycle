@@ -1,0 +1,101 @@
+# host-lifecycle-dream.obligations — disposition for every `allium plan` obligation.
+# `host-lifecycle obligations host-lifecycle-dream.allium --tests src --strict-discharge`
+# checks this is complete (no obligation undispositioned, no stale entry, every
+# test: name real, every exercises= symbol referenced).
+#   <id> => test:<name> [exercises=<symbol>] | structural | waived: <reason>
+# structural = the spec's own `allium check`/`analyse` lane discharges it (field
+# presence, enum comparability, surface shape, declared transition graph).
+# The behavioural tests live inline in src/main.rs (#[cfg(test)] mod tests),
+# alongside the existing host-lifecycle suite.
+#
+# Plan/0073 build sequence: this manifest is written at #write-obligations ahead
+# of the implementation tasks (#implement-store, #extend-mcp, #implement-dream,
+# #write-tests). The test names below are forward references; strict-discharge
+# passes once #write-tests lands the named tests with the cited exercises=
+# entrypoints. The non-strict completeness check (every obligation
+# dispositioned, no stale entry) passes immediately on this manifest.
+
+# --- Spec-integrity (covered by the check/analyse lane) ---
+enum-comparable.StoreLoc                       => structural
+enum-comparable.Route                          => structural
+enum-comparable.MemoryWriteOp                  => structural
+enum-comparable.MemoryWriteOrigin              => structural
+entity-fields.MemoryStore                      => structural
+entity-fields.MemoryEntry                      => structural
+entity-fields.LinkRef                          => structural
+entity-fields.Finding                          => structural
+entity-fields.Suggestion                       => structural
+entity-fields.Dream                            => structural
+entity-fields.Project                          => structural
+entity-fields.MemoryWrite                      => structural
+transition-edge.Dream.dreaming.clean           => test:dream_transition_dreaming_to_clean exercises=dream
+transition-edge.Dream.dreaming.findings        => test:dream_transition_dreaming_to_findings exercises=dream
+transition-edge.Dream.dreaming.error           => test:dream_transition_dreaming_to_error exercises=dream
+transition-rejected.Dream.status               => structural
+transition-terminal.Dream.status               => structural
+surface-actor.DreamRun                         => structural
+surface-provides.DreamRun                      => structural
+
+# --- Detectors (behavioural) ---
+# Each `test:` carries an `exercises=<symbol>` link to the entrypoint the discharging
+# test drives, checked by `obligations --strict-discharge` (plan/0052, no-hollow-green).
+# `dream` is the dream audit entrypoint; `memory_write` is the MCP tool handler.
+# Both land in src/main.rs at #implement-dream and #extend-mcp respectively.
+
+rule-success.DetectDescriptionBodyDrift        => test:dream_detects_description_body_drift exercises=dream
+rule-failure.DetectDescriptionBodyDrift.1      => test:dream_clean_on_drift_free_entry exercises=dream
+
+rule-success.DetectSupersededButUnlinked       => test:dream_detects_superseded_unlinked exercises=dream
+rule-failure.DetectSupersededButUnlinked.1     => test:dream_clean_on_linked_supersession exercises=dream
+
+rule-success.DetectStaleStateOverLore          => test:dream_detects_stale_state_over_lore exercises=dream
+rule-failure.DetectStaleStateOverLore.1        => test:dream_clean_on_current_state exercises=dream
+
+rule-success.DetectWorkaroundVsPlan            => test:dream_detects_workaround_vs_plan exercises=dream
+rule-failure.DetectWorkaroundVsPlan.1          => test:dream_clean_on_consistent_entries exercises=dream
+
+rule-success.DetectDanglingLink                => test:dream_detects_dangling_link exercises=dream
+rule-failure.DetectDanglingLink.1              => test:dream_clean_on_resolved_links exercises=dream
+
+rule-success.DetectAppendOnlyViolation         => test:dream_detects_append_only_violation exercises=dream
+rule-failure.DetectAppendOnlyViolation.1       => test:dream_clean_on_clean_repo_store exercises=dream
+rule-entity-creation.DetectAppendOnlyViolation.1 => test:dream_append_only_violation_finding_created exercises=dream
+
+rule-success.DetectRoomTouching                => test:dream_detects_room_touching exercises=dream
+rule-failure.DetectRoomTouching.1              => test:dream_clean_on_no_room_refs exercises=dream
+
+# --- Suggestion scoping ---
+rule-success.ScopeSuggestion                   => test:dream_suggestion_scoped_to_finding_store exercises=dream
+rule-entity-creation.ScopeSuggestion.1         => test:dream_suggestion_created_per_finding exercises=dream
+
+# --- Verdict lifecycle ---
+rule-success.StartDream                        => test:dream_start_inits_latch_and_status exercises=dream
+rule-success.RecordFinding                     => test:dream_record_finding_sets_latch exercises=dream
+rule-failure.RecordFinding.1                   => test:dream_record_finding_guarded_on_dreaming exercises=dream
+rule-success.VerdictFindings                   => test:dream_verdict_findings_on_any_finding exercises=dream
+rule-failure.VerdictFindings.1                 => test:dream_no_false_findings_verdict exercises=dream
+rule-success.VerdictClean                      => test:dream_verdict_clean_on_no_finding exercises=dream
+rule-failure.VerdictClean.1                    => test:dream_no_false_clean_verdict exercises=dream
+rule-success.VerdictError                      => test:dream_verdict_error_on_fail_signal exercises=dream
+rule-failure.VerdictError.1                    => test:dream_no_false_error_verdict exercises=dream
+
+# --- memory_write tool surface (plan/0073, extending plan/0065) ---
+rule-success.MemoryWriteRefusesRepoUpdateDelete       => test:memory_write_refuses_repo_update exercises=memory_write
+rule-failure.MemoryWriteRefusesRepoUpdateDelete.1     => test:memory_write_accepts_repo_create exercises=memory_write
+rule-success.MemoryWriteRefusesRepoCreateForAudit     => test:memory_write_refuses_repo_for_audit_origin exercises=memory_write
+rule-failure.MemoryWriteRefusesRepoCreateForAudit.1   => test:memory_write_accepts_repo_create_for_mcp exercises=memory_write
+rule-success.MemoryWriteAcceptsPerUser                => test:memory_write_accepts_per_user exercises=memory_write
+rule-failure.MemoryWriteAcceptsPerUser.1              => test:memory_write_refuses_per_user_for_audit exercises=memory_write
+rule-success.MemoryWriteCompletes                     => test:memory_write_completes_when_accepted exercises=memory_write
+rule-failure.MemoryWriteCompletes.1                   => test:memory_write_not_completed_when_refused exercises=memory_write
+
+# --- Invariants (behavioural) ---
+invariant.AuditNeverWrites                     => test:audit_origin_never_accepted exercises=memory_write
+invariant.RepoStoreAppendOnly                 => test:repo_store_accepts_create_only exercises=memory_write
+invariant.FixNeverTouchesRepo                  => test:fix_mode_never_applies_repo_suggestion exercises=dream
+invariant.SuggestionTargetsItsFinding          => test:suggestion_target_equals_finding_store exercises=dream
+invariant.RepoFindingsNeverEdit                => test:repo_store_finding_routes_to_append exercises=dream
+invariant.VerdictMatchesFindings               => test:clean_verdict_implies_no_finding exercises=dream
+invariant.AcceptanceBiconditional              => test:acceptance_iff_per_user_non_audit exercises=memory_write
+invariant.CompletedImpliesAccepted             => test:completed_implies_accepted exercises=memory_write
+invariant.IdempotentSuggestionDischarge        => test:at_most_one_write_per_suggestion exercises=memory_write
