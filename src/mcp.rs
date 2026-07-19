@@ -6,12 +6,18 @@
 //! writer and takes an injected verb runner, so the protocol (the elicitation round trip included)
 //! is unit-tested without stdio or a subprocess.
 
+use std::path::{Path, PathBuf};
+
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+use crate::memory::{EntryType, MemoryEntry, MemoryStore};
+
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// The two onboarding tools the server exposes, each with a flat input schema.
+/// The onboarding + memory tools the server exposes. The onboarding tools
+/// (plan/0065) run as subprocesses; the memory tools (plan/0073) call the
+/// memory store directly.
 fn tool_defs() -> Value {
     json!([
         {
@@ -38,6 +44,41 @@ fn tool_defs() -> Value {
                     "at": {"type": "string", "description": "an optional parent directory for the new host"}
                 }
             }
+        },
+        {
+            "name": "memory_list",
+            "description": "List every memory entry in the per-user host-* memory store for the current project.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "memory_read",
+            "description": "Read one memory entry by slug from the per-user store.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"slug": {"type": "string", "description": "the entry slug"}},
+                "required": ["slug"]
+            }
+        },
+        {
+            "name": "memory_write",
+            "description": "Create, update, or delete a memory entry in the per-user store. The repo MEMORY.md (append-only) is never writable via this tool.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string", "description": "the entry slug"},
+                    "description": {"type": "string", "description": "a one-line summary (what recall keys on)"},
+                    "body": {"type": "string", "description": "the free-form markdown body"},
+                    "type": {"type": "string", "enum": ["feedback", "fact", "workaround", "state"], "description": "the entry class (default fact)"},
+                    "superseded_by": {"type": "string", "description": "a slug that supersedes this entry"},
+                    "op": {"type": "string", "enum": ["write", "delete"], "description": "write (create-or-update) or delete (default write)"}
+                },
+                "required": ["slug"]
+            }
+        },
+        {
+            "name": "memory_consolidate",
+            "description": "Run the dream audit over both memory stores (repo MEMORY.md + per-user) and return the findings. Read-only; the advisory memory-consolidation pass.",
+            "inputSchema": {"type": "object", "properties": {}}
         }
     ])
 }
@@ -148,14 +189,13 @@ fn run_verb_subprocess(argv: &[String]) -> (String, i32) {
 
 /// The public entry: build a current-thread tokio runtime and serve over real stdio.
 pub fn mcp(_args: &[String]) {
-    // Async stdio uses tokio's blocking pool (a current-thread runtime carries it), not the IO
-    // reactor, so no `enable_io` is needed and the `net` feature stays out of the vendored set.
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("tokio current-thread runtime");
+    let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let reader = BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
-    rt.block_on(serve(reader, writer, run_verb_subprocess));
+    rt.block_on(serve(reader, writer, run_verb_subprocess, project_dir));
 }
 
 /// Read one newline-delimited JSON message, skipping blank lines. `None` on a closed pipe.
@@ -201,7 +241,7 @@ async fn write_error<W: AsyncWrite + Unpin>(writer: &mut W, id: &Value, code: i6
 /// The protocol loop, generic over reader/writer and the verb runner. Reads newline-delimited
 /// JSON-RPC and handles `initialize`, `tools/list`, and `tools/call` (eliciting the name when the
 /// client declared the capability and the verb reports name-required) until the client closes stdin.
-async fn serve<R, W, F>(reader: R, mut writer: W, run_verb: F)
+async fn serve<R, W, F>(reader: R, mut writer: W, run_verb: F, project_dir: PathBuf)
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -225,11 +265,122 @@ where
             "ping" => write_response(&mut writer, &id, json!({})).await,
             "tools/list" => write_response(&mut writer, &id, json!({"tools": tool_defs()})).await,
             "tools/call" => {
-                let result = handle_tool_call(&msg, &mut reader, &mut writer, client_elicits, &mut next_id, &run_verb).await;
+                let result = handle_tool_call(&msg, &mut reader, &mut writer, client_elicits, &mut next_id, &run_verb, &project_dir).await;
                 write_response(&mut writer, &id, result).await;
             }
             other => write_error(&mut writer, &id, -32601, &format!("method not found: {other}")).await,
         }
+    }
+}
+
+/// Handle a `tools/call` for a memory tool (plan/0073). These call the memory
+/// store directly (no subprocess); the per-user store at
+/// `~/.host-memory/<encoded-cwd>/` is the only writable target. The repo
+/// MEMORY.md is never writable via MCP.
+fn handle_memory_call(verb: &str, args: &Value, project_dir: &Path) -> Value {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let Some(home) = home else {
+        return tool_result("no HOME set; cannot locate the per-user memory store", true);
+    };
+    let root = home.join(".host-memory");
+    let store = match MemoryStore::open(&root, project_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_result(&format!("cannot open memory store: {e}"), true),
+    };
+    match verb {
+        "memory_list" => {
+            let entries = match store.list() {
+                Ok(e) => e,
+                Err(e) => return tool_result(&format!("list: {e}"), true),
+            };
+            if entries.is_empty() {
+                return tool_result("(no memory entries)", false);
+            }
+            let text = entries
+                .iter()
+                .map(|e| format!("- [{}]({}.md): {}", e.slug, e.slug, e.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tool_result(&text, false)
+        }
+        "memory_read" => {
+            let slug = args.get("slug").and_then(Value::as_str).unwrap_or("").trim();
+            if slug.is_empty() {
+                return tool_result("memory_read requires a 'slug'", true);
+            }
+            match store.read(slug) {
+                Ok(entry) => tool_result(&entry.render(), false),
+                Err(e) => tool_result(&format!("read {slug}: {e}"), true),
+            }
+        }
+        "memory_write" => {
+            let slug = args.get("slug").and_then(Value::as_str).unwrap_or("").trim();
+            if slug.is_empty() {
+                return tool_result("memory_write requires a 'slug'", true);
+            }
+            let op = args.get("op").and_then(Value::as_str).unwrap_or("write");
+            if op == "delete" {
+                return match store.delete(slug) {
+                    Ok(()) => tool_result(&format!("deleted {slug}"), false),
+                    Err(e) => tool_result(&format!("delete {slug}: {e}"), true),
+                };
+            }
+            let description = args.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+            let body = args.get("body").and_then(Value::as_str).unwrap_or("").to_string();
+            let entry_type = args
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(|s| EntryType::parse(s).ok())
+                .unwrap_or(EntryType::Fact);
+            let superseded_by = args
+                .get("superseded_by")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let today = crate::today();
+            let created = store.read(slug).map(|e| e.created).unwrap_or_else(|_| today.clone());
+            let entry = MemoryEntry {
+                slug: slug.to_string(),
+                description,
+                body,
+                entry_type,
+                created,
+                last_edited: today,
+                superseded_by,
+            };
+            match store.write(&entry) {
+                Ok(()) => tool_result(&format!("wrote {slug}"), false),
+                Err(e) => tool_result(&format!("write {slug}: {e}"), true),
+            }
+        }
+        "memory_consolidate" => {
+            let findings = crate::dream::run_audit(project_dir);
+            if findings.is_empty() {
+                tool_result("clean: no staleness, drift, or append-only violations", false)
+            } else {
+                let lines: Vec<String> = findings
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            "{} ({}) [{}] route={}: {}",
+                            f.entry_slug,
+                            match f.store {
+                                crate::dream::StoreLoc::Repo => "repo",
+                                crate::dream::StoreLoc::PerUser => "per-user",
+                            },
+                            f.kind,
+                            match f.route {
+                                crate::dream::Route::Edit => "edit",
+                                crate::dream::Route::Append => "append",
+                            },
+                            f.explanation
+                        )
+                    })
+                    .collect();
+                tool_result(&format!("{} finding(s):\n{}", findings.len(), lines.join("\n")), false)
+            }
+        }
+        _ => tool_result(&format!("unknown memory tool: {verb}"), true),
     }
 }
 
@@ -242,6 +393,7 @@ async fn handle_tool_call<R, W, F>(
     client_elicits: bool,
     next_id: &mut i64,
     run_verb: &F,
+    project_dir: &Path,
 ) -> Value
 where
     R: AsyncBufRead + Unpin,
@@ -250,6 +402,13 @@ where
 {
     let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
     let verb = params.get("name").and_then(Value::as_str).unwrap_or("");
+
+    // Memory tools (plan/0073): direct Rust calls to the memory store; no subprocess.
+    if matches!(verb, "memory_list" | "memory_read" | "memory_write" | "memory_consolidate") {
+        let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        return handle_memory_call(verb, &args, project_dir);
+    }
+
     if verb != "init" && verb != "adopt" {
         return tool_result(&format!("unknown tool: {verb}"), true);
     }
@@ -292,9 +451,13 @@ mod tests {
         assert_eq!(initialize_result()["protocolVersion"], PROTOCOL_VERSION);
         assert!(initialize_result()["capabilities"]["tools"].is_object());
         let tools = tool_defs();
-        assert_eq!(tools.as_array().unwrap().len(), 2);
+        assert_eq!(tools.as_array().unwrap().len(), 6);
         assert_eq!(tools[0]["name"], "init");
         assert_eq!(tools[1]["name"], "adopt");
+        assert_eq!(tools[2]["name"], "memory_list");
+        assert_eq!(tools[3]["name"], "memory_read");
+        assert_eq!(tools[4]["name"], "memory_write");
+        assert_eq!(tools[5]["name"], "memory_consolidate");
         let req = elicitation_request(7);
         assert_eq!(req["method"], "elicitation/create");
         assert_eq!(req["id"], 7);
@@ -341,7 +504,7 @@ mod tests {
             if argv.iter().any(|a| a == "--name") { (format!("ok {}", argv.join(" ")), 0) }
             else { ("name-required\n".to_string(), crate::EXIT_NAME_REQUIRED) }
         };
-        serve(BufReader::new(input.as_bytes()), &mut out, run).await;
+        serve(BufReader::new(input.as_bytes()), &mut out, run, std::path::PathBuf::from(".")).await;
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("--name acme"), "the interleaved notification was skipped and the elicited name resolved");
     }
@@ -366,7 +529,7 @@ mod tests {
                 ("name-required: supply the project name\n".to_string(), crate::EXIT_NAME_REQUIRED)
             }
         };
-        serve(BufReader::new(input.as_bytes()), &mut out, run).await;
+        serve(BufReader::new(input.as_bytes()), &mut out, run, std::path::PathBuf::from(".")).await;
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(PROTOCOL_VERSION), "initialize echoed the protocol version");
         assert!(text.contains("\"name\":\"init\"") || text.contains("\"name\": \"init\""), "tools/list carried init");
@@ -391,10 +554,131 @@ mod tests {
                 ("name-required: supply the project name\n".to_string(), crate::EXIT_NAME_REQUIRED)
             }
         };
-        serve(BufReader::new(input.as_bytes()), &mut out, run).await;
+        serve(BufReader::new(input.as_bytes()), &mut out, run, std::path::PathBuf::from(".")).await;
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("elicitation/create"), "no elicitation without the capability");
         assert!(text.contains("name-required"), "the name-required text is returned as the result");
         assert!(text.contains("\"isError\":true") || text.contains("\"isError\": true"), "flagged as an error");
+    }
+
+    // --- Memory tool tests (plan/0073 #extend-mcp) ---
+    // These drive the MCP server over stdio JSON-RPC with a real per-user
+    // memory store fixture. HOME is set to a tmp dir so the store opens there.
+
+    fn memory_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let home = std::env::temp_dir().join(format!("mcp-mem-home-{n}"));
+        let project = std::env::temp_dir().join(format!("mcp-mem-proj-{n}"));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(home.join(".host-memory")).unwrap();
+        (home, project)
+    }
+
+    #[tokio::test]
+    async fn memory_write_then_list_then_read_round_trips() {
+        let (home, project) = memory_fixture();
+        std::env::set_var("HOME", home.as_os_str());
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_write","arguments":{"slug":"alpha","description":"first","body":"Alpha body."}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_list","arguments":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_read","arguments":{"slug":"alpha"}}}"#, "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        let run = |_: &[String]| ("unused\n".to_string(), 0);
+        serve(
+            BufReader::new(input.as_bytes()),
+            &mut out,
+            run,
+            project.clone(),
+        )
+        .await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("wrote alpha"), "write result: {text}");
+        assert!(text.contains("alpha.md"), "list result includes the entry: {text}");
+        assert!(text.contains("Alpha body"), "read result includes the body: {text}");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test]
+    async fn memory_consolidate_reports_findings() {
+        let (home, project) = memory_fixture();
+        std::env::set_var("HOME", home.as_os_str());
+        // Write a repo MEMORY.md with a room reference so consolidate finds it.
+        std::fs::write(
+            project.join("MEMORY.md"),
+            "# M\n\n### Entry\n\nCites call/0017.\n",
+        )
+        .unwrap();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_consolidate","arguments":{}}}"#, "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        let run = |_: &[String]| ("unused\n".to_string(), 0);
+        serve(
+            BufReader::new(input.as_bytes()),
+            &mut out,
+            run,
+            project.clone(),
+        )
+        .await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("room-touching"), "consolidate found the call/ ref: {text}");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test]
+    async fn memory_write_delete_round_trips() {
+        let (home, project) = memory_fixture();
+        std::env::set_var("HOME", home.as_os_str());
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_write","arguments":{"slug":"temp","description":"temp","body":"Temp."}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_write","arguments":{"slug":"temp","op":"delete"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_list","arguments":{}}}"#, "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        let run = |_: &[String]| ("unused\n".to_string(), 0);
+        serve(
+            BufReader::new(input.as_bytes()),
+            &mut out,
+            run,
+            project.clone(),
+        )
+        .await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("deleted temp"), "delete result: {text}");
+        assert!(text.contains("no memory entries"), "list after delete is empty: {text}");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test]
+    async fn init_and_adopt_still_pass_unchanged() {
+        // The plan/0065 onboarding tools are byte-identical; the new project_dir
+        // parameter does not affect their dispatch.
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"init","arguments":{"name":"acme"}}}"#, "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        let run = |argv: &[String]| {
+            if argv.iter().any(|a| a == "--name" && argv[argv.len() - 1] == "acme") {
+                ("host-path: ./agentic-acme\n".to_string(), 0)
+            } else {
+                ("error\n".to_string(), 1)
+            }
+        };
+        serve(BufReader::new(input.as_bytes()), &mut out, run, std::path::PathBuf::from(".")).await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("host-path: ./agentic-acme"), "init still works with the new signature");
     }
 }
