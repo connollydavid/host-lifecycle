@@ -21,6 +21,10 @@ mod mcp;
 // (#extend-mcp) wire these surfaces; the allow lifts then.
 #[allow(dead_code)]
 mod memory;
+// plan/0073 #implement-dream: the dream audit subcommand + detector engine.
+// `dream` is wired below; the MCP memory_consolidate tool (#extend-mcp)
+// reuses the engine.
+mod dream;
 
 /// The canonical template a project adopts from; recorded in the stamp.
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/host-template";
@@ -121,6 +125,7 @@ fn main() {
         Some("entrance") => entrance(&args[2..]),
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
+        Some("dream") => dream::dream(&args[2..]),
         _ => {
             eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
