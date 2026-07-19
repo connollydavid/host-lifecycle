@@ -1,0 +1,416 @@
+-- allium: 3
+-- host-lifecycle dream: the advisory memory-consolidation verdict over a project's
+-- two memory stores. A dream run scans the repo MEMORY.md (append-only) and the
+-- host-* per-user store (editable) for staleness, contradictions, drift, and
+-- append-only violations, emits a per-finding route (edit on per-user store,
+-- append on repo store), and settles to exactly one terminal verdict: clean (0),
+-- findings (1), or error (2). It is read-only; the MCP memory_write tool is the
+-- only mutator, and it refuses the repo store by construction.
+--
+-- Scope: the detector set, the routing rules, the verdict lifecycle, the
+-- memory_write safety invariant, and the MCP tool surface. Excludes: the
+-- stdio JSON-RPC transport (an implementation detail), exact CLI flag names
+-- and output strings, the fixture file paths, and the cast/adversarial-review
+-- rulings on detector naming (those feed back into the rule set before the
+-- build, per plan/0073 gather-data).
+--
+-- Non-overlap (2026-07-19, recorded in plan/0073/gather-data.md): dream's
+-- surface is memory-only. It never proposes a MADR supersession, an upgrade
+-- application, or any other methodology-state change. Those are operator
+-- actions on non-overlapping surfaces (MADR on call/, upgrade on the applied
+-- set). A finding that traces to a superseded call/ names the record as
+-- context, but the route stays edit/append on the memory.
+
+-- The two memory stores plan/0073 audits. The asymmetry is load-bearing: the
+-- repo store is append-only (CLAUDE.md section 6), the per-user store is
+-- editable. The dream audit treats them differently; the memory_write MCP
+-- tool refuses the repo store.
+enum StoreLoc {
+    repo
+    per_user
+}
+
+-- The route a finding takes. The route is the operator-facing surface; the
+-- detector class is secondary metadata. dream's surface is memory-only: edit
+-- on the per-user store, append on the repo store. There is intentionally no
+-- `madar` route and no third option; methodology-record actions are out of
+-- dream's scope.
+enum Route {
+    edit
+    append
+}
+
+-- The kind of mutation a memory_write performs. create adds a new entry;
+-- update edits an existing entry's body in place (per-user store only); delete
+-- removes an entry (per-user store only; consolidation prunes). The repo
+-- store accepts create only (the append-only rule).
+enum MemoryWriteOp {
+    create
+    update
+    delete
+}
+
+-- The originator of a memory_write. The audit itself never writes; every
+-- write comes from the MCP surface (the harness invoking a memory tool) or
+-- from the consolidation tool (which consumes Suggestions). `audit` is the
+-- forbidden origin: the AuditNeverWrites invariant keys on it.
+enum MemoryWriteOrigin {
+    mcp_tool
+    consolidation
+    audit
+}
+
+-- A memory store: one repo store (the project's MEMORY.md) plus zero or more
+-- per-user stores (the host-* per-user tier at ~/.host-memory/<project>/).
+entity MemoryStore {
+    loc: StoreLoc
+}
+
+-- One memory entry, in either store. The boolean fields carry the detector
+-- preconditions directly (the allium idiom, mirroring host-lint's
+-- `line.has_phase_synonym_numeral`): the dream analysis populates them from
+-- the entry's content and the rest of the store, and the rule set fires when
+-- they hold.
+entity MemoryEntry {
+    store: MemoryStore
+    description: String
+    body: String
+    has_description_body_drift: Boolean
+    is_superseded_unlinked: Boolean
+    is_stale_state: Boolean
+    is_workaround_not_plan: Boolean
+    is_append_only_violation: Boolean
+    is_room_touching: Boolean
+}
+
+-- A cross-entry [[slug]] reference. Links are same-store by format definition
+-- (a per-user entry may reference repo lore by name, but the [[slug]] form
+-- resolves only within the entry's own store; a cross-store reference is
+-- ordinary prose, not a LinkRef). Same-store resolution keeps the
+-- dangling-link detector sound; cross-store linking is out of scope.
+entity LinkRef {
+    src: MemoryEntry
+    target_slug: String
+    resolves: Boolean
+}
+
+-- A detected finding. Each finding carries its detector class and a route.
+-- `dream` ties the finding to the run that produced it (single-shot model;
+-- see Dream).
+entity Finding {
+    entry: MemoryEntry
+    kind: String
+    route: Route
+    dream: Dream
+}
+
+-- A pending suggested action (the verbatim edit / append text the audit
+-- prints). `applies` is false for any Suggestion whose target is the repo
+-- store under --fix; the FixNeverTouchesRepo invariant discharges it.
+-- `target_store` is denormalized from `finding.entry.store`; the
+-- SuggestionTargetsItsFinding invariant pins the relation so a future
+-- Suggestion creator cannot mis-copy the store and bypass the repo
+-- protection while the invariant stays green.
+entity Suggestion {
+    finding: Finding
+    target_store: MemoryStore
+    applies: Boolean
+}
+
+-- One dream run. Starts scanning; the findings it accumulates drive the
+-- terminal verdict. `saw_finding` records whether any detector fired;
+-- `fix_mode` records whether --fix was passed. Single-shot: the given
+-- `dream` is the only run in this universe; a future DreamStarts has no
+-- effect once the run has left `dreaming`.
+entity Dream {
+    status: dreaming | clean | findings | error
+    saw_finding: Boolean
+    fix_mode: Boolean
+    transitions status {
+        dreaming -> clean
+        dreaming -> findings
+        dreaming -> error
+        terminal: clean, findings, error
+    }
+}
+
+given {
+    dream: Dream
+}
+
+surface DreamRun {
+    facing project: Project
+    provides:
+        DreamStarts(project)
+        DreamCompletes(project)
+        DreamFails(project)
+}
+
+-- === Project: shared with the wider host-lifecycle spec ===
+
+entity Project {
+    name: String
+}
+
+-- === Detectors (single-rule if/else form) ===
+-- Each detector fires on a structural defect of an entry. Routing is encoded
+-- at creation time via an if/else on the store: per-user -> edit, repo ->
+-- append. One `requires` per detector means the store split cannot silently
+-- eat a case (the failure mode the paired-detector form introduces), and
+-- every invariant stays inductive (each creation rule checked once).
+
+rule DetectDescriptionBodyDrift {
+    when: entry: MemoryEntry.created
+    requires: entry.has_description_body_drift
+    ensures:
+        if entry.store.loc = per_user:
+            Finding.created(entry: entry, kind: "description-body-drift", route: edit, dream: dream)
+        else:
+            Finding.created(entry: entry, kind: "description-body-drift", route: append, dream: dream)
+}
+
+rule DetectSupersededButUnlinked {
+    when: entry: MemoryEntry.created
+    requires: entry.is_superseded_unlinked
+    ensures:
+        if entry.store.loc = per_user:
+            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: edit, dream: dream)
+        else:
+            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: append, dream: dream)
+}
+
+rule DetectStaleStateOverLore {
+    when: entry: MemoryEntry.created
+    requires: entry.is_stale_state
+    ensures:
+        if entry.store.loc = per_user:
+            Finding.created(entry: entry, kind: "stale-state-over-lore", route: edit, dream: dream)
+        else:
+            Finding.created(entry: entry, kind: "stale-state-over-lore", route: append, dream: dream)
+}
+
+rule DetectWorkaroundVsPlan {
+    when: entry: MemoryEntry.created
+    requires: entry.is_workaround_not_plan
+    ensures:
+        if entry.store.loc = per_user:
+            Finding.created(entry: entry, kind: "workaround-vs-plan", route: edit, dream: dream)
+        else:
+            Finding.created(entry: entry, kind: "workaround-vs-plan", route: append, dream: dream)
+}
+
+rule DetectDanglingLink {
+    when: ref: LinkRef.created
+    requires: not ref.resolves
+    ensures:
+        if ref.src.store.loc = per_user:
+            Finding.created(entry: ref.src, kind: "dangling-link", route: edit, dream: dream)
+        else:
+            Finding.created(entry: ref.src, kind: "dangling-link", route: append, dream: dream)
+}
+
+-- Append-only violation: an in-place edit to an existing repo store entry. The
+-- route is append: dream suggests a correcting append (the next entry that
+-- supersedes the violated one, with a forward [[link]]). dream does not
+-- propose a MADR record or any other methodology-state change.
+rule DetectAppendOnlyViolation {
+    when: entry: MemoryEntry.created
+    requires: entry.is_append_only_violation and entry.store.loc = repo
+    ensures: Finding.created(entry: entry, kind: "append-only-violation", route: append, dream: dream)
+}
+
+-- Room-touching finding: a memory entry that cites a call/ or plan/ record
+-- since superseded by the spine. dream names the superseded record as context
+-- in the finding text; the route is the memory edit (per-user) or append
+-- (repo), never a MADR action. The named record itself is upgrade/MADR
+-- territory, out of dream's scope.
+rule DetectRoomTouching {
+    when: entry: MemoryEntry.created
+    requires: entry.is_room_touching
+    ensures:
+        if entry.store.loc = per_user:
+            Finding.created(entry: entry, kind: "room-touching", route: edit, dream: dream)
+        else:
+            Finding.created(entry: entry, kind: "room-touching", route: append, dream: dream)
+}
+
+-- === Suggestion scoping ===
+
+-- A finding's suggestion is scoped to its finding's store. In fix_mode the
+-- suggestion applies only when the target is the per-user store; the repo
+-- store is never auto-fixed. `target_store` copies `finding.entry.store`;
+-- SuggestionTargetsItsFinding pins the relation.
+rule ScopeSuggestion {
+    when: finding: Finding.created
+    ensures: Suggestion.created(finding: finding, target_store: finding.entry.store,
+        applies: dream.fix_mode and finding.entry.store.loc = per_user)
+}
+
+-- === Verdict lifecycle: findings drive the exit-code decision ===
+
+-- StartDream inits the run: status -> dreaming, saw_finding -> false. The
+-- init is what makes VerdictMatchesFindings provable (M1): a stale
+-- `saw_finding` latch from a prior run cannot leak in. fix_mode is bound at
+-- DreamStarts (the CLI flag) and stays constant for the run (F5).
+rule StartDream {
+    when: DreamStarts(project)
+    ensures: dream.status = dreaming
+    ensures: dream.saw_finding = false
+}
+
+-- RecordFinding is guarded on dreaming: a late Finding under a settled
+-- verdict cannot flip the latch and produce a clean verdict that lied.
+rule RecordFinding {
+    when: finding: Finding.created
+    requires: dream.status = dreaming
+    ensures: dream.saw_finding = true
+}
+
+rule VerdictFindings {
+    when: DreamCompletes(project)
+    requires: dream.status = dreaming and dream.saw_finding
+    ensures: dream.status = findings
+}
+
+rule VerdictClean {
+    when: DreamCompletes(project)
+    requires: dream.status = dreaming and not dream.saw_finding
+    ensures: dream.status = clean
+}
+
+rule VerdictError {
+    when: DreamFails(project)
+    requires: dream.status = dreaming
+    ensures: dream.status = error
+}
+
+-- === The MCP memory tool surface (plan/0073, extending plan/0065) ===
+
+-- memory_write is the only mutator. It carries the operation kind, the
+-- target entry (for update/delete), the originator, an optional Suggestion
+-- it discharges (idempotency), and the accept/complete distinction.
+-- `accepted` is the policy decision (the store is writable); `completed` is
+-- the durable effect (the entry file and the index both landed). The
+-- per-user store is physically two writes; a crash between them is
+-- index/entry divergence, so the audit-safe signal is `completed`, not
+-- `accepted`.
+entity MemoryWrite {
+    target_store: MemoryStore
+    op: MemoryWriteOp
+    target_entry: MemoryEntry
+    origin: MemoryWriteOrigin
+    suggestion: Suggestion
+    accepted: Boolean
+    completed: Boolean
+}
+
+-- Repo store accepts create only (the append-only rule). Update and delete
+-- are refused; they are the operationally invalid case for an append-only
+-- store.
+rule MemoryWriteRefusesRepoUpdateDelete {
+    when: write: MemoryWrite.created
+    requires: write.target_store.loc = repo and write.op != create
+    ensures: write.accepted = false
+}
+
+rule MemoryWriteRefusesRepoCreateForAudit {
+    when: write: MemoryWrite.created
+    requires: write.target_store.loc = repo and write.origin = audit
+    ensures: write.accepted = false
+}
+
+-- The per-user store accepts every op from mcp_tool or consolidation. The
+-- audit origin is universally refused (AuditNeverWrites invariant below).
+rule MemoryWriteAcceptsPerUser {
+    when: write: MemoryWrite.created
+    requires: write.target_store.loc = per_user and write.origin != audit
+    ensures: write.accepted = true
+}
+
+-- Completion: a write that was accepted reaches the durable state. The
+-- implementation guarantees this for the per-user store; the model asserts
+-- the policy-to-effect relation so a future regression (accepted but never
+-- completed) is visible.
+rule MemoryWriteCompletes {
+    when: write: MemoryWrite.created
+    requires: write.accepted
+    ensures: write.completed = true
+}
+
+-- === Invariants ===
+
+-- AuditNeverWrites (M4): the dream audit never produces a MemoryWrite. This
+-- is the real content of the read-only property; it needs MemoryWrite.origin
+-- to be checkable. dream's detectors create Findings, not writes; the
+-- consolidation tool is a MemoryWrite caller with origin = consolidation,
+-- never audit.
+invariant AuditNeverWrites {
+    for w in MemoryWrites where w.origin = audit:
+        not w.accepted
+}
+
+-- The repo store is append-only at the methodology level (CLAUDE.md section
+-- 6). memory_write accepts create only on the repo store, refused for update
+-- and delete. The only sanctioned escape from append-only (the archive-first
+-- map-only rename) is a separate code path that does not go through
+-- memory_write.
+invariant RepoStoreAppendOnly {
+    for w in MemoryWrites where w.target_store.loc = repo and w.accepted:
+        w.op = create
+}
+
+-- Fix mode never proposes an edit on the repo store. A Suggestion whose
+-- target is the repo store is not applicable in fix_mode. The audit may still
+-- report the finding (route: append), but it never auto-applies it.
+invariant FixNeverTouchesRepo {
+    for s in Suggestions where s.target_store.loc = repo:
+        not s.applies
+}
+
+-- Suggestion target faithfulness (M3): the denormalized `target_store` field
+-- equals the store of the finding the suggestion fixes. Without this, a
+-- future Suggestion creator could mis-copy `target_store` and bypass
+-- FixNeverTouchesRepo while the invariant stays green.
+invariant SuggestionTargetsItsFinding {
+    for s in Suggestions:
+        s.target_store = s.finding.entry.store
+}
+
+-- A repo-store finding never routes to edit. Encoded at Finding creation time
+-- via the if/else in each detector's ensures block.
+invariant RepoFindingsNeverEdit {
+    for f in Findings where f.entry.store.loc = repo:
+        f.route != edit
+}
+
+-- VerdictMatchesFindings (M1): a clean verdict implies no finding was
+-- recorded. The RecordFinding dreaming-guard and the StartDream saw_finding
+-- init together make this provable. A clean verdict over a run that saw a
+-- finding is the "verdict that lied" failure mode this invariant closes.
+invariant VerdictMatchesFindings {
+    for d in Dreams where d.status = clean:
+        not d.saw_finding
+}
+
+-- Acceptance biconditional (M5): a write is accepted iff its target is the
+-- per-user store and its origin is not the audit. Encodes both directions so
+-- a regression in either rule, or a third StoreLoc later, is visible.
+invariant AcceptanceBiconditional {
+    for w in MemoryWrites:
+        w.accepted = (w.target_store.loc = per_user and w.origin != audit)
+}
+
+-- Completed implies accepted: a write that was never accepted cannot reach
+-- the durable state. The converse (accepted -> completed) is the
+-- implementation's eventual-delivery guarantee, not an invariant.
+invariant CompletedImpliesAccepted {
+    for w in MemoryWrites where w.completed:
+        w.accepted
+}
+
+-- Idempotency: at most one accepted write per Suggestion. An MCP transport
+-- retry or a harness re-invocation cannot double-apply a fix.
+invariant IdempotentSuggestionDischarge {
+    for s in Suggestions:
+        Single(MemoryWrites where w.suggestion = s and w.accepted)
+}
