@@ -64,9 +64,28 @@ impl Route {
     }
 }
 
+/// Compose the verbatim operator imperative (Wren's W1 finding). The route
+/// determines the leading verb and the anti-action tail — the load-bearing
+/// two-store asymmetry. The fen-acceptance probe (plan/0073) showed a 4B reads
+/// this natural-language imperative and ignores the `route=` token, so the
+/// suggestion must carry the routing decision in prose, not just metadata.
+/// `goal` is the detector-specific fix, phrased store-neutrally to slot after
+/// either frame's "to ...".
+fn suggestion_for(route: Route, slug: &str, goal: &str) -> String {
+    match route {
+        Route::Edit => format!(
+            "Edit the per-user entry `{slug}` in place to {goal}. Do not append to the repo log."
+        ),
+        Route::Append => format!(
+            "Append a new dated entry to the repo MEMORY.md to {goal}. Do not edit the existing entry in place."
+        ),
+    }
+}
+
 /// A detected finding. `entry_slug` identifies the entry; `store` carries the
 /// routing asymmetry; `kind` is the detector class (secondary metadata); the
-/// `explanation` is the operator-facing prose.
+/// `explanation` is the operator-facing prose; the `suggestion` is the verbatim
+/// route-carrying imperative (W1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
     pub entry_slug: String,
@@ -74,6 +93,7 @@ pub struct Finding {
     pub kind: String,
     pub route: Route,
     pub explanation: String,
+    pub suggestion: String,
 }
 
 /// The detector engine's input: one entry, plus its store context. The
@@ -158,13 +178,19 @@ pub fn detect_superseded_unlinked(input: &DetectorInput) -> Option<Finding> {
     if input.body.contains(&link) {
         return None;
     }
+    let route = DetectorInput::route_for(input.store);
     Some(Finding {
         entry_slug: input.slug.clone(),
         store: input.store,
         kind: "superseded-but-unlinked".to_string(),
-        route: DetectorInput::route_for(input.store),
+        route,
         explanation: format!(
             "superseded by `{target}` but no forward link `[[{target}]]` in the body"
+        ),
+        suggestion: suggestion_for(
+            route,
+            &input.slug,
+            &format!("record that it is superseded by `{target}` with a forward `[[{target}]]` link"),
         ),
     })
 }
@@ -175,12 +201,18 @@ pub fn detect_superseded_unlinked(input: &DetectorInput) -> Option<Finding> {
 pub fn detect_dangling_link(input: &DetectorInput) -> Option<Finding> {
     for link in extract_wiki_links(&input.body) {
         if !input.known_slugs.contains(&link) {
+            let route = DetectorInput::route_for(input.store);
             return Some(Finding {
                 entry_slug: input.slug.clone(),
                 store: input.store,
                 kind: "dangling-link".to_string(),
-                route: DetectorInput::route_for(input.store),
+                route,
                 explanation: format!("body links `[[{link}]]` but no entry `{link}` exists in the {} store", input.store.as_str()),
+                suggestion: suggestion_for(
+                    route,
+                    &input.slug,
+                    &format!("resolve the broken `[[{link}]]` reference (create the entry `{link}` or drop the link)"),
+                ),
             });
         }
     }
@@ -204,6 +236,11 @@ pub fn detect_room_touching(input: &DetectorInput) -> Option<Finding> {
             explanation: format!(
                 "body cites `{room_ref}`; confirm the record is not superseded by the spine"
             ),
+            // Bespoke: a room reference routes to MADR, not a memory edit/append.
+            // The imperative names the record and the room action explicitly.
+            suggestion: format!(
+                "Confirm the cited record `{room_ref}`; if the spine superseded it, mark `Status: superseded` on the record via an audited MADR commit. Do not edit the memory entry or append to the log."
+            ),
         });
     }
     None
@@ -225,13 +262,19 @@ pub fn detect_description_body_drift(input: &DetectorInput) -> Option<Finding> {
             if !tail.is_empty() {
                 let token = tail.split_whitespace().next().unwrap_or("");
                 if !token.is_empty() && token.len() >= 3 && b.contains(token) {
+                    let route = DetectorInput::route_for(input.store);
                     return Some(Finding {
                         entry_slug: input.slug.clone(),
                         store: input.store,
                         kind: "description-body-drift".to_string(),
-                        route: DetectorInput::route_for(input.store),
+                        route,
                         explanation: format!(
                             "description says `{neg}{token}` but the body asserts `{token}`"
+                        ),
+                        suggestion: suggestion_for(
+                            route,
+                            &input.slug,
+                            "bring the `description:` line back in line with what the body now asserts",
                         ),
                     });
                 }
@@ -271,12 +314,18 @@ pub fn detect_stale_state_over_lore(input: &DetectorInput) -> Option<Finding> {
     if !has_lore {
         return None;
     }
+    let route = DetectorInput::route_for(input.store);
     Some(Finding {
         entry_slug: input.slug.clone(),
         store: input.store,
         kind: "stale-state-over-lore".to_string(),
-        route: DetectorInput::route_for(input.store),
+        route,
         explanation: "State entry reads done but carries durable measured lore; mark the state superseded with a dated current-state block, do not delete the lore".to_string(),
+        suggestion: suggestion_for(
+            route,
+            &input.slug,
+            "mark the state superseded with a dated current-state block, keeping the measured lore",
+        ),
     })
 }
 
@@ -313,13 +362,19 @@ pub fn detect_workaround_vs_plan<'a>(
             let entry_links_other = entry.body.contains(&format!("[[{}]]", other.slug));
             let other_links_entry = other.body.contains(&format!("[[{}]]", entry.slug));
             if !entry_links_other && !other_links_entry {
+                let route = DetectorInput::route_for(entry.store);
                 return Some(Finding {
                     entry_slug: entry.slug.clone(),
                     store: entry.store,
                     kind: "workaround-vs-plan".to_string(),
-                    route: DetectorInput::route_for(entry.store),
+                    route,
                     explanation: format!(
                         "Workaround entry shares a key term with Fact entry `{}` but neither cross-links the other; one may be a fix-of-the-moment the plan supersedes", other.slug
+                    ),
+                    suggestion: suggestion_for(
+                        route,
+                        &entry.slug,
+                        &format!("cross-link this entry and `{}` with a `[[link]]`, or supersede whichever is stale", other.slug),
                     ),
                 });
             }
@@ -707,6 +762,11 @@ fn detect_append_only_violations(path: &Path) -> Vec<Finding> {
             explanation: format!(
                 "section `{section}` has body removals in git history; the repo MEMORY.md is append-only (CLAUDE.md section 6); if the body changed, append a correction with a forward [[link]] instead"
             ),
+            // Bespoke: an append-only violation is already an in-place edit; the
+            // imperative is to restore and append, never to edit further.
+            suggestion: format!(
+                "The repo MEMORY.md section `{section}` was edited in place — a CLAUDE.md §6 violation. Restore the removed text and append a new dated correction with a forward `[[link]]`. Never edit repo entries in place."
+            ),
         });
     }
     out
@@ -787,6 +847,7 @@ fn print_text(findings: &[Finding]) {
             f.route.as_str(),
             f.explanation
         );
+        println!("  → {}", f.suggestion);
     }
     eprintln!(
         "host-lifecycle dream: {} finding(s) across the memory stores",
@@ -798,12 +859,13 @@ fn print_json(findings: &[Finding]) {
     let mut s = String::from("[\n");
     for (i, f) in findings.iter().enumerate() {
         s.push_str(&format!(
-            "  {{\"entry\": \"{}\", \"store\": \"{}\", \"kind\": \"{}\", \"route\": \"{}\", \"explanation\": \"{}\"}}",
+            "  {{\"entry\": \"{}\", \"store\": \"{}\", \"kind\": \"{}\", \"route\": \"{}\", \"explanation\": \"{}\", \"suggestion\": \"{}\"}}",
             json_escape(&f.entry_slug),
             f.store.as_str(),
             f.kind,
             f.route.as_str(),
-            json_escape(&f.explanation)
+            json_escape(&f.explanation),
+            json_escape(&f.suggestion)
         ));
         if i + 1 < findings.len() {
             s.push(',');
@@ -975,6 +1037,65 @@ mod tests {
             assert_ne!(f.route, Route::Edit, "repo finding routed to edit: {:?}", f);
             assert_eq!(f.route, Route::Append);
         }
+    }
+
+    #[test]
+    fn per_user_finding_suggestion_carries_the_edit_imperative() {
+        // W1 (plan/0073 fen-acceptance): the suggestion, not the `route=` token,
+        // is what a 4B reads. A per-user finding's imperative must say EDIT in
+        // place and forbid the repo append, or the model appends anyway.
+        let slugs = known(&["alpha"]);
+        let mut inp = input("alpha", "x", "See [[beta]] which is missing.", &slugs);
+        inp.store = StoreLoc::PerUser;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("dangling-link finding");
+        assert!(f.suggestion.starts_with("Edit"), "not an edit imperative: {}", f.suggestion);
+        assert!(f.suggestion.contains("in place"), "missing in-place cue: {}", f.suggestion);
+        assert!(
+            f.suggestion.contains("Do not append"),
+            "missing anti-append tail: {}",
+            f.suggestion
+        );
+    }
+
+    #[test]
+    fn repo_finding_suggestion_carries_the_append_imperative() {
+        // The mirror of the above: a repo finding's imperative must say APPEND a
+        // new entry and forbid the in-place edit.
+        let slugs = known(&["alpha"]);
+        let mut inp = input("alpha", "x", "See [[beta]] which is missing.", &slugs);
+        inp.store = StoreLoc::Repo;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("dangling-link finding");
+        assert!(f.suggestion.starts_with("Append"), "not an append imperative: {}", f.suggestion);
+        assert!(
+            f.suggestion.contains("Do not edit"),
+            "missing anti-edit tail: {}",
+            f.suggestion
+        );
+    }
+
+    #[test]
+    fn room_touching_suggestion_routes_to_madr_not_a_memory_write() {
+        // Room-touching is neither an edit nor an append: the imperative names
+        // the record and the MADR action, and forbids both memory writes.
+        let slugs = known(&["alpha"]);
+        let inp = input("alpha", "x", "Cites call/0017 as live rule.", &slugs);
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "room-touching")
+            .expect("room-touching finding");
+        assert!(f.suggestion.contains("call/0017"), "record not named: {}", f.suggestion);
+        assert!(f.suggestion.contains("Status: superseded"), "no MADR action: {}", f.suggestion);
+        assert!(
+            f.suggestion.contains("Do not edit the memory entry"),
+            "missing anti-memory-write tail: {}",
+            f.suggestion
+        );
     }
 
     // --- Manifest tests: verdict lifecycle (exercises=dream) ---

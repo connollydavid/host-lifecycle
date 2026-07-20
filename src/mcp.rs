@@ -362,7 +362,7 @@ fn handle_memory_call(verb: &str, args: &Value, project_dir: &Path) -> Value {
                     .iter()
                     .map(|f| {
                         format!(
-                            "{} ({}) [{}] route={}: {}",
+                            "{} ({}) [{}] route={}: {}\n  → {}",
                             f.entry_slug,
                             match f.store {
                                 crate::dream::StoreLoc::Repo => "repo",
@@ -373,7 +373,8 @@ fn handle_memory_call(verb: &str, args: &Value, project_dir: &Path) -> Value {
                                 crate::dream::Route::Edit => "edit",
                                 crate::dream::Route::Append => "append",
                             },
-                            f.explanation
+                            f.explanation,
+                            f.suggestion
                         )
                     })
                     .collect();
