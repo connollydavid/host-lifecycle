@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "host-lifecycle"
-version = "0.41.1"
+version = "0.41.2"
 dependencies = [
  "host-grammar",
  "host-lint",

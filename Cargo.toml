@@ -1,6 +1,6 @@
 [package]
 name = "host-lifecycle"
-version = "0.41.1"
+version = "0.41.2"
 edition = "2021"
 description = "Token-free lifecycle tool for an agentic project — scaffolds milestones, decisions, and personas, and validates the tree."
 license = "Unlicense"
