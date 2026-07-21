@@ -448,10 +448,14 @@ pub fn extract_room_refs(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        let tail = &body[i..];
-        let (matched_len, kind) = if tail.strip_prefix("call/").is_some() {
+        // Index `bytes`, not `body`: on a non-match we advance by one byte, so
+        // `i` can land inside a multibyte char (e.g. an em-dash); slicing the
+        // `str` there would panic on the non-char-boundary. The prefixes and
+        // the digits are ASCII, so a byte-slice check is behaviourally identical.
+        let tail = &bytes[i..];
+        let (matched_len, kind) = if tail.starts_with(b"call/") {
             (5, "call/")
-        } else if tail.strip_prefix("plan/").is_some() {
+        } else if tail.starts_with(b"plan/") {
             (5, "plan/")
         } else {
             i += 1;
@@ -929,6 +933,17 @@ mod tests {
         let body = "as recorded in call/0017 and revisited in plan/0042; call/0017 again";
         let refs = extract_room_refs(body);
         assert_eq!(refs, vec!["call/0017", "plan/0042", "call/0017"]);
+    }
+
+    #[test]
+    fn extract_room_refs_survives_multibyte_chars() {
+        // Regression: a byte-at-a-time walk used to slice the `str` at `i`,
+        // panicking when `i` landed inside a multibyte char (an em-dash).
+        let body = "see plan/0074 — the receipt, per call/0018 — reopened";
+        let refs = extract_room_refs(body);
+        assert_eq!(refs, vec!["plan/0074", "call/0018"]);
+        // An em-dash with no following ref must not panic either.
+        assert_eq!(extract_room_refs("— just prose —"), Vec::<String>::new());
     }
 
     #[test]
