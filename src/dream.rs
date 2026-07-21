@@ -199,6 +199,14 @@ pub fn detect_superseded_unlinked(input: &DetectorInput) -> Option<Finding> {
 /// in the known set for the same store. Same-store by format definition; a
 /// cross-store reference is ordinary prose, not a link.
 pub fn detect_dangling_link(input: &DetectorInput) -> Option<Finding> {
+    // Structural, per-user-only. The repo tier keys entries by their dated
+    // `### ` heading slug, so a bare `[[concept]]` ref cannot match by
+    // construction, and `audit_repo_memory` states the per-user structural
+    // detectors do not apply there. Self-guard, as the sibling detectors guard
+    // on their own applicability (`superseded_by`, `type: state`).
+    if !matches!(input.store, StoreLoc::PerUser) {
+        return None;
+    }
     for link in extract_wiki_links(&input.body) {
         if !input.known_slugs.contains(&link) {
             let route = DetectorInput::route_for(input.store);
@@ -253,6 +261,13 @@ pub fn detect_room_touching(input: &DetectorInput) -> Option<Finding> {
 /// (only fires on the `not/no` pattern, which is the shape the motivating
 /// failure took).
 pub fn detect_description_body_drift(input: &DetectorInput) -> Option<Finding> {
+    // Per-user-only. This keys on the frontmatter `description:` line, which the
+    // repo format lacks; `audit_repo_memory` feeds the `### ` heading as a
+    // stand-in, so a "not X" heading over a body that discusses X false-positives.
+    // Self-guard, matching the sibling detectors.
+    if !matches!(input.store, StoreLoc::PerUser) {
+        return None;
+    }
     let d = input.description.to_lowercase();
     let b = input.body.to_lowercase();
     // description says "not X" but body asserts X
@@ -908,6 +923,10 @@ mod tests {
         }
     }
 
+    fn repo_input<'a>(slug: &str, desc: &str, body: &str, slugs: &'a BTreeSet<String>) -> DetectorInput<'a> {
+        DetectorInput { store: StoreLoc::Repo, ..input(slug, desc, body, slugs) }
+    }
+
     fn tmp_fixture(name: &str, memory_md: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1025,6 +1044,37 @@ mod tests {
     }
 
     #[test]
+    fn dangling_link_is_per_user_only_not_repo() {
+        // Repo entries key by dated `### ` heading slug, so a bare `[[concept]]`
+        // ref cannot match; the detector must not fire on the repo tier.
+        let slugs = known(&["alpha"]);
+        let inp = repo_input("alpha", "x", "See [[specs-colocate-with-software]] which is missing.", &slugs);
+        let fs = detect(&inp);
+        assert!(!fs.iter().any(|f| f.kind == "dangling-link"));
+        // Still fires on the per-user tier.
+        let per_user = input("alpha", "x", "See [[beta]] which is missing.", &slugs);
+        assert!(detect(&per_user).iter().any(|f| f.kind == "dangling-link"));
+    }
+
+    #[test]
+    fn description_body_drift_is_per_user_only_not_repo() {
+        // On the repo tier the `### ` heading is fed as the description stand-in,
+        // so a "not X" heading over a body discussing X must not false-positive.
+        let slugs = known(&["alpha"]);
+        let inp = repo_input(
+            "alpha",
+            "check artifact mismatch is a note not drift",
+            "The mismatch is a note, not drift; drift is a separate concern.",
+            &slugs,
+        );
+        let fs = detect(&inp);
+        assert!(!fs.iter().any(|f| f.kind == "description-body-drift"));
+        // Still fires on the per-user tier.
+        let per_user = input("alpha", "not stabilized yet", "The API is stabilized.", &slugs);
+        assert!(detect(&per_user).iter().any(|f| f.kind == "description-body-drift"));
+    }
+
+    #[test]
     fn dream_detects_room_touching() {
         let slugs = known(&["alpha"]);
         let inp = input("alpha", "x", "Cites call/0017 as live rule.", &slugs);
@@ -1077,21 +1127,14 @@ mod tests {
 
     #[test]
     fn repo_finding_suggestion_carries_the_append_imperative() {
-        // The mirror of the above: a repo finding's imperative must say APPEND a
-        // new entry and forbid the in-place edit.
-        let slugs = known(&["alpha"]);
-        let mut inp = input("alpha", "x", "See [[beta]] which is missing.", &slugs);
-        inp.store = StoreLoc::Repo;
-        let f = detect(&inp)
-            .into_iter()
-            .find(|f| f.kind == "dangling-link")
-            .expect("dangling-link finding");
-        assert!(f.suggestion.starts_with("Append"), "not an append imperative: {}", f.suggestion);
-        assert!(
-            f.suggestion.contains("Do not edit"),
-            "missing anti-edit tail: {}",
-            f.suggestion
-        );
+        // The mirror of the above: the repo route (Append) imperative must say
+        // APPEND a new entry and forbid the in-place edit. Tested on the routing
+        // frame directly, since the single-entry detectors that carry it are
+        // per-user-only (dangling-link, description-body-drift) and room-touching
+        // carries its own bespoke MADR imperative.
+        let s = suggestion_for(Route::Append, "alpha", "resolve the thing");
+        assert!(s.starts_with("Append"), "not an append imperative: {s}");
+        assert!(s.contains("Do not edit"), "missing anti-edit tail: {s}");
     }
 
     #[test]
