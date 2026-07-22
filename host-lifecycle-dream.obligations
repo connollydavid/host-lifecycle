@@ -14,22 +14,37 @@
 # #implement-remaining; the rest are forward refs that land at #write-tests.
 # Non-strict completeness check passes today (--tests src rc=0);
 # --strict-discharge catches up at #write-tests.
+#
+# Plan/0076 (call/0045): the store-model extension adds the confidence taxonomy,
+# the LinkResolution split, the TierMarker lifecycle, and the advisory verdict.
+# New behavioural entries are forward refs that land at plan/0076#write-tests.
 
 # --- Spec-integrity (covered by the check/analyse lane) ---
 enum-comparable.StoreLoc                       => structural
 enum-comparable.Route                          => structural
+enum-comparable.Confidence                     => structural
+enum-comparable.LinkResolution                 => structural
 entity-fields.MemoryStore                      => structural
 entity-fields.MemoryEntry                      => structural
 entity-fields.Finding                          => structural
+entity-optional.Finding.entry                  => structural
 entity-fields.Dream                            => structural
+entity-fields.TierMarker                       => structural
 entity-fields.Project                          => structural
 transition-edge.Dream.dreaming.clean           => test:dream_transition_dreaming_to_clean exercises=dream
+transition-edge.Dream.dreaming.advisory        => test:dream_transition_dreaming_to_advisory exercises=dream
 transition-edge.Dream.dreaming.findings        => test:dream_transition_dreaming_to_findings exercises=dream
 transition-edge.Dream.dreaming.error           => test:dream_transition_dreaming_to_error exercises=dream
 transition-rejected.Dream.status               => structural
 transition-terminal.Dream.status               => structural
+transition-edge.TierMarker.absent.stamped      => test:marker_transition_absent_to_stamped exercises=dream
+transition-edge.TierMarker.stamped.retired     => test:marker_transition_stamped_to_retired exercises=dream
+transition-rejected.TierMarker.status          => structural
+transition-terminal.TierMarker.status          => structural
 surface-actor.DreamRun                         => structural
 surface-provides.DreamRun                      => structural
+surface-actor.MarkerLifecycle                  => structural
+surface-provides.MarkerLifecycle               => structural
 
 # --- Detectors (behavioural) ---
 # The four implemented detectors (DescriptionBodyDrift, SupersededButUnlinked,
@@ -39,12 +54,21 @@ surface-provides.DreamRun                      => structural
 
 rule-success.DetectDescriptionBodyDrift        => test:dream_detects_description_body_drift exercises=detect
 rule-failure.DetectDescriptionBodyDrift.1      => test:dream_clean_on_drift_free_entry exercises=detect
+rule-entity-creation.DetectDescriptionBodyDrift.1 => test:drift_finding_created_per_user_only exercises=detect
 
 rule-success.DetectSupersededButUnlinked       => test:dream_detects_superseded_unlinked exercises=detect
 rule-failure.DetectSupersededButUnlinked.1     => test:dream_clean_on_linked_supersession exercises=detect
 
-rule-success.DetectDanglingLink                => test:dream_detects_dangling_link exercises=detect
-rule-failure.DetectDanglingLink.1              => test:dream_clean_on_resolved_links exercises=detect
+# The three dangling states (call/0045): confirmed only while the tier was
+# never initialized; advisory under a stamped marker.
+rule-success.DetectDanglingConfirmed           => test:dangling_confirmed_without_marker exercises=detect
+rule-failure.DetectDanglingConfirmed.1         => test:dangling_not_confirmed_when_marker_present exercises=detect
+rule-entity-creation.DetectDanglingConfirmed.1 => test:dangling_confirmed_finding_created exercises=detect
+rule-success.DetectDanglingUninitializedHere   => test:dangling_advisory_when_store_absent_here exercises=detect
+rule-failure.DetectDanglingUninitializedHere.1 => test:dangling_uninitialized_requires_marker exercises=detect
+rule-entity-creation.DetectDanglingUninitializedHere.1 => test:dangling_uninitialized_finding_created exercises=detect
+rule-success.DetectDanglingEntryMissing        => test:dangling_advisory_when_entry_missing exercises=detect
+rule-failure.DetectDanglingEntryMissing.1      => test:dream_clean_on_resolved_links exercises=detect
 
 rule-success.DetectRoomTouching                => test:dream_detects_room_touching exercises=detect
 rule-failure.DetectRoomTouching.1              => test:dream_clean_on_no_room_refs exercises=detect
@@ -59,12 +83,25 @@ rule-success.DetectAppendOnlyViolation         => test:dream_detects_append_only
 rule-failure.DetectAppendOnlyViolation.1       => test:dream_clean_on_clean_repo_store exercises=detect
 rule-entity-creation.DetectAppendOnlyViolation.1 => test:dream_append_only_violation_finding_created exercises=detect
 
+# --- Tier-marker lifecycle (call/0045) ---
+rule-success.StampMarker                       => test:marker_stamps_on_observed_store exercises=dream
+rule-failure.StampMarker.1                     => test:marker_stamp_only_from_absent exercises=dream
+rule-success.RetireMarker                      => test:marker_retires_from_stamped exercises=dream
+rule-failure.RetireMarker.1                    => test:marker_retire_only_from_stamped exercises=dream
+rule-success.MarkerContradiction               => test:marker_contradiction_after_retirement exercises=dream
+rule-failure.MarkerContradiction.1             => test:marker_no_contradiction_before_retirement exercises=dream
+rule-entity-creation.MarkerContradiction.1     => test:marker_contradiction_finding_created exercises=dream
+
 # --- Verdict lifecycle ---
 rule-success.StartDream                        => test:dream_start_inits_latch_and_status exercises=dream
 rule-success.RecordFinding                     => test:dream_record_finding_sets_latch exercises=dream
 rule-failure.RecordFinding.1                   => test:dream_record_finding_guarded_on_dreaming exercises=dream
+rule-success.RecordConfirmedFinding            => test:dream_confirmed_latch_sets exercises=dream
+rule-failure.RecordConfirmedFinding.1          => test:dream_confirmed_latch_guarded exercises=dream
 rule-success.VerdictFindings                   => test:dream_verdict_findings_on_any_finding exercises=dream
 rule-failure.VerdictFindings.1                 => test:dream_no_false_findings_verdict exercises=dream
+rule-success.VerdictAdvisory                   => test:dream_verdict_advisory_on_review_prompt_only exercises=dream
+rule-failure.VerdictAdvisory.1                 => test:dream_no_false_advisory_verdict exercises=dream
 rule-success.VerdictClean                      => test:dream_verdict_clean_on_no_finding exercises=dream
 rule-failure.VerdictClean.1                    => test:dream_no_false_clean_verdict exercises=dream
 rule-success.VerdictError                      => test:dream_verdict_error_on_fail_signal exercises=dream
@@ -75,3 +112,6 @@ rule-failure.VerdictError.1                    => test:dream_no_false_error_verd
 # route_for(StoreLoc::Repo) == Route::Append directly.
 invariant.RepoFindingsNeverEdit                => test:repo_store_finding_routes_to_append exercises=detect
 invariant.VerdictMatchesFindings               => test:clean_verdict_implies_no_finding exercises=dream
+invariant.AdvisoryNeverSawConfirmed            => test:advisory_verdict_never_saw_confirmed exercises=dream
+invariant.FindingsVerdictSawConfirmed          => test:findings_verdict_implies_confirmed exercises=dream
+invariant.DanglingConfirmedOnlyWithoutMarker   => test:dangling_confirmed_only_with_marker_absent exercises=detect

@@ -3,19 +3,28 @@
 -- two memory stores. A dream run scans the repo MEMORY.md (append-only) and the
 -- host-* per-user store (editable) for staleness, contradictions, drift, and
 -- append-only violations, emits a per-finding route (edit on per-user store,
--- append on repo store), and settles to exactly one terminal verdict: clean (0),
--- findings (1), or error (2). It is read-only; the MCP memory_write tool is the
--- only mutator, and it refuses the repo store by construction.
+-- append on repo store) and a per-finding confidence (confirmed or review-prompt),
+-- and settles to exactly one terminal verdict: clean (0), advisory (3, findings
+-- but none confirmed), findings (1, at least one confirmed), or error (2). It is
+-- read-only on the memory stores; the MCP memory_write tool is the only memory
+-- mutator, and it refuses the repo store by construction. The one sanctioned
+-- repo-side write is the tier marker stamp (call/0045), modelled here.
 --
 -- Scope (post-weed-and-tend, 2026-07-19): the dream audit surface ONLY. The
 -- MemoryWrite / Suggestion / LinkRef entities, the MCP-flavoured rules, and the
 -- invariants that referenced them belong with the MCP layer (#extend-mcp) and
 -- were restored there at that task. The dream-side surface here is: the detector
--- set, the routing rules, the verdict lifecycle, and the dream-relevant
--- invariants. Excludes: the stdio JSON-RPC transport (an implementation detail),
--- exact CLI flag names and output strings, and the cast/adversarial-review
--- rulings on detector naming (those feed back into the rule set before the
--- build, per plan/0073 gather-data).
+-- set, the routing rules, the tier-marker lifecycle, the verdict lifecycle, and
+-- the dream-relevant invariants. Excludes: the stdio JSON-RPC transport (an
+-- implementation detail), exact CLI flag names and output strings, and the
+-- cast/adversarial-review rulings on detector naming (those feed back into the
+-- rule set before the build, per plan/0073 gather-data).
+--
+-- Store model (call/0045, plan/0076): each detector declares the stores its
+-- format fits, and the engine enforces the declaration; a memory link resolves
+-- against the union of both stores; the per-user tier's in-use status is
+-- declared state (the tier marker below), so absence splits into three states
+-- instead of one.
 --
 -- Non-overlap (2026-07-19, recorded in plan/0073/gather-data.md): dream's
 -- surface is memory-only. It never proposes a MADR supersession, an upgrade
@@ -43,6 +52,32 @@ enum Route {
     append
 }
 
+-- The finding's confidence (call/0045): `confirmed` is mechanically evidenced
+-- on the stores and gates the run at exit 1; `review_prompt` is an unverified
+-- hypothesis whose lead remedy is a review note, and a run with only
+-- review-prompt findings settles advisory at exit 3. The kind taxonomy is one
+-- surface across every detector; a label the reader can miss is no label, so
+-- the confidence travels in each finding's printed explanation and suggestion,
+-- not only in metadata.
+enum Confidence {
+    confirmed
+    review_prompt
+}
+
+-- The union-resolution outcome for an entry's forward [[links]], populated by
+-- the dream analysis from the link targets, the tier marker, and the stores
+-- present on the running machine. `resolved` means every link lands in the
+-- union; the three unresolved states carry the call/0045 absence semantics.
+-- `unresolved_no_marker` can hold only for repo entries: with no marker, no
+-- per-user store was ever initialized anywhere, so no per-user entry exists to
+-- carry a link.
+enum LinkResolution {
+    resolved
+    unresolved_no_marker
+    unresolved_store_absent
+    unresolved_entry_missing
+}
+
 -- A memory store: one repo store (the project's MEMORY.md) plus zero or more
 -- per-user stores (the host-* per-user tier at ~/.host-memory/<project>/).
 entity MemoryStore {
@@ -53,7 +88,8 @@ entity MemoryStore {
 -- preconditions directly (the allium idiom, mirroring host-lint's
 -- `line.has_phase_synonym_numeral`): the dream analysis populates them from
 -- the entry's content and the rest of the store, and the rule set fires when
--- they hold.
+-- they hold. `link` replaces the old dangling boolean with the union-resolution
+-- outcome.
 entity MemoryEntry {
     store: MemoryStore
     description: String
@@ -64,35 +100,59 @@ entity MemoryEntry {
     is_workaround_not_plan: Boolean
     is_append_only_violation: Boolean
     is_room_touching: Boolean
-    has_dangling_link: Boolean
+    link: LinkResolution
 }
 
--- A detected finding. Each finding carries its detector class and a route.
+-- A detected finding. Each finding carries its detector class, a route, and a
+-- confidence. `entry` is optional for the one entry-less class: the marker
+-- contradiction concerns the tier marker itself, not any memory entry.
 entity Finding {
-    entry: MemoryEntry
+    entry: MemoryEntry?
     kind: String
     route: Route
+    confidence: Confidence
+}
+
+-- The per-user tier's in-use marker (call/0045): tool-written, audited,
+-- repo-side declared state. dream stamps it when it first observes an
+-- initialized store on the running machine; retirement is an operator act by
+-- appended correction. There is no retired -> stamped transition: a store
+-- observed after retirement is a contradiction FINDING, never a silent
+-- re-stamp, so retirement holds until the operator says otherwise. The stamp
+-- is dream's sole sanctioned repo-side write, an explicit carve-out from the
+-- read-only discipline above.
+entity TierMarker {
+    status: absent | stamped | retired
+    transitions status {
+        absent -> stamped
+        stamped -> retired
+        terminal: retired
+    }
 }
 
 -- One dream run. Starts scanning; the findings it accumulates drive the
 -- terminal verdict. `saw_finding` records whether any detector fired;
+-- `saw_confirmed` records whether any finding carried confirmed confidence;
 -- `fix_mode` records whether --fix was passed. Single-shot: the given
 -- `dream` is the only run in this universe; a future DreamStarts has no
 -- effect once the run has left `dreaming`.
 entity Dream {
-    status: dreaming | clean | findings | error
+    status: dreaming | clean | advisory | findings | error
     saw_finding: Boolean
+    saw_confirmed: Boolean
     fix_mode: Boolean
     transitions status {
         dreaming -> clean
+        dreaming -> advisory
         dreaming -> findings
         dreaming -> error
-        terminal: clean, findings, error
+        terminal: clean, advisory, findings, error
     }
 }
 
 given {
     dream: Dream
+    marker: TierMarker
 }
 
 surface DreamRun {
@@ -103,6 +163,19 @@ surface DreamRun {
         DreamFails(project)
 }
 
+-- The marker lifecycle's boundary. StoreObserved is raised by the run itself
+-- when an initialized per-user store exists on the running machine;
+-- MarkerRetires is the operator's act, carried as an appended correction in
+-- the repo log. Neither is ever an agent's remedy: no finding's suggestion
+-- instructs stamping or retiring, and flips in either direction never ride
+-- one machine's evidence alone (call/0045 guardrails).
+surface MarkerLifecycle {
+    facing project: Project
+    provides:
+        StoreObserved(project)
+        MarkerRetires(project)
+}
+
 -- === Project: shared with the wider host-lifecycle spec ===
 
 entity Project {
@@ -110,20 +183,21 @@ entity Project {
 }
 
 -- === Detectors (single-rule if/else form) ===
--- Each detector fires on a structural defect of an entry. Routing is encoded
--- at creation time via an if/else on the store: per-user -> edit, repo ->
--- append. One `requires` per detector means the store split cannot silently
--- eat a case (the failure mode the paired-detector form introduces), and
--- every invariant stays inductive (each creation rule checked once).
+-- Each detector fires on a structural defect of an entry, and each declares
+-- the stores its format fits: the requires guard IS the applicability
+-- declaration, beside a comment citing the format fact that justifies it
+-- (call/0045). Routing is encoded at creation time via an if/else on the
+-- store: per-user -> edit, repo -> append. One `requires` per detector means
+-- the store split cannot silently eat a case, and every invariant stays
+-- inductive (each creation rule checked once).
 
+-- Applicability: per-user only. The repo store's format has no per-entry
+-- description field (a dated heading is not a description), so drift between
+-- description and body is structurally undefined there.
 rule DetectDescriptionBodyDrift {
     when: entry: MemoryEntry.created
-    requires: entry.has_description_body_drift
-    ensures:
-        if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "description-body-drift", route: edit)
-        else:
-            Finding.created(entry: entry, kind: "description-body-drift", route: append)
+    requires: entry.has_description_body_drift and entry.store.loc = per_user
+    ensures: Finding.created(entry: entry, kind: "description-body-drift", route: edit, confidence: confirmed)
 }
 
 rule DetectSupersededButUnlinked {
@@ -131,9 +205,9 @@ rule DetectSupersededButUnlinked {
     requires: entry.is_superseded_unlinked
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: edit)
+            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: edit, confidence: confirmed)
         else:
-            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: append)
+            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: append, confidence: confirmed)
 }
 
 rule DetectStaleStateOverLore {
@@ -141,9 +215,9 @@ rule DetectStaleStateOverLore {
     requires: entry.is_stale_state
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "stale-state-over-lore", route: edit)
+            Finding.created(entry: entry, kind: "stale-state-over-lore", route: edit, confidence: confirmed)
         else:
-            Finding.created(entry: entry, kind: "stale-state-over-lore", route: append)
+            Finding.created(entry: entry, kind: "stale-state-over-lore", route: append, confidence: confirmed)
 }
 
 rule DetectWorkaroundVsPlan {
@@ -151,19 +225,48 @@ rule DetectWorkaroundVsPlan {
     requires: entry.is_workaround_not_plan
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "workaround-vs-plan", route: edit)
+            Finding.created(entry: entry, kind: "workaround-vs-plan", route: edit, confidence: confirmed)
         else:
-            Finding.created(entry: entry, kind: "workaround-vs-plan", route: append)
+            Finding.created(entry: entry, kind: "workaround-vs-plan", route: append, confidence: confirmed)
 }
 
-rule DetectDanglingLink {
+-- === Dangling links: three absence states (call/0045) ===
+-- A link resolves against the union of both stores. What an unresolved link
+-- means depends on the tier marker, so one detector becomes three rules, each
+-- with its own confidence and remedy shape.
+
+-- No marker: the tier was never initialized anywhere, so an unresolved link
+-- is genuinely dangling. Confirmed, with teeth; the remedy leads with the
+-- operator's initialization fork before fix-or-drop, and any fix rides an
+-- appended correction. Repo-only by construction (see LinkResolution).
+rule DetectDanglingConfirmed {
     when: entry: MemoryEntry.created
-    requires: entry.has_dangling_link
+    requires: entry.link = unresolved_no_marker and entry.store.loc = repo
+    ensures: Finding.created(entry: entry, kind: "dangling-link", route: append, confidence: confirmed)
+}
+
+-- Marker present, store absent on this machine: unresolvable here, possibly
+-- real elsewhere. Advisory; the remedy is initialize or seed here, or leave
+-- standing and report; a link is never dropped on one machine's absence.
+-- Repo-only: with the store absent on this machine, no local per-user entry
+-- exists to carry a link.
+rule DetectDanglingUninitializedHere {
+    when: entry: MemoryEntry.created
+    requires: entry.link = unresolved_store_absent and entry.store.loc = repo
+    ensures: Finding.created(entry: entry, kind: "dangling-link", route: append, confidence: review_prompt)
+}
+
+-- Marker present, store present, target entry missing: dangling within a live
+-- graph. Advisory; create the target or correct the link, by edit on the
+-- per-user store and by appended correction on the repo store.
+rule DetectDanglingEntryMissing {
+    when: entry: MemoryEntry.created
+    requires: entry.link = unresolved_entry_missing
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "dangling-link", route: edit)
+            Finding.created(entry: entry, kind: "dangling-link", route: edit, confidence: review_prompt)
         else:
-            Finding.created(entry: entry, kind: "dangling-link", route: append)
+            Finding.created(entry: entry, kind: "dangling-link", route: append, confidence: review_prompt)
 }
 
 -- Append-only violation: an in-place edit to an existing repo store entry. The
@@ -173,34 +276,63 @@ rule DetectDanglingLink {
 rule DetectAppendOnlyViolation {
     when: entry: MemoryEntry.created
     requires: entry.is_append_only_violation and entry.store.loc = repo
-    ensures: Finding.created(entry: entry, kind: "append-only-violation", route: append)
+    ensures: Finding.created(entry: entry, kind: "append-only-violation", route: append, confidence: confirmed)
 }
 
 -- Room-touching finding: a memory entry that cites a call/ or plan/ record
--- since superseded by the spine. dream names the superseded record as context
--- in the finding text; the route is the memory edit (per-user) or append
--- (repo), never a MADR action. The named record itself is upgrade/MADR
--- territory, out of dream's scope.
+-- the detector suspects the spine has superseded. Until the applied-receipts
+-- cross-check lands (the deferred mechanical half, call/0045), the suspicion
+-- is unverified, so the confidence is review_prompt and the lead remedy is a
+-- review note, never a supersession mark. The named record itself is
+-- upgrade/MADR territory, out of dream's scope.
 rule DetectRoomTouching {
     when: entry: MemoryEntry.created
     requires: entry.is_room_touching
     ensures:
         if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "room-touching", route: edit)
+            Finding.created(entry: entry, kind: "room-touching", route: edit, confidence: review_prompt)
         else:
-            Finding.created(entry: entry, kind: "room-touching", route: append)
+            Finding.created(entry: entry, kind: "room-touching", route: append, confidence: review_prompt)
+}
+
+-- === Tier-marker lifecycle (call/0045) ===
+
+-- The stamp: only from absent, only on an observed store on the running
+-- machine. Operator-attributable: the stamp lands as an audited commit.
+rule StampMarker {
+    when: StoreObserved(project)
+    requires: marker.status = absent
+    ensures: marker.status = stamped
+}
+
+-- Retirement: an operator act by appended correction. Only from stamped.
+rule RetireMarker {
+    when: MarkerRetires(project)
+    requires: marker.status = stamped
+    ensures: marker.status = retired
+}
+
+-- The contradiction: a store observed after retirement surfaces as a
+-- confirmed finding routed append (the operator's re-opt-in, if intended, is
+-- an appended correction reversing the retirement). Never a silent re-stamp:
+-- there is no retired -> stamped transition to witness.
+rule MarkerContradiction {
+    when: StoreObserved(project)
+    requires: marker.status = retired
+    ensures: Finding.created(entry: null, kind: "marker-contradiction", route: append, confidence: confirmed)
 }
 
 -- === Verdict lifecycle: findings drive the exit-code decision ===
 
--- StartDream inits the run: status -> dreaming, saw_finding -> false. The
--- init is what makes VerdictMatchesFindings provable: a stale `saw_finding`
--- latch from a prior run cannot leak in. fix_mode is bound at DreamStarts
--- (the CLI flag) and stays constant for the run.
+-- StartDream inits the run: status -> dreaming, both latches -> false. The
+-- init is what makes the verdict invariants provable: a stale latch from a
+-- prior run cannot leak in. fix_mode is bound at DreamStarts (the CLI flag)
+-- and stays constant for the run.
 rule StartDream {
     when: DreamStarts(project)
     ensures: dream.status = dreaming
     ensures: dream.saw_finding = false
+    ensures: dream.saw_confirmed = false
 }
 
 -- RecordFinding is guarded on dreaming: a late Finding under a settled
@@ -211,10 +343,24 @@ rule RecordFinding {
     ensures: dream.saw_finding = true
 }
 
+-- The confirmed latch, same guard: only a confirmed finding can push the run
+-- past advisory.
+rule RecordConfirmedFinding {
+    when: finding: Finding.created
+    requires: dream.status = dreaming and finding.confidence = confirmed
+    ensures: dream.saw_confirmed = true
+}
+
 rule VerdictFindings {
     when: DreamCompletes(project)
-    requires: dream.status = dreaming and dream.saw_finding
+    requires: dream.status = dreaming and dream.saw_confirmed
     ensures: dream.status = findings
+}
+
+rule VerdictAdvisory {
+    when: DreamCompletes(project)
+    requires: dream.status = dreaming and dream.saw_finding and not dream.saw_confirmed
+    ensures: dream.status = advisory
 }
 
 rule VerdictClean {
@@ -235,7 +381,7 @@ rule VerdictError {
 -- via the if/else in each detector's ensures block. The Kani harness at
 -- #write-tests proves `route_for(StoreLoc::Repo) == Route::Append` directly.
 invariant RepoFindingsNeverEdit {
-    for f in Findings where f.entry.store.loc = repo:
+    for f in Findings where f.entry != null and f.entry.store.loc = repo:
         f.route != edit
 }
 
@@ -246,4 +392,27 @@ invariant RepoFindingsNeverEdit {
 invariant VerdictMatchesFindings {
     for d in Dreams where d.status = clean:
         not d.saw_finding
+}
+
+-- An advisory verdict never hides a confirmed finding: advisory is reachable
+-- only through VerdictAdvisory's not-saw_confirmed guard, and the confirmed
+-- latch shares RecordFinding's dreaming-guard.
+invariant AdvisoryNeverSawConfirmed {
+    for d in Dreams where d.status = advisory:
+        not d.saw_confirmed
+}
+
+-- A findings verdict always rests on a confirmed finding; review-prompt
+-- findings alone can never gate the run at exit 1.
+invariant FindingsVerdictSawConfirmed {
+    for d in Dreams where d.status = findings:
+        d.saw_confirmed
+}
+
+-- The confirmed dangling state exists only while the tier was never
+-- initialized: with the marker stamped or retired, an unresolved link is
+-- advisory (uninitialized-here or entry-missing), never confirmed-dangling.
+invariant DanglingConfirmedOnlyWithoutMarker {
+    for f in Findings where f.kind = "dangling-link" and f.confidence = confirmed:
+        marker.status = absent
 }
