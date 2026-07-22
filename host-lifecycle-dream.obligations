@@ -60,8 +60,8 @@ rule-success.DetectSupersededButUnlinked       => test:dream_detects_superseded_
 rule-failure.DetectSupersededButUnlinked.1     => test:dream_clean_on_linked_supersession exercises=detect
 rule-entity-creation.DetectSupersededButUnlinked.1 => test:superseded_unlinked_finding_created exercises=detect
 
-# The three dangling states (call/0045): confirmed only while the tier was
-# never initialized; advisory under a stamped marker.
+# The three dangling states (call/0045): confirmed only while the tier is not
+# in use (marker absent or retired); advisory under a stamped marker.
 rule-success.DetectDanglingConfirmed           => test:dangling_confirmed_without_marker exercises=detect
 rule-failure.DetectDanglingConfirmed.1         => test:dangling_not_confirmed_when_marker_present exercises=detect
 rule-success.DetectDanglingUninitializedHere   => test:dangling_advisory_when_store_absent_here exercises=detect
