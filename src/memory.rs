@@ -172,6 +172,13 @@ impl MemoryStore {
         &self.dir
     }
 
+    /// Whether the store is initialized on this machine: the index file
+    /// exists. A bare directory is not an initialized store, so a stray
+    /// `mkdir` cannot mint the tier marker (the call/0045 anti-gaming bar).
+    pub fn initialized(&self) -> bool {
+        self.index_path().exists()
+    }
+
     /// List every entry, read from the index. Entries whose file is missing
     /// (the index/entry divergence failure mode) are skipped with a recorded
     /// dangling pointer; the dream audit catches them separately via

@@ -68,12 +68,13 @@ enum Confidence {
 -- the dream analysis from the link targets, the tier marker, and the stores
 -- present on the running machine. `resolved` means every link lands in the
 -- union; the three unresolved states carry the call/0045 absence semantics.
--- `unresolved_no_marker` can hold only for repo entries: with no marker, no
--- per-user store was ever initialized anywhere, so no per-user entry exists to
--- carry a link.
+-- `unresolved_tier_unused` covers both not-in-use marker states: absent (the
+-- tier was never initialized anywhere) and retired (the operator declared it
+-- out of use; retirement re-escalates surviving links to confirmed, the
+-- recorded pressure valve).
 enum LinkResolution {
     resolved
-    unresolved_no_marker
+    unresolved_tier_unused
     unresolved_store_absent
     unresolved_entry_missing
 }
@@ -200,34 +201,27 @@ rule DetectDescriptionBodyDrift {
     ensures: Finding.created(entry: entry, kind: "description-body-drift", route: edit, confidence: confirmed)
 }
 
+-- Applicability: per-user only. The repo format has no supersession field
+-- (supersession there rides a forward [[link]] in an appended correction), so
+-- the precondition is structurally unpopulatable on the repo tier.
 rule DetectSupersededButUnlinked {
     when: entry: MemoryEntry.created
-    requires: entry.is_superseded_unlinked
-    ensures:
-        if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: edit, confidence: confirmed)
-        else:
-            Finding.created(entry: entry, kind: "superseded-but-unlinked", route: append, confidence: confirmed)
+    requires: entry.is_superseded_unlinked and entry.store.loc = per_user
+    ensures: Finding.created(entry: entry, kind: "superseded-but-unlinked", route: edit, confidence: confirmed)
 }
 
+-- Applicability: per-user only (as is workaround-vs-plan below). Entry types
+-- exist only in the per-user frontmatter; the repo format types nothing.
 rule DetectStaleStateOverLore {
     when: entry: MemoryEntry.created
-    requires: entry.is_stale_state
-    ensures:
-        if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "stale-state-over-lore", route: edit, confidence: confirmed)
-        else:
-            Finding.created(entry: entry, kind: "stale-state-over-lore", route: append, confidence: confirmed)
+    requires: entry.is_stale_state and entry.store.loc = per_user
+    ensures: Finding.created(entry: entry, kind: "stale-state-over-lore", route: edit, confidence: confirmed)
 }
 
 rule DetectWorkaroundVsPlan {
     when: entry: MemoryEntry.created
-    requires: entry.is_workaround_not_plan
-    ensures:
-        if entry.store.loc = per_user:
-            Finding.created(entry: entry, kind: "workaround-vs-plan", route: edit, confidence: confirmed)
-        else:
-            Finding.created(entry: entry, kind: "workaround-vs-plan", route: append, confidence: confirmed)
+    requires: entry.is_workaround_not_plan and entry.store.loc = per_user
+    ensures: Finding.created(entry: entry, kind: "workaround-vs-plan", route: edit, confidence: confirmed)
 }
 
 -- === Dangling links: three absence states (call/0045) ===
@@ -235,14 +229,21 @@ rule DetectWorkaroundVsPlan {
 -- means depends on the tier marker, so one detector becomes three rules, each
 -- with its own confidence and remedy shape.
 
--- No marker: the tier was never initialized anywhere, so an unresolved link
--- is genuinely dangling. Confirmed, with teeth; the remedy leads with the
--- operator's initialization fork before fix-or-drop, and any fix rides an
--- appended correction. Repo-only by construction (see LinkResolution).
+-- Tier not in use (marker absent or retired): an unresolved link is genuinely
+-- dangling. Confirmed, with teeth; under an absent marker the remedy leads
+-- with the operator's initialization fork before fix-or-drop, under a retired
+-- marker with the store-correct fix-or-drop plus the re-opt-in protocol; any
+-- repo fix rides an appended correction. Under an absent marker the state is
+-- repo-only by construction; under a retired marker a per-user entry can
+-- still exist (the contradiction scenario), so routing follows the store.
 rule DetectDanglingConfirmed {
     when: entry: MemoryEntry.created
-    requires: entry.link = unresolved_no_marker and entry.store.loc = repo
-    ensures: Finding.created(entry: entry, kind: "dangling-link", route: append, confidence: confirmed)
+    requires: entry.link = unresolved_tier_unused
+    ensures:
+        if entry.store.loc = per_user:
+            Finding.created(entry: entry, kind: "dangling-link", route: edit, confidence: confirmed)
+        else:
+            Finding.created(entry: entry, kind: "dangling-link", route: append, confidence: confirmed)
 }
 
 -- Marker present, store absent on this machine: unresolvable here, possibly
@@ -409,10 +410,12 @@ invariant FindingsVerdictSawConfirmed {
         d.saw_confirmed
 }
 
--- The confirmed dangling state exists only while the tier was never
--- initialized: with the marker stamped or retired, an unresolved link is
--- advisory (uninitialized-here or entry-missing), never confirmed-dangling.
-invariant DanglingConfirmedOnlyWithoutMarker {
+-- The confirmed dangling state exists only while the tier is not in use:
+-- marker absent (never initialized) or retired (the operator opted out, and
+-- retirement re-escalates surviving links to confirmed, the recorded pressure
+-- valve). Under a stamped marker an unresolved link is advisory
+-- (uninitialized-here or entry-missing), never confirmed-dangling.
+invariant DanglingConfirmedOnlyWhenTierUnused {
     for f in Findings where f.kind = "dangling-link" and f.confidence = confirmed:
-        marker.status = absent
+        marker.status != stamped
 }

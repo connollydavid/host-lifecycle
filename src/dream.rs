@@ -101,7 +101,7 @@ pub enum TierState {
 /// `detect` engine enforces these rows and the coverage lines are generated
 /// from the same rows, so the output and the engine cannot disagree.
 pub const APPLICABILITY: &[(&str, &[StoreLoc], &str)] = &[
-    ("superseded-but-unlinked", &[StoreLoc::Repo, StoreLoc::PerUser], "both formats can carry a supersession field"),
+    ("superseded-but-unlinked", &[StoreLoc::PerUser], "the repo format has no supersession field; supersession there rides a forward link in an appended correction"),
     ("dangling-link", &[StoreLoc::Repo, StoreLoc::PerUser], "the [[slug]] notation spans both tiers; resolution is against the union"),
     ("room-touching", &[StoreLoc::Repo, StoreLoc::PerUser], "room references appear in either tier's prose"),
     ("description-body-drift", &[StoreLoc::PerUser], "the repo format has no per-entry description field"),
@@ -150,6 +150,11 @@ pub struct Finding {
     pub kind: String,
     pub route: Route,
     pub confidence: Confidence,
+    /// The dangling-link absence state ("tier-unused", "uninitialized-here",
+    /// "entry-missing"), empty for every other kind. Machine-readable so a new
+    /// dangle cannot hide inside a standing baseline (call/0045 condition on
+    /// per-state counts).
+    pub state: String,
     pub explanation: String,
     pub suggestion: String,
 }
@@ -262,6 +267,7 @@ pub fn detect_superseded_unlinked(input: &DetectorInput) -> Option<Finding> {
         store: input.store,
         kind: "superseded-but-unlinked".to_string(),
         confidence: Confidence::Confirmed,
+        state: String::new(),
         route,
         explanation: format!(
             "superseded by `{target}` but no forward link `[[{target}]]` in the body"
@@ -287,24 +293,26 @@ pub fn detect_dangling_link(input: &DetectorInput) -> Option<Finding> {
             continue;
         }
         let route = DetectorInput::route_for(input.store);
-        let (confidence, explanation, suggestion) = match (input.tier, input.store_present) {
+        let (confidence, state, explanation, suggestion) = match (input.tier, input.store_present) {
             // Tier declared in use, store absent on this machine: unresolvable
             // here, possibly real elsewhere. Advisory; the lead action is the
-            // safe no-op.
+            // safe no-op, and initialization stays the operator's act.
             (TierState::Stamped, false) => (
                 Confidence::ReviewPrompt,
+                "uninitialized-here",
                 format!(
                     "review prompt: body links `[[{link}]]`, which resolves in neither store present on this machine (tier marker: stamped {}; per-user store absent here)",
                     input.tier_provenance
                 ),
                 format!(
-                    "Leave the `[[{link}]]` link standing and report it. If this machine should carry the per-user store, initialize or seed it; the link may resolve on the machine that carries the store. Do not drop the link on this machine's evidence alone; do not edit the entry in place."
+                    "Leave the `[[{link}]]` link standing and report it. If this machine should carry the per-user store, the operator initializes or seeds it; the link may resolve on the machine that carries the store. Do not drop the link on this machine's evidence alone; do not edit the entry in place."
                 ),
             ),
             // Tier in use (declared, or a store observed ahead of its stamp),
             // store present, target missing: dangling within a live graph.
             (TierState::Stamped, true) | (TierState::Absent, true) => (
                 Confidence::ReviewPrompt,
+                "entry-missing",
                 format!(
                     "review prompt: body links `[[{link}]]`, which resolves in neither the repo log nor the per-user store on this machine"
                 ),
@@ -314,20 +322,40 @@ pub fn detect_dangling_link(input: &DetectorInput) -> Option<Finding> {
                     &format!("resolve the broken `[[{link}]]` reference (create the entry `{link}` or correct the link)"),
                 ),
             ),
-            // Tier never initialized, or declared out of use by retirement:
-            // genuinely dangling, confirmed, with the operator's initialization
-            // fork leading the remedy (call/0045 guardrails).
-            (TierState::Absent, false) | (TierState::Retired, _) => (
+            // Tier declared out of use by retirement: confirmed, through the
+            // store-correct frame (a per-user entry can still exist here, the
+            // contradiction scenario, and must route edit, never a repo
+            // append). The initialization fork does not apply from retired;
+            // re-opting in rides the contradiction protocol.
+            (TierState::Retired, _) => (
                 Confidence::Confirmed,
+                "tier-unused",
                 format!(
-                    "body links `[[{link}]]`, which resolves in neither the repo log nor the per-user tier ({})",
-                    match input.tier {
-                        TierState::Retired => format!("tier marker: retired {}", input.tier_provenance),
-                        _ => "tier marker: absent; the tier was never initialized".to_string(),
-                    }
+                    "body links `[[{link}]]`, which resolves in neither the repo log nor the per-user tier (tier marker: retired {})",
+                    input.tier_provenance
+                ),
+                {
+                    let mut s = suggestion_for(
+                        route,
+                        &input.slug,
+                        &format!("resolve the broken `[[{link}]]` reference (fix the slug, or drop the link with the operator's confirmation)"),
+                    );
+                    s.push_str(" To re-opt into the per-user tier instead, the operator appends a correction that records the decision, removes the retired marker, and lets the next dream run re-stamp; initialization and stamping are never the auditing agent's act.");
+                    s
+                },
+            ),
+            // Tier never initialized anywhere: genuinely dangling, confirmed,
+            // with the operator's initialization fork leading the remedy
+            // (call/0045 guardrails). Repo-only in practice: with no store on
+            // any machine, no per-user entry exists to carry a link.
+            (TierState::Absent, false) => (
+                Confidence::Confirmed,
+                "tier-unused",
+                format!(
+                    "body links `[[{link}]]`, which resolves in neither the repo log nor the per-user tier (tier marker: absent; the tier was never initialized)"
                 ),
                 format!(
-                    "If a per-user store is intended, the operator initializes it and commits the tier marker; these findings then re-tier advisory. Otherwise fix the slug or drop the forward `[[{link}]]` link via a new appended correction to the repo MEMORY.md. Never edit the existing entry in place."
+                    "If a per-user store is intended, the operator initializes it and commits the tier marker; these findings then re-tier advisory. Otherwise fix the slug or drop the forward `[[{link}]]` link, with the operator's confirmation, via a new appended correction to the repo MEMORY.md. Never edit the existing entry in place; initialization and stamping are never the auditing agent's act."
                 ),
             ),
         };
@@ -337,6 +365,7 @@ pub fn detect_dangling_link(input: &DetectorInput) -> Option<Finding> {
             kind: "dangling-link".to_string(),
             route,
             confidence,
+            state: state.to_string(),
             explanation,
             suggestion,
         });
@@ -363,6 +392,7 @@ pub fn detect_room_touching(input: &DetectorInput) -> Option<Finding> {
             // the softened lead remedy travel in the prose, because the prose is
             // what a weak agent obeys (W1).
             confidence: Confidence::ReviewPrompt,
+            state: String::new(),
             explanation: format!(
                 "review prompt: body cites `{room_ref}`; whether the spine superseded it is unverified until the applied-receipts cross-check lands"
             ),
@@ -399,6 +429,7 @@ pub fn detect_description_body_drift(input: &DetectorInput) -> Option<Finding> {
                         store: input.store,
                         kind: "description-body-drift".to_string(),
                         confidence: Confidence::Confirmed,
+                        state: String::new(),
                         route,
                         explanation: format!(
                             "description says `{neg}{token}` but the body asserts `{token}`"
@@ -452,6 +483,7 @@ pub fn detect_stale_state_over_lore(input: &DetectorInput) -> Option<Finding> {
         store: input.store,
         kind: "stale-state-over-lore".to_string(),
         confidence: Confidence::Confirmed,
+        state: String::new(),
         route,
         explanation: "State entry reads done but carries durable measured lore; mark the state superseded with a dated current-state block, do not delete the lore".to_string(),
         suggestion: suggestion_for(
@@ -501,6 +533,7 @@ pub fn detect_workaround_vs_plan<'a>(
                     store: entry.store,
                     kind: "workaround-vs-plan".to_string(),
                     confidence: Confidence::Confirmed,
+                    state: String::new(),
                     route,
                     explanation: format!(
                         "Workaround entry shares a key term with Fact entry `{}` but neither cross-links the other; one may be a fix-of-the-moment the plan supersedes", other.slug
@@ -711,7 +744,8 @@ pub fn run_dream(args: &[String]) -> DreamOutcome {
         eprintln!("host-lifecycle {line}");
     }
 
-    let findings = run_audit(&dir);
+    let audit = run_audit(&dir);
+    let findings = audit.findings;
 
     if fix_mode {
         let repo_count = findings.iter().filter(|f| f.store == StoreLoc::Repo).count();
@@ -733,16 +767,10 @@ pub fn run_dream(args: &[String]) -> DreamOutcome {
         );
     }
 
-    let marker = read_tier_marker(&dir);
-    let store_present = home
-        .as_ref()
-        .and_then(|h| MemoryStore::open(&h.join(".host-memory"), &dir).ok())
-        .map(|s| s.dir().exists())
-        .unwrap_or(false);
     if json {
-        print_json(&findings, &marker, store_present);
+        print_json(&findings, &audit.marker, audit.store_present, audit.history_checked);
     } else {
-        print_text(&findings, &marker, store_present);
+        print_text(&findings, &audit.marker, audit.store_present, audit.history_checked);
     }
 
     // The exit split (call/0045): clean 0; review prompts alone are the
@@ -825,7 +853,7 @@ pub fn stamp_if_observed(project_dir: &Path, home: Option<&Path>) -> Option<Stri
         return None;
     }
     let store = home.and_then(|h| MemoryStore::open(&h.join(".host-memory"), project_dir).ok())?;
-    if !store.dir().exists() {
+    if !store.initialized() {
         return None;
     }
     let provenance = provenance_line(project_dir);
@@ -895,11 +923,24 @@ fn provenance_line(project_dir: &Path) -> String {
     format!("{date} {who}")
 }
 
+/// One audit's full result: the findings plus the store facts the coverage
+/// lines and callers report from, so output can never claim more than the
+/// audit did (call/0045 legibility).
+pub struct Audit {
+    pub findings: Vec<Finding>,
+    pub marker: TierMarker,
+    pub store_present: bool,
+    /// Whether the append-only history scan actually ran (a git history was
+    /// available and `git log` succeeded). False means unchecked, and the
+    /// coverage line says so instead of claiming the check.
+    pub history_checked: bool,
+}
+
 /// The full audit. Reads the per-user store (memory.rs), the repo `MEMORY.md`,
 /// and the tier marker; resolves links against the union of both stores; runs
 /// the detector engine over each entry; returns findings in
 /// detector-declaration order, per-user tier first.
-pub fn run_audit(project_dir: &Path) -> Vec<Finding> {
+pub fn run_audit(project_dir: &Path) -> Audit {
     let home = env::var_os("HOME").map(PathBuf::from);
     run_audit_with_home(project_dir, home.as_deref())
 }
@@ -909,14 +950,15 @@ pub fn run_audit(project_dir: &Path) -> Vec<Finding> {
 /// so the MCP consolidate surface stays read-only. Detection treats an
 /// observed-but-unstamped store as in use; the stamp is the durable record
 /// for other machines, not the detection input.
-pub fn run_audit_with_home(project_dir: &Path, home: Option<&Path>) -> Vec<Finding> {
+pub fn run_audit_with_home(project_dir: &Path, home: Option<&Path>) -> Audit {
     let mut findings = Vec::new();
     let marker = read_tier_marker(project_dir);
 
     // Per-user store: `open` always succeeds (lazy materialization), so the
-    // presence signal is the directory itself.
+    // presence signal is an initialized store (index present), never a bare
+    // directory.
     let per_user_store = home.and_then(|h| MemoryStore::open(&h.join(".host-memory"), project_dir).ok());
-    let store_present = per_user_store.as_ref().map(|s| s.dir().exists()).unwrap_or(false);
+    let store_present = per_user_store.as_ref().map(|s| s.initialized()).unwrap_or(false);
     let per_user_entries = match &per_user_store {
         Some(store) if store_present => store.list().unwrap_or_default(),
         _ => Vec::new(),
@@ -978,9 +1020,16 @@ pub fn run_audit_with_home(project_dir: &Path, home: Option<&Path>) -> Vec<Findi
         findings.extend(detect(&input));
     }
     // Append-only-violation: scan git history of MEMORY.md for in-place body
-    // edits to existing sections. Returns one finding per edited section.
-    findings.extend(detect_append_only_violations(&repo_memory));
-    findings
+    // edits to existing sections. Returns one finding per edited section plus
+    // whether the scan actually ran.
+    let (violations, history_checked) = detect_append_only_violations(&repo_memory);
+    findings.extend(violations);
+    Audit {
+        findings,
+        marker,
+        store_present,
+        history_checked,
+    }
 }
 
 /// The marker-contradiction finding. The spec's `Finding.entry` is null here;
@@ -992,6 +1041,7 @@ fn marker_contradiction_finding(marker: &TierMarker) -> Finding {
         kind: "marker-contradiction".to_string(),
         route: Route::Append,
         confidence: Confidence::Confirmed,
+        state: String::new(),
         explanation: format!(
             "a per-user store is present on this machine but the tier marker is retired ({})",
             marker.provenance
@@ -1008,23 +1058,24 @@ fn marker_contradiction_finding(marker: &TierMarker) -> Finding {
 /// section's body) is an in-place edit. Conservative: the cast review may
 /// refine the heuristic; for now it flags any section with removed body
 /// lines across revisions.
-fn detect_append_only_violations(path: &Path) -> Vec<Finding> {
+fn detect_append_only_violations(path: &Path) -> (Vec<Finding>, bool) {
     let mut out = Vec::new();
     let Some(parent) = path.parent() else {
-        return out;
+        return (out, false);
     };
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("MEMORY.md");
-    // `git log -p --no-color -- MEMORY.md` under the project dir.
+    // `git log -p --no-color -- MEMORY.md` under the project dir. A failed or
+    // unavailable history is reported as unchecked, never as a clean check.
     let result = std::process::Command::new("git")
         .arg("-C")
         .arg(parent)
         .args(["log", "-p", "--no-color", "--", file_name])
         .output();
     let Ok(output) = result else {
-        return out;
+        return (out, false);
     };
     if !output.status.success() {
-        return out;
+        return (out, false);
     }
     let log = String::from_utf8_lossy(&output.stdout);
     // Track sections that have removals inside them in any revision's diff.
@@ -1077,6 +1128,7 @@ fn detect_append_only_violations(path: &Path) -> Vec<Finding> {
             store: StoreLoc::Repo,
             kind: "append-only-violation".to_string(),
             confidence: Confidence::Confirmed,
+            state: String::new(),
             route: Route::Append,
             explanation: format!(
                 "section `{section}` has body removals in git history; the repo MEMORY.md is append-only (CLAUDE.md section 6); if the body changed, append a correction with a forward [[link]] instead"
@@ -1084,11 +1136,11 @@ fn detect_append_only_violations(path: &Path) -> Vec<Finding> {
             // Bespoke: an append-only violation is already an in-place edit; the
             // imperative is to restore and append, never to edit further.
             suggestion: format!(
-                "The repo MEMORY.md section `{section}` was edited in place — a CLAUDE.md §6 violation. Restore the removed text and append a new dated correction with a forward `[[link]]`. Never edit repo entries in place."
+                "The repo MEMORY.md section `{section}` was edited in place — a CLAUDE.md §6 violation. Append a new dated correction that restores the removed text and names the violated section with a forward `[[link]]`; the restoration rides the append. Never edit repo entries in place."
             ),
         });
     }
-    out
+    (out, true)
 }
 
 /// One section of the repo MEMORY.md: a `### ` heading plus the body until the
@@ -1158,7 +1210,7 @@ fn print_help() {
 /// the engine cannot disagree. Printed in the clean case and the findings
 /// case alike; the marker's provenance rides along so a possibly-stale latch
 /// is judgeable in the same glance.
-fn coverage_lines(marker: &TierMarker, store_present: bool) -> Vec<String> {
+pub fn coverage_lines(marker: &TierMarker, store_present: bool, history_checked: bool) -> Vec<String> {
     let marker_desc = match marker.state {
         TierState::Absent => "tier marker: absent".to_string(),
         TierState::Stamped => format!("tier marker: stamped {}", marker.provenance),
@@ -1169,6 +1221,9 @@ fn coverage_lines(marker: &TierMarker, store_present: bool) -> Vec<String> {
         .iter()
         .filter(|r| r.1.contains(&StoreLoc::Repo))
         .map(|r| r.0)
+        // The history scan only counts as checked when it actually ran; a
+        // failed or absent git history moves it to the unchecked clause.
+        .filter(|k| history_checked || *k != "append-only-violation")
         .collect();
     let repo_skipped: Vec<String> = APPLICABILITY
         .iter()
@@ -1179,6 +1234,9 @@ fn coverage_lines(marker: &TierMarker, store_present: bool) -> Vec<String> {
         "coverage: repo tier: checked {}; links resolved against the union of both stores ({marker_desc})",
         repo_ran.join(", ")
     );
+    if !history_checked {
+        repo_line.push_str("; unchecked: append-only-violation (no git history available)");
+    }
     if !repo_skipped.is_empty() {
         repo_line.push_str(&format!("; not applicable: {}", repo_skipped.join("; ")));
     }
@@ -1201,7 +1259,15 @@ fn coverage_lines(marker: &TierMarker, store_present: bool) -> Vec<String> {
     out
 }
 
-fn print_text(findings: &[Finding], marker: &TierMarker, store_present: bool) {
+/// The per-state dangling-link counts (call/0045 condition 6): a new dangle
+/// must not hide inside a standing baseline, so the three states count
+/// separately wherever the totals print.
+fn dangling_state_counts(findings: &[Finding]) -> (usize, usize, usize) {
+    let count = |s: &str| findings.iter().filter(|f| f.state == s).count();
+    (count("tier-unused"), count("uninitialized-here"), count("entry-missing"))
+}
+
+fn print_text(findings: &[Finding], marker: &TierMarker, store_present: bool, history_checked: bool) {
     let confirmed: Vec<&Finding> = findings.iter().filter(|f| f.confidence == Confidence::Confirmed).collect();
     let prompts: Vec<&Finding> = findings.iter().filter(|f| f.confidence == Confidence::ReviewPrompt).collect();
     if findings.is_empty() {
@@ -1215,6 +1281,12 @@ fn print_text(findings: &[Finding], marker: &TierMarker, store_present: bool) {
             confirmed.len(),
             prompts.len()
         );
+        let (tier_unused, uninit_here, entry_missing) = dangling_state_counts(findings);
+        if tier_unused + uninit_here + entry_missing > 0 {
+            println!(
+                "dangling-link states: {tier_unused} tier-unused, {uninit_here} uninitialized-here, {entry_missing} entry-missing"
+            );
+        }
         for f in confirmed.iter().chain(prompts.iter()) {
             println!(
                 "{} ({}) [{}] {} route={} — {}",
@@ -1228,7 +1300,7 @@ fn print_text(findings: &[Finding], marker: &TierMarker, store_present: bool) {
             println!("  → {}", f.suggestion);
         }
     }
-    for line in coverage_lines(marker, store_present) {
+    for line in coverage_lines(marker, store_present, history_checked) {
         println!("{line}");
     }
     if !findings.is_empty() {
@@ -1239,18 +1311,19 @@ fn print_text(findings: &[Finding], marker: &TierMarker, store_present: bool) {
     }
 }
 
-fn print_json(findings: &[Finding], marker: &TierMarker, store_present: bool) {
+fn print_json(findings: &[Finding], marker: &TierMarker, store_present: bool, history_checked: bool) {
     // An object, not a bare array (call/0045): [] cannot distinguish clean
     // from unchecked, so the coverage travels in-band. The shape change is
     // ledgered for adopters in the release's migration entry.
     let mut s = String::from("{\n  \"findings\": [\n");
     for (i, f) in findings.iter().enumerate() {
         s.push_str(&format!(
-            "    {{\"entry\": \"{}\", \"store\": \"{}\", \"kind\": \"{}\", \"confidence\": \"{}\", \"route\": \"{}\", \"explanation\": \"{}\", \"suggestion\": \"{}\"}}",
+            "    {{\"entry\": \"{}\", \"store\": \"{}\", \"kind\": \"{}\", \"confidence\": \"{}\", \"state\": \"{}\", \"route\": \"{}\", \"explanation\": \"{}\", \"suggestion\": \"{}\"}}",
             json_escape(&f.entry_slug),
             f.store.as_str(),
             f.kind,
             f.confidence.as_str(),
+            json_escape(&f.state),
             f.route.as_str(),
             json_escape(&f.explanation),
             json_escape(&f.suggestion)
@@ -1266,13 +1339,18 @@ fn print_json(findings: &[Finding], marker: &TierMarker, store_present: bool) {
         TierState::Stamped => "stamped",
         TierState::Retired => "retired",
     };
+    let (tier_unused, uninit_here, entry_missing) = dangling_state_counts(findings);
     s.push_str(&format!(
-        "  \"coverage\": {{\"marker\": {{\"state\": \"{}\", \"provenance\": \"{}\"}}, \"per_user_store_present\": {}, \"tiers\": [",
+        "  \"coverage\": {{\"marker\": {{\"state\": \"{}\", \"provenance\": \"{}\"}}, \"per_user_store_present\": {}, \"history_checked\": {}, \"dangling_states\": {{\"tier_unused\": {}, \"uninitialized_here\": {}, \"entry_missing\": {}}}, \"tiers\": [",
         marker_state,
         json_escape(&marker.provenance),
-        store_present
+        store_present,
+        history_checked,
+        tier_unused,
+        uninit_here,
+        entry_missing
     ));
-    let tiers = coverage_lines(marker, store_present);
+    let tiers = coverage_lines(marker, store_present, history_checked);
     for (i, t) in tiers.iter().enumerate() {
         s.push_str(&format!("\"{}\"", json_escape(t)));
         if i + 1 < tiers.len() {
@@ -1344,6 +1422,9 @@ mod tests {
     fn materialized_store(home: &Path, proj: &Path) -> PathBuf {
         let store = MemoryStore::open(&home.join(".host-memory"), proj).unwrap();
         fs::create_dir_all(store.dir()).unwrap();
+        // An initialized store means the index exists (a bare directory does
+        // not count, the anti-gaming bar).
+        fs::write(store.dir().join("MEMORY.md"), "").unwrap();
         store.dir().to_path_buf()
     }
 
@@ -1396,7 +1477,7 @@ mod tests {
         stamp_if_observed(&proj, Some(&home)).expect("stamp");
         retire_marker(&proj).expect("retire");
         // Store still present after retirement: confirmed contradiction finding.
-        let findings = run_audit_with_home(&proj, Some(&home));
+        let findings = run_audit_with_home(&proj, Some(&home)).findings;
         let f = findings
             .iter()
             .find(|f| f.kind == "marker-contradiction")
@@ -1405,7 +1486,7 @@ mod tests {
         assert!(f.suggestion.contains("Never edit the marker"), "anti-hand-edit tail: {}", f.suggestion);
         // Store removed: the contradiction clears.
         fs::remove_dir_all(&store_dir).unwrap();
-        let findings = run_audit_with_home(&proj, Some(&home));
+        let findings = run_audit_with_home(&proj, Some(&home)).findings;
         assert!(!findings.iter().any(|f| f.kind == "marker-contradiction"));
         let _ = fs::remove_dir_all(&proj);
         let _ = fs::remove_dir_all(&home);
@@ -1473,7 +1554,7 @@ mod tests {
         let home = tmp_dir("no-contradict-home");
         materialized_store(&home, &proj);
         stamp_if_observed(&proj, Some(&home)).expect("stamp");
-        let findings = run_audit_with_home(&proj, Some(&home));
+        let findings = run_audit_with_home(&proj, Some(&home)).findings;
         assert!(!findings.iter().any(|f| f.kind == "marker-contradiction"));
         let _ = fs::remove_dir_all(&proj);
         let _ = fs::remove_dir_all(&home);
@@ -1486,7 +1567,7 @@ mod tests {
         materialized_store(&home, &proj);
         stamp_if_observed(&proj, Some(&home)).expect("stamp");
         retire_marker(&proj).expect("retire");
-        let findings = run_audit_with_home(&proj, Some(&home));
+        let findings = run_audit_with_home(&proj, Some(&home)).findings;
         let f = findings.iter().find(|f| f.kind == "marker-contradiction").expect("finding");
         assert_eq!(f.entry_slug, "tier-marker");
         assert_eq!(f.store, StoreLoc::Repo);
@@ -1631,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn dangling_confirmed_only_with_marker_absent() {
+    fn dangling_confirmed_only_when_tier_unused() {
         // The invariant sweep: across the state matrix, confirmed dangling
         // holds only while the tier is not in use (absent or retired).
         let slugs = known(&["alpha"]);
@@ -1652,7 +1733,102 @@ mod tests {
                 .find(|f| f.kind == "dangling-link")
                 .expect("finding");
             assert_eq!(f.confidence, expect, "state ({tier:?}, store_present={present})");
+            // The machine-readable state token matches the confidence tier.
+            match expect {
+                Confidence::Confirmed => assert_eq!(f.state, "tier-unused"),
+                Confidence::ReviewPrompt => assert!(
+                    f.state == "uninitialized-here" || f.state == "entry-missing",
+                    "advisory state token: {}",
+                    f.state
+                ),
+            }
         }
+    }
+
+    #[test]
+    fn dangling_retired_per_user_routes_edit_not_append() {
+        // The contradiction scenario (retired marker, store still present): a
+        // per-user entry's confirmed dangle must ride the store-correct edit
+        // frame, never a repo-append imperative (the W1 failure class).
+        let slugs = known(&["alpha"]);
+        let mut inp = input("alpha", "x", "See [[beta]] which is missing.", &slugs);
+        inp.tier = TierState::Retired;
+        inp.tier_provenance = "2026-07-22 t@t";
+        inp.store_present = true;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("finding");
+        assert_eq!(f.confidence, Confidence::Confirmed);
+        assert_eq!(f.state, "tier-unused");
+        assert_eq!(f.route, Route::Edit);
+        assert!(f.suggestion.starts_with("Edit"), "store-correct edit frame: {}", f.suggestion);
+        assert!(f.suggestion.contains("Do not append"), "anti-append tail: {}", f.suggestion);
+        // The retired remedy names the re-opt-in protocol, never the
+        // initialize-and-commit fork (which is false from retired).
+        assert!(f.suggestion.contains("removes the retired marker"), "re-opt-in protocol: {}", f.suggestion);
+        assert!(!f.suggestion.contains("commits the tier marker"), "no stale fork: {}", f.suggestion);
+        assert!(f.suggestion.contains("never the auditing agent's act"), "anti-stamp tail: {}", f.suggestion);
+    }
+
+    #[test]
+    fn superseded_unlinked_finding_created() {
+        // Per-user single-branch creation shape: route edit, confirmed, the
+        // W1 edit frame with its anti-append tail.
+        let slugs = known(&["alpha", "beta"]);
+        let mut inp = input("alpha", "older", "Alpha body. See nothing.", &slugs);
+        inp.superseded_by = "beta".to_string();
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "superseded-but-unlinked")
+            .expect("finding");
+        assert_eq!(f.route, Route::Edit);
+        assert_eq!(f.confidence, Confidence::Confirmed);
+        assert!(f.suggestion.starts_with("Edit"), "edit frame: {}", f.suggestion);
+    }
+
+    #[test]
+    fn stale_state_finding_created() {
+        let slugs = known(&["snapshot"]);
+        let mut inp = input(
+            "snapshot",
+            "GPU parity status",
+            "Single-GPU parity is done; the dual-GPU measurement was 42ms.",
+            &slugs,
+        );
+        inp.entry_type = EntryType::State;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "stale-state-over-lore")
+            .expect("finding");
+        assert_eq!(f.route, Route::Edit);
+        assert_eq!(f.confidence, Confidence::Confirmed);
+    }
+
+    #[test]
+    fn workaround_finding_created() {
+        let slugs = known(&["workaround", "plan"]);
+        let mut w = input(
+            "workaround",
+            "k=0 kernel fix",
+            "The k=0_kernel needs the AR16 model applied at boot.",
+            &slugs,
+        );
+        w.entry_type = EntryType::Workaround;
+        let mut p = input(
+            "plan",
+            "kernel plan",
+            "The k=0_kernel lands properly in the boot path rework.",
+            &slugs,
+        );
+        p.entry_type = EntryType::Fact;
+        let all = vec![w, p];
+        let f = detect_cross(&all)
+            .into_iter()
+            .find(|f| f.kind == "workaround-vs-plan")
+            .expect("finding");
+        assert_eq!(f.route, Route::Edit);
+        assert_eq!(f.confidence, Confidence::Confirmed);
     }
 
     #[test]
@@ -2173,7 +2349,7 @@ mod tests {
         g(&["add", "MEMORY.md"]);
         g(&["commit", "-q", "-m", "second"]);
         let path = dir.join("MEMORY.md");
-        let fs_out = detect_append_only_violations(&path);
+        let fs_out = detect_append_only_violations(&path).0;
         assert!(
             fs_out.iter().any(|f| f.kind == "append-only-violation"),
             "expected an append-only-violation finding, got: {fs_out:?}"
@@ -2219,7 +2395,7 @@ mod tests {
         g(&["add", "MEMORY.md"]);
         g(&["commit", "-q", "-m", "second"]);
         let path = dir.join("MEMORY.md");
-        let fs_out = detect_append_only_violations(&path);
+        let fs_out = detect_append_only_violations(&path).0;
         assert!(
             !fs_out.iter().any(|f| f.kind == "append-only-violation"),
             "expected no append-only-violation findings on a clean-append history, got: {fs_out:?}"
@@ -2257,7 +2433,7 @@ mod tests {
         g(&["add", "MEMORY.md"]);
         g(&["commit", "-q", "-m", "second"]);
         let path = dir.join("MEMORY.md");
-        let fs_out = detect_append_only_violations(&path);
+        let fs_out = detect_append_only_violations(&path).0;
         let f = fs_out
             .iter()
             .find(|f| f.kind == "append-only-violation")

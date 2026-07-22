@@ -354,9 +354,12 @@ fn handle_memory_call(verb: &str, args: &Value, project_dir: &Path) -> Value {
             }
         }
         "memory_consolidate" => {
-            let findings = crate::dream::run_audit(project_dir);
+            let audit = crate::dream::run_audit(project_dir);
+            let coverage = crate::dream::coverage_lines(&audit.marker, audit.store_present, audit.history_checked)
+                .join("\n");
+            let findings = audit.findings;
             if findings.is_empty() {
-                tool_result("clean: no staleness, drift, or append-only violations", false)
+                tool_result(&format!("clean\n{coverage}"), false)
             } else {
                 let lines: Vec<String> = findings
                     .iter()
@@ -385,10 +388,11 @@ fn handle_memory_call(verb: &str, args: &Value, project_dir: &Path) -> Value {
                     .count();
                 tool_result(
                     &format!(
-                        "{} confirmed finding(s), {} review prompt(s):\n{}",
+                        "{} confirmed finding(s), {} review prompt(s):\n{}\n{}",
                         confirmed,
                         findings.len() - confirmed,
-                        lines.join("\n")
+                        lines.join("\n"),
+                        coverage
                     ),
                     false,
                 )
