@@ -362,13 +362,14 @@ fn handle_memory_call(verb: &str, args: &Value, project_dir: &Path) -> Value {
                     .iter()
                     .map(|f| {
                         format!(
-                            "{} ({}) [{}] route={}: {}\n  → {}",
+                            "{} ({}) [{}] {} route={}: {}\n  → {}",
                             f.entry_slug,
                             match f.store {
                                 crate::dream::StoreLoc::Repo => "repo",
                                 crate::dream::StoreLoc::PerUser => "per-user",
                             },
                             f.kind,
+                            f.confidence.as_str(),
                             match f.route {
                                 crate::dream::Route::Edit => "edit",
                                 crate::dream::Route::Append => "append",
@@ -378,7 +379,19 @@ fn handle_memory_call(verb: &str, args: &Value, project_dir: &Path) -> Value {
                         )
                     })
                     .collect();
-                tool_result(&format!("{} finding(s):\n{}", findings.len(), lines.join("\n")), false)
+                let confirmed = findings
+                    .iter()
+                    .filter(|f| f.confidence == crate::dream::Confidence::Confirmed)
+                    .count();
+                tool_result(
+                    &format!(
+                        "{} confirmed finding(s), {} review prompt(s):\n{}",
+                        confirmed,
+                        findings.len() - confirmed,
+                        lines.join("\n")
+                    ),
+                    false,
+                )
             }
         }
         _ => tool_result(&format!("unknown memory tool: {verb}"), true),

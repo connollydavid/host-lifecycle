@@ -733,14 +733,33 @@ pub fn run_dream(args: &[String]) -> DreamOutcome {
         );
     }
 
+    let marker = read_tier_marker(&dir);
+    let store_present = home
+        .as_ref()
+        .and_then(|h| MemoryStore::open(&h.join(".host-memory"), &dir).ok())
+        .map(|s| s.dir().exists())
+        .unwrap_or(false);
     if json {
-        print_json(&findings);
+        print_json(&findings, &marker, store_present);
     } else {
-        print_text(&findings);
+        print_text(&findings, &marker, store_present);
     }
 
+    // The exit split (call/0045): clean 0; review prompts alone are the
+    // advisory tier at 3 (mirroring host-lint's warn); any confirmed finding
+    // gates at 1.
+    let confirmed = findings
+        .iter()
+        .filter(|f| f.confidence == Confidence::Confirmed)
+        .count();
     DreamOutcome {
-        exit_code: if findings.is_empty() { 0 } else { 1 },
+        exit_code: if findings.is_empty() {
+            0
+        } else if confirmed > 0 {
+            1
+        } else {
+            3
+        },
         findings,
         fix_mode,
         json,
@@ -1134,36 +1153,104 @@ fn print_help() {
     eprintln!("  -h, --help       this help");
 }
 
-fn print_text(findings: &[Finding]) {
-    if findings.is_empty() {
-        println!("dream: clean (no staleness, drift, or append-only violations)");
-        return;
-    }
-    for f in findings {
-        println!(
-            "{} ({}) [{}] route={} — {}",
-            f.entry_slug,
-            f.store.as_str(),
-            f.kind,
-            f.route.as_str(),
-            f.explanation
-        );
-        println!("  → {}", f.suggestion);
-    }
-    eprintln!(
-        "host-lifecycle dream: {} finding(s) across the memory stores",
-        findings.len()
+/// The per-tier coverage lines (call/0045): generated from the same
+/// APPLICABILITY rows and store facts the engine enforced, so the output and
+/// the engine cannot disagree. Printed in the clean case and the findings
+/// case alike; the marker's provenance rides along so a possibly-stale latch
+/// is judgeable in the same glance.
+fn coverage_lines(marker: &TierMarker, store_present: bool) -> Vec<String> {
+    let marker_desc = match marker.state {
+        TierState::Absent => "tier marker: absent".to_string(),
+        TierState::Stamped => format!("tier marker: stamped {}", marker.provenance),
+        TierState::Retired => format!("tier marker: retired {}", marker.provenance),
+    };
+    let mut out = Vec::new();
+    let repo_ran: Vec<&str> = APPLICABILITY
+        .iter()
+        .filter(|r| r.1.contains(&StoreLoc::Repo))
+        .map(|r| r.0)
+        .collect();
+    let repo_skipped: Vec<String> = APPLICABILITY
+        .iter()
+        .filter(|r| !r.1.contains(&StoreLoc::Repo))
+        .map(|r| format!("{} ({})", r.0, r.2))
+        .collect();
+    let mut repo_line = format!(
+        "coverage: repo tier: checked {}; links resolved against the union of both stores ({marker_desc})",
+        repo_ran.join(", ")
     );
+    if !repo_skipped.is_empty() {
+        repo_line.push_str(&format!("; not applicable: {}", repo_skipped.join("; ")));
+    }
+    out.push(repo_line);
+    if store_present {
+        let per_user_ran: Vec<&str> = APPLICABILITY
+            .iter()
+            .filter(|r| r.1.contains(&StoreLoc::PerUser))
+            .map(|r| r.0)
+            .collect();
+        out.push(format!(
+            "coverage: per-user tier: store present on this machine; checked {}",
+            per_user_ran.join(", ")
+        ));
+    } else {
+        out.push(format!(
+            "coverage: per-user tier: store absent on this machine ({marker_desc}); cross-store links resolved against the repo log only"
+        ));
+    }
+    out
 }
 
-fn print_json(findings: &[Finding]) {
-    let mut s = String::from("[\n");
+fn print_text(findings: &[Finding], marker: &TierMarker, store_present: bool) {
+    let confirmed: Vec<&Finding> = findings.iter().filter(|f| f.confidence == Confidence::Confirmed).collect();
+    let prompts: Vec<&Finding> = findings.iter().filter(|f| f.confidence == Confidence::ReviewPrompt).collect();
+    if findings.is_empty() {
+        println!("dream: clean");
+    } else {
+        // Grouped presentation (call/0045): the count line leads, confirmed
+        // findings print above the review prompts, and each line carries its
+        // confidence so the label cannot be missed.
+        println!(
+            "dream: {} confirmed finding(s), {} review prompt(s)",
+            confirmed.len(),
+            prompts.len()
+        );
+        for f in confirmed.iter().chain(prompts.iter()) {
+            println!(
+                "{} ({}) [{}] {} route={} — {}",
+                f.entry_slug,
+                f.store.as_str(),
+                f.kind,
+                f.confidence.as_str(),
+                f.route.as_str(),
+                f.explanation
+            );
+            println!("  → {}", f.suggestion);
+        }
+    }
+    for line in coverage_lines(marker, store_present) {
+        println!("{line}");
+    }
+    if !findings.is_empty() {
+        eprintln!(
+            "host-lifecycle dream: {} finding(s) across the memory stores",
+            findings.len()
+        );
+    }
+}
+
+fn print_json(findings: &[Finding], marker: &TierMarker, store_present: bool) {
+    // An object, not a bare array (call/0045): [] cannot distinguish clean
+    // from unchecked, so the coverage travels in-band. The shape change is
+    // ledgered for adopters in the release's migration entry.
+    let mut s = String::from("{\n  \"findings\": [\n");
     for (i, f) in findings.iter().enumerate() {
         s.push_str(&format!(
-            "  {{\"entry\": \"{}\", \"store\": \"{}\", \"kind\": \"{}\", \"route\": \"{}\", \"explanation\": \"{}\", \"suggestion\": \"{}\"}}",
+            "    {{\"entry\": \"{}\", \"store\": \"{}\", \"kind\": \"{}\", \"confidence\": \"{}\", \"route\": \"{}\", \"explanation\": \"{}\", \"suggestion\": \"{}\"}}",
             json_escape(&f.entry_slug),
             f.store.as_str(),
             f.kind,
+            f.confidence.as_str(),
             f.route.as_str(),
             json_escape(&f.explanation),
             json_escape(&f.suggestion)
@@ -1173,7 +1260,26 @@ fn print_json(findings: &[Finding]) {
         }
         s.push('\n');
     }
-    s.push(']');
+    s.push_str("  ],\n");
+    let marker_state = match marker.state {
+        TierState::Absent => "absent",
+        TierState::Stamped => "stamped",
+        TierState::Retired => "retired",
+    };
+    s.push_str(&format!(
+        "  \"coverage\": {{\"marker\": {{\"state\": \"{}\", \"provenance\": \"{}\"}}, \"per_user_store_present\": {}, \"tiers\": [",
+        marker_state,
+        json_escape(&marker.provenance),
+        store_present
+    ));
+    let tiers = coverage_lines(marker, store_present);
+    for (i, t) in tiers.iter().enumerate() {
+        s.push_str(&format!("\"{}\"", json_escape(t)));
+        if i + 1 < tiers.len() {
+            s.push_str(", ");
+        }
+    }
+    s.push_str("]}\n}");
     println!("{s}");
 }
 
@@ -1551,9 +1657,18 @@ mod tests {
 
     #[test]
     fn dream_transition_dreaming_to_findings() {
-        // A fixture with a call/ ref: dreaming -> findings (exit 1).
-        let outcome = dream_outcome("# M\n\n## L\n\n### Cites\n\nSee call/0017.\n", false);
+        // A confirmed finding (a dangling link with no tier marker):
+        // dreaming -> findings (exit 1).
+        let outcome = dream_outcome("# M\n\n## L\n\n### Cites\n\nSee [[missing-note]].\n", false);
         assert_eq!(outcome.exit_code, 1);
+    }
+
+    #[test]
+    fn dream_transition_dreaming_to_advisory() {
+        // Review prompts alone (a room-touching citation): dreaming ->
+        // advisory (exit 3, the call/0045 split).
+        let outcome = dream_outcome("# M\n\n## L\n\n### Cites\n\nSee call/0017.\n", false);
+        assert_eq!(outcome.exit_code, 3);
     }
 
     #[test]
@@ -1578,7 +1693,7 @@ mod tests {
     #[test]
     fn dream_record_finding_sets_latch() {
         // Any finding fires the latch: exit 1 iff findings is non-empty.
-        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee [[missing-note]].\n", false);
         assert_eq!(outcome.exit_code, 1);
         assert!(!outcome.findings.is_empty());
     }
@@ -1588,7 +1703,7 @@ mod tests {
         // The latch is per-run (single-shot model); a finding recorded in one
         // run does not leak into the next run's verdict. Run two audits back
         // to back and confirm the second's verdict matches its own findings.
-        let dirty = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        let dirty = dream_outcome("# M\n\n## L\n\n### X\n\nSee [[missing-note]].\n", false);
         assert_eq!(dirty.exit_code, 1);
         let clean = dream_outcome("# M\n\n## L\n\n### Y\n\nClean entry.\n", false);
         assert_eq!(clean.exit_code, 0, "clean run after a dirty run must still be clean");
@@ -1596,7 +1711,7 @@ mod tests {
 
     #[test]
     fn dream_verdict_findings_on_any_finding() {
-        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee [[missing-note]].\n", false);
         assert_eq!(outcome.exit_code, 1);
     }
 
@@ -1616,7 +1731,7 @@ mod tests {
     #[test]
     fn dream_no_false_clean_verdict() {
         // A fixture with a finding never yields exit 0.
-        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee [[missing-note]].\n", false);
         assert_ne!(outcome.exit_code, 0);
     }
 
