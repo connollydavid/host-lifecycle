@@ -76,6 +76,14 @@ jobs:
         run: allium analyse host-lifecycle.allium
       - name: allium plan (test obligations)
         run: allium plan host-lifecycle.allium
+      # The materialize surface (plan/0074) runs the same three lanes: a spec no
+      # workflow reads is an ungated spec.
+      - name: allium check (materialize surface)
+        run: allium check host-lifecycle-materialize.allium
+      - name: allium analyse (materialize surface)
+        run: allium analyse host-lifecycle-materialize.allium
+      - name: allium plan (materialize surface)
+        run: allium plan host-lifecycle-materialize.allium
       - name: Build host-lifecycle (drives its own obligations check, no self-install)
         run: cargo build --release --locked
       - name: Discharge obligations (every obligation dispositioned, test refs exist)

@@ -1,0 +1,622 @@
+-- allium: 3
+-- host-lifecycle materialize: the Where-room materialization surface. A fresh
+-- clone's local tree is MADE by one orchestrator (`bootstrap`), RECORDED by two
+-- orthogonal artifacts (the append-only materialize receipt and the gitignored
+-- environment hash), and GATED by one completeness run (`software
+-- --verify-setup`). This spec models the four concerns and, above all, the
+-- non-overlap discipline that keeps them from duplicating (plan/0074).
+--
+-- The reference points, one per concern: the receipt answers "what happened, by
+-- what authority, when" against the event; the envhash answers "did the tree
+-- drift from what I last recorded" against the recorded state; the completeness
+-- run answers "is the setup complete per the recipe" against the recipe; and
+-- bootstrap answers nothing — it makes the state and defers every verification
+-- to the other three, so it adds no writer (VerifyingOpsWriteNothing below).
+--
+-- Scope: the observable behaviour of the four concerns — which facts each
+-- artifact records, which op writes it, and each run's verdict and exit split.
+-- Excludes (implementation): the git mechanics of materialization, the TOML
+-- stanza syntax of either file, the container-runtime probe for the image
+-- digest, the recipe parser, the per-platform build matrix, and exact CLI flags
+-- and output strings.
+--
+-- Idempotence (a second `bootstrap` over a complete tree changes nothing) is a
+-- two-moment property, so it is not an expressible invariant here; it is carried
+-- as a behavioural obligation in the sibling `.obligations` manifest, as is the
+-- append-only persistence of a written receipt (no rule mutates a Receipt: a
+-- correction to a receipt is another receipt).
+
+-- The two data artifacts of the Where room. `receipt` is the checked-in
+-- append-only provenance file; `envhash` is the gitignored local fingerprint.
+-- Bootstrap and the completeness run are absent by design: neither is an
+-- artifact, because neither records anything.
+enum Artifact {
+    receipt
+    envhash
+}
+
+-- The ops a write can be attributed to. `bootstrap` and `verify_setup` are
+-- enumerated so that "they write nothing" is a checked assertion rather than an
+-- unwritable one: bootstrap drives the writers, and the gate only reads.
+enum Writer {
+    materialize
+    install_hooks
+    verify_build
+    image_pull
+    bootstrap
+    verify_setup
+}
+
+-- Every fact either artifact records, at the resolution plan/0074's field table
+-- uses. The event facts (first block) belong to the receipt; the state facts
+-- (second block) belong to the envhash; the partition is asserted by
+-- ReceiptWritesOnlyEventFacts and EnvHashWritesOnlyStateFacts. The table's one
+-- shared row, "component realized", is two facts here because the artifacts
+-- record it at different resolutions: the receipt names the component, the
+-- envhash observes a worktree path present on disk. A digest has no time, no
+-- disposition and no evidence; an event has no ambient machine state. Pin
+-- adherence appears only as `pin_reference`, context on the event: pin-versus-
+-- recorded is `software --check`'s question, not this surface's.
+enum RecordedFact {
+    materialization_happened
+    disposition
+    evidence
+    recorded_at
+    component_named
+    pin_reference
+    image_reference
+    worktree_present
+    hook_binary_hash
+    image_digest
+    submodule_init_state
+    repo_abspath
+}
+
+-- The envhash's per-input sub-hash dimensions (one stanza each), so
+-- `env --check` diffs dimension by dimension and prints only the rows that
+-- moved rather than one opaque digest that moved.
+enum Dimension {
+    worktree_paths
+    hook_binary
+    pulled_image
+    submodule_init
+    repo_path
+}
+
+-- The classes of local artifact the recipe requires of a bootstrapped tree.
+-- These are the completeness run's whole vocabulary: each is an artifact that is
+-- present or absent, never a value that moved (GapsAreMissingArtifacts).
+enum RequirementKind {
+    worktree_materialized
+    host_hook_installed
+    worktree_hook_installed
+    build_artifact_present
+    rederiver_on_path
+    skill_linked
+}
+
+-- === Project: shared with the wider host-lifecycle spec ===
+
+entity Project {
+    name: String
+}
+
+-- The machine the run happens on. `is_build_host` is the recipe's declaration
+-- that this host builds the artifact-bearing components; a host that never built
+-- them is not incomplete for lacking their artifacts.
+entity Host {
+    is_build_host: Boolean
+}
+
+-- A component's canonical worktree in the Where room. Both booleans are
+-- live-tree facts the completeness run and the envhash read; `hook_installed` is
+-- the one the install-hooks op sets, because a materialized worktree is a real
+-- commit surface and needs its own local tell-gate (plan/0074, Bug A).
+entity Worktree {
+    name: String
+    materialized: Boolean
+    hook_installed: Boolean
+}
+
+-- One write act: which op wrote which artifact, and the facts that write
+-- recorded. The four non-overlap invariants are stated over this entity, and
+-- every writer rule below creates exactly one, so the invariants bind real
+-- writes rather than a hypothetical schema.
+entity Write {
+    writer: Writer
+    artifact: Artifact
+    facts: Set<RecordedFact>
+}
+
+-- One `software --materialize` run: the EVENT the receipt records. `components`
+-- is what the run was asked to realize; a failed run realizes nothing and leaves
+-- no receipt (ReceiptOnlyForRealizedRun).
+entity MaterializeRun {
+    status: materializing | realized | aborted
+    components: Set<String>
+    transitions status {
+        materializing -> realized
+        materializing -> aborted
+        terminal: realized, aborted
+    }
+}
+
+-- The appended provenance line (#18): one per realized materialize run, in the
+-- same append-only shape as the `embed` receipt. It has no lifecycle field
+-- because it has no lifecycle: once written it is never rewritten, and a
+-- correction to a receipt is another receipt.
+entity Receipt {
+    run: MaterializeRun
+    components: Set<String>
+}
+
+-- The recorded local STATE (#19): the gitignored `.host-envhash`. `recorded` is
+-- false on a clone that has not materialized yet, which is why `env --check` has
+-- a cannot-proceed outcome that is a prompt rather than a gate failure.
+entity EnvHash {
+    recorded: Boolean
+}
+
+-- One dimension of the envhash as read on this machine. `readable` is false when
+-- the dimension cannot be probed here — no container runtime for the image
+-- digest — and an unreadable dimension is never reported as moved
+-- (UnreadableDimensionNeverMoves): silence beats a delta the tool cannot see.
+entity EnvDimension {
+    kind: Dimension
+    moved: Boolean
+    readable: Boolean
+}
+
+-- One advisory route line: the dimension that moved. A delta names where to
+-- look; it never fails the run.
+entity Delta {
+    dimension: EnvDimension
+}
+
+-- One `env --check` run. The verdict is advisory by construction: there is no
+-- hazarded state to reach. `clean` and `drifted` both exit 0; `cannot_proceed`
+-- exits 2 and only ever means "no envhash on disk yet"
+-- (CannotProceedOnlyWithoutRecord).
+entity EnvCheck {
+    status: checking | clean | drifted | cannot_proceed
+    saw_delta: Boolean
+    transitions status {
+        checking -> clean
+        checking -> drifted
+        checking -> cannot_proceed
+        terminal: clean, drifted, cannot_proceed
+    }
+}
+
+-- One required local artifact, as the recipe implies it for this host.
+-- `required` is host-role-aware (BuildArtifactRequiredOnlyOnBuildHost);
+-- `present` is the live tree. `worktree` names the worktree a per-worktree
+-- requirement concerns, so a hook gap says which worktree is ungated.
+entity Requirement {
+    kind: RequirementKind
+    required: Boolean
+    present: Boolean
+    worktree: Worktree?
+}
+
+-- A required artifact that is not there: one HAZARD line. The remedy is always
+-- to install the missing thing, never to reconcile a drifted value.
+entity Gap {
+    requirement: Requirement
+}
+
+-- One `software --verify-setup` run: the plan's Completeness concern. A gate, so
+-- unlike `env --check` it has a hazarded verdict; it writes nothing at all,
+-- neither receipt nor envhash (VerifyingOpsWriteNothing).
+entity CompletenessRun {
+    status: verifying | complete | hazarded
+    saw_gap: Boolean
+    transitions status {
+        verifying -> complete
+        verifying -> hazarded
+        terminal: complete, hazarded
+    }
+}
+
+-- One `host-lifecycle bootstrap <dir>` run: the orchestrator. `hooks_installed`
+-- latches the install-hooks step, which is what makes worktree-hook coverage
+-- provable at completion. Bootstrap's final act is to start the completeness
+-- run, so the orchestrator never certifies itself.
+entity BootstrapRun {
+    status: bootstrapping | bootstrapped | abandoned
+    hooks_installed: Boolean
+    transitions status {
+        bootstrapping -> bootstrapped
+        bootstrapping -> abandoned
+        terminal: bootstrapped, abandoned
+    }
+}
+
+given {
+    host: Host
+    materialize_run: MaterializeRun
+    envhash: EnvHash
+    envcheck: EnvCheck
+    setup_run: CompletenessRun
+    bootstrap_run: BootstrapRun
+}
+
+surface MaterializeOp {
+    facing project: Project
+    provides:
+        MaterializeStarts(project)
+        MaterializeCompletes(project)
+        MaterializeFails(project)
+}
+
+-- The three remaining state-changing ops, each an envhash writer and none a
+-- receipt writer: installing hooks (also the worktree gate, Bug A), confirming
+-- the image digest on a verify-build, and pulling the toolchain image.
+surface StateChangingOps {
+    facing project: Project
+    provides:
+        HooksInstalled(project)
+        BuildVerified(project)
+        ImagePulled(project)
+}
+
+surface EnvCheckOp {
+    facing project: Project
+    provides:
+        EnvCheckStarts(project)
+        EnvCheckCompletes(project)
+}
+
+surface VerifySetupOp {
+    facing project: Project
+    provides:
+        VerifySetupStarts(project)
+        VerifySetupCompletes(project)
+}
+
+surface BootstrapOp {
+    facing project: Project
+    provides:
+        BootstrapStarts(project)
+        BootstrapStepsDone(project)
+        BootstrapFails(project)
+}
+
+-- === Materialize: the event, and its two orthogonal writers ===
+
+rule StartMaterialize {
+    when: MaterializeStarts(project)
+    ensures: materialize_run.status = materializing
+}
+
+rule RealizeMaterialize {
+    when: MaterializeCompletes(project)
+    requires: materialize_run.status = materializing
+    ensures: materialize_run.status = realized
+}
+
+rule AbortMaterialize {
+    when: MaterializeFails(project)
+    requires: materialize_run.status = materializing
+    ensures: materialize_run.status = aborted
+}
+
+-- The append-only receipt rule: a realized run appends one receipt, recording
+-- event facts only. Nothing rewrites an earlier one, and an aborted run appends
+-- none.
+rule AppendMaterializeReceipt {
+    when: run: MaterializeRun.status transitions_to realized
+    ensures: Receipt.created(run: run, components: run.components)
+    ensures: Write.created(
+        writer: materialize,
+        artifact: receipt,
+        facts: {
+            materialization_happened,
+            disposition,
+            evidence,
+            recorded_at,
+            component_named,
+            pin_reference,
+            image_reference
+        }
+    )
+}
+
+-- The second writer at the same call site, recording nothing the receipt
+-- records: one materialize refreshes the fingerprint as well, and the two files
+-- share no fact.
+rule RefreshEnvHashOnMaterialize {
+    when: run: MaterializeRun.status transitions_to realized
+    ensures: envhash.recorded = true
+    ensures: Write.created(
+        writer: materialize,
+        artifact: envhash,
+        facts: {
+            worktree_present,
+            hook_binary_hash,
+            image_digest,
+            submodule_init_state,
+            repo_abspath
+        }
+    )
+}
+
+-- === The remaining state-changing ops: envhash only, never a receipt ===
+
+-- Every materialized worktree is a commit surface, so the op gates each one, not
+-- the host repo alone.
+rule InstallHooksCoversWorktrees {
+    when: HooksInstalled(project)
+    ensures:
+        for w in Worktrees where w.materialized:
+            w.hook_installed = true
+}
+
+-- Installing hooks moves the hook binary hash: a state change, not a lifecycle
+-- event, so it refreshes the fingerprint and appends no provenance.
+rule RefreshEnvHashOnInstallHooks {
+    when: HooksInstalled(project)
+    ensures: envhash.recorded = true
+    ensures: Write.created(
+        writer: install_hooks,
+        artifact: envhash,
+        facts: {
+            worktree_present,
+            hook_binary_hash,
+            image_digest,
+            submodule_init_state,
+            repo_abspath
+        }
+    )
+}
+
+rule RecordBootstrapHooks {
+    when: HooksInstalled(project)
+    requires: bootstrap_run.status = bootstrapping
+    ensures: bootstrap_run.hooks_installed = true
+}
+
+rule RefreshEnvHashOnBuildVerified {
+    when: BuildVerified(project)
+    ensures: envhash.recorded = true
+    ensures: Write.created(
+        writer: verify_build,
+        artifact: envhash,
+        facts: {
+            worktree_present,
+            hook_binary_hash,
+            image_digest,
+            submodule_init_state,
+            repo_abspath
+        }
+    )
+}
+
+rule RefreshEnvHashOnImagePull {
+    when: ImagePulled(project)
+    ensures: envhash.recorded = true
+    ensures: Write.created(
+        writer: image_pull,
+        artifact: envhash,
+        facts: {
+            worktree_present,
+            hook_binary_hash,
+            image_digest,
+            submodule_init_state,
+            repo_abspath
+        }
+    )
+}
+
+-- === env --check: advisory drift, never a gate ===
+
+rule StartEnvCheck {
+    when: EnvCheckStarts(project)
+    ensures: envcheck.status = checking
+    ensures: envcheck.saw_delta = false
+}
+
+-- A dimension the tool cannot read is never called moved; with no container
+-- runtime the image dimension stays silent rather than guessing.
+rule ReportMovedDimension {
+    when: dim: EnvDimension.created
+    requires: dim.moved and dim.readable
+    ensures: Delta.created(dimension: dim)
+}
+
+rule RecordDelta {
+    when: delta: Delta.created
+    requires: envcheck.status = checking
+    ensures: envcheck.saw_delta = true
+}
+
+-- No recorded fingerprint to diff against: a prompt to materialize (exit 2), not
+-- a verdict about the tree.
+rule VerdictCannotProceed {
+    when: EnvCheckCompletes(project)
+    requires: envcheck.status = checking and not envhash.recorded
+    ensures: envcheck.status = cannot_proceed
+}
+
+rule VerdictDrifted {
+    when: EnvCheckCompletes(project)
+    requires: envcheck.status = checking and envhash.recorded and envcheck.saw_delta
+    ensures: envcheck.status = drifted
+}
+
+rule VerdictEnvClean {
+    when: EnvCheckCompletes(project)
+    requires: envcheck.status = checking and envhash.recorded and not envcheck.saw_delta
+    ensures: envcheck.status = clean
+}
+
+-- === The completeness run: recipe versus live tree ===
+
+rule StartVerifySetup {
+    when: VerifySetupStarts(project)
+    ensures: setup_run.status = verifying
+    ensures: setup_run.saw_gap = false
+}
+
+-- The gate's only detector: a required artifact that is not present. A
+-- requirement this host never carried is not required, so it cannot gap.
+rule DetectMissingArtifact {
+    when: requirement: Requirement.created
+    requires: requirement.required and not requirement.present
+    ensures: Gap.created(requirement: requirement)
+}
+
+rule RecordGap {
+    when: gap: Gap.created
+    requires: setup_run.status = verifying
+    ensures: setup_run.saw_gap = true
+}
+
+rule VerdictSetupHazarded {
+    when: VerifySetupCompletes(project)
+    requires: setup_run.status = verifying and setup_run.saw_gap
+    ensures: setup_run.status = hazarded
+}
+
+rule VerdictSetupComplete {
+    when: VerifySetupCompletes(project)
+    requires: setup_run.status = verifying and not setup_run.saw_gap
+    ensures: setup_run.status = complete
+}
+
+-- === Bootstrap: makes the state, verifies none of it ===
+
+rule StartBootstrap {
+    when: BootstrapStarts(project)
+    ensures: bootstrap_run.status = bootstrapping
+    ensures: bootstrap_run.hooks_installed = false
+}
+
+-- Completion is guarded on the hooks step having run, and its last act hands the
+-- verdict to the gate: the orchestrator never certifies itself.
+rule CompleteBootstrap {
+    when: BootstrapStepsDone(project)
+    requires: bootstrap_run.status = bootstrapping and bootstrap_run.hooks_installed
+    ensures: bootstrap_run.status = bootstrapped
+    ensures: VerifySetupStarts(project: project)
+}
+
+rule AbandonBootstrap {
+    when: BootstrapFails(project)
+    requires: bootstrap_run.status = bootstrapping
+    ensures: bootstrap_run.status = abandoned
+}
+
+-- === Invariants ===
+
+-- Non-overlap, receipt side: the receipt records the event and nothing about
+-- ambient machine state. A digest has no timestamp, no disposition and no
+-- evidence, so those never cross.
+invariant ReceiptWritesOnlyEventFacts {
+    for w in Writes where w.artifact = receipt:
+        w.facts.all(f => f in {
+            materialization_happened,
+            disposition,
+            evidence,
+            recorded_at,
+            component_named,
+            pin_reference,
+            image_reference
+        })
+}
+
+-- Non-overlap, envhash side: the fingerprint records state and never an event.
+-- It carries no timestamp, no disposition and no evidence — a fingerprint that
+-- claimed an event would be a receipt wearing the wrong file's name.
+invariant EnvHashWritesOnlyStateFacts {
+    for w in Writes where w.artifact = envhash:
+        w.facts.all(f => f in {
+            worktree_present,
+            hook_binary_hash,
+            image_digest,
+            submodule_init_state,
+            repo_abspath
+        })
+}
+
+-- Only the materialize op appends provenance. Installing hooks, verifying a
+-- build and pulling an image all change state, so they write the fingerprint
+-- alone.
+invariant OnlyMaterializeWritesReceipt {
+    for w in Writes where w.artifact = receipt:
+        w.writer = materialize
+}
+
+-- Bootstrap adds no writer and the gate only reads: whatever a write says, it
+-- was performed by an op that changes the tree, and both verifying concerns are
+-- absent from every attribution.
+invariant VerifyingOpsWriteNothing {
+    for w in Writes:
+        w.writer not in {bootstrap, verify_setup}
+}
+
+-- No receipt without the event it records: an aborted materialize leaves the
+-- provenance file untouched.
+invariant ReceiptOnlyForRealizedRun {
+    for r in Receipts:
+        r.run.status = realized
+}
+
+-- Worktree-hook coverage: a setup that verified complete has a hook on every
+-- materialized worktree. Materializing a new component into an already
+-- bootstrapped tree therefore cannot pass the gate until its hook is installed.
+invariant CompleteSetupCoversWorktreeHooks {
+    for c in CompletenessRuns where c.status = complete:
+        for w in Worktrees where w.materialized:
+            w.hook_installed
+}
+
+-- Host-role awareness: a host the recipe never made a build host is not required
+-- to hold the build artifact, so its absence is not a gap.
+invariant BuildArtifactRequiredOnlyOnBuildHost {
+    for r in Requirements where r.kind = build_artifact_present and r.required:
+        host.is_build_host
+}
+
+-- The gate reports absence, never drift: every gap is a required artifact that
+-- is missing, which is why its remedy is always to install the missing thing.
+invariant GapsAreMissingArtifacts {
+    for g in Gaps:
+        g.requirement.required and not g.requirement.present
+}
+
+-- A per-worktree requirement names the worktree it concerns, so a hook gap can
+-- say which worktree is ungated rather than that "a hook" is missing.
+invariant WorktreeRequirementNamesItsWorktree {
+    for r in Requirements where r.kind = worktree_hook_installed:
+        r.worktree != null
+}
+
+-- A dimension this machine cannot probe never reports a delta: the image digest
+-- with no container runtime is silent, not moved.
+invariant UnreadableDimensionNeverMoves {
+    for d in EnvDimensions where not d.readable:
+        not d.moved
+}
+
+-- The mirror of GapsAreMissingArtifacts on the drift side: every delta names a
+-- dimension that was read on this machine and moved. The two together are the
+-- non-overlap the operator reads — absence gates, movement routes.
+invariant DeltasNameObservedMoves {
+    for d in Deltas:
+        d.dimension.readable and d.dimension.moved
+}
+
+-- `env --check` never gates: its one non-zero outcome means there is no recorded
+-- fingerprint yet, never that the tree moved.
+invariant CannotProceedOnlyWithoutRecord {
+    for c in EnvChecks where c.status = cannot_proceed:
+        not envhash.recorded
+}
+
+-- A completeness run that saw any gap never settles complete, so one missing
+-- artifact gates the setup exactly as one HAZARD gates `software --check`.
+invariant GapBlocksComplete {
+    for c in CompletenessRuns where c.saw_gap and c.status != verifying:
+        c.status = hazarded
+}
