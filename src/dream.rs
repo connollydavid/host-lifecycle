@@ -64,6 +64,63 @@ impl Route {
     }
 }
 
+/// A finding's confidence (call/0045): `Confirmed` is mechanically evidenced
+/// on the stores and gates the run; `ReviewPrompt` is an unverified hypothesis
+/// whose lead remedy is a review note. The label travels in the printed
+/// explanation and suggestion, not only here: a 4B reads the prose, not the
+/// metadata (the W1 lineage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confidence {
+    Confirmed,
+    ReviewPrompt,
+}
+
+impl Confidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Confirmed => "confirmed",
+            Confidence::ReviewPrompt => "review-prompt",
+        }
+    }
+}
+
+/// The per-user tier's declared in-use state, read from the repo-side marker
+/// file (call/0045). `Absent` means the tier was never initialized anywhere;
+/// `Stamped` declares it in use; `Retired` declares it out of use (an operator
+/// act). There is no silent path back from `Retired`: a store observed after
+/// retirement is a contradiction finding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierState {
+    Absent,
+    Stamped,
+    Retired,
+}
+
+/// The declared applicability table (call/0045): each detector names the
+/// stores its format fits, beside the format fact that justifies it. The
+/// `detect` engine enforces these rows and the coverage lines are generated
+/// from the same rows, so the output and the engine cannot disagree.
+pub const APPLICABILITY: &[(&str, &[StoreLoc], &str)] = &[
+    ("superseded-but-unlinked", &[StoreLoc::Repo, StoreLoc::PerUser], "both formats can carry a supersession field"),
+    ("dangling-link", &[StoreLoc::Repo, StoreLoc::PerUser], "the [[slug]] notation spans both tiers; resolution is against the union"),
+    ("room-touching", &[StoreLoc::Repo, StoreLoc::PerUser], "room references appear in either tier's prose"),
+    ("description-body-drift", &[StoreLoc::PerUser], "the repo format has no per-entry description field"),
+    ("stale-state-over-lore", &[StoreLoc::PerUser], "entry types exist only in the per-user frontmatter"),
+    ("workaround-vs-plan", &[StoreLoc::PerUser], "entry types exist only in the per-user frontmatter"),
+    ("append-only-violation", &[StoreLoc::Repo], "the append-only discipline binds the repo log only"),
+];
+
+/// Whether a detector's declared applicability covers a store. Unknown kinds
+/// default to applicable so a new detector cannot be silently skipped by a
+/// missing row.
+pub fn applies(kind: &str, loc: StoreLoc) -> bool {
+    APPLICABILITY
+        .iter()
+        .find(|row| row.0 == kind)
+        .map(|row| row.1.contains(&loc))
+        .unwrap_or(true)
+}
+
 /// Compose the verbatim operator imperative (Wren's W1 finding). The route
 /// determines the leading verb and the anti-action tail — the load-bearing
 /// two-store asymmetry. The fen-acceptance probe (plan/0073) showed a 4B reads
@@ -92,6 +149,7 @@ pub struct Finding {
     pub store: StoreLoc,
     pub kind: String,
     pub route: Route,
+    pub confidence: Confidence,
     pub explanation: String,
     pub suggestion: String,
 }
@@ -109,9 +167,16 @@ pub struct DetectorInput<'a> {
     pub entry_type: EntryType,
     pub store: StoreLoc,
     pub store_dir: Option<&'a Path>,
-    /// The set of slugs known to exist in the same store (for dangling-link
-    /// resolution on either store).
+    /// The union of slugs known to exist across BOTH stores (call/0045): a
+    /// `[[slug]]` link resolves against the whole memory graph, not one tier.
     pub known_slugs: &'a BTreeSet<String>,
+    /// The per-user tier's declared state, from the repo-side marker.
+    pub tier: TierState,
+    /// The tier marker's provenance line (stamp or retirement date and author),
+    /// empty when the marker is absent; travels into finding explanations.
+    pub tier_provenance: &'a str,
+    /// Whether an initialized per-user store is present on this machine.
+    pub store_present: bool,
 }
 
 impl<'a> DetectorInput<'a> {
@@ -133,20 +198,33 @@ impl<'a> DetectorInput<'a> {
 /// respectively; they need wider context than a single DetectorInput carries.
 pub fn detect(input: &DetectorInput) -> Vec<Finding> {
     let mut out = Vec::new();
-    if let Some(f) = detect_superseded_unlinked(input) {
-        out.push(f);
+    // The applicability table is the single enforcement point (call/0045):
+    // a detector whose declared stores exclude this entry's store is skipped
+    // here, and the coverage lines report the same rows.
+    if applies("superseded-but-unlinked", input.store) {
+        if let Some(f) = detect_superseded_unlinked(input) {
+            out.push(f);
+        }
     }
-    if let Some(f) = detect_dangling_link(input) {
-        out.push(f);
+    if applies("dangling-link", input.store) {
+        if let Some(f) = detect_dangling_link(input) {
+            out.push(f);
+        }
     }
-    if let Some(f) = detect_room_touching(input) {
-        out.push(f);
+    if applies("room-touching", input.store) {
+        if let Some(f) = detect_room_touching(input) {
+            out.push(f);
+        }
     }
-    if let Some(f) = detect_description_body_drift(input) {
-        out.push(f);
+    if applies("description-body-drift", input.store) {
+        if let Some(f) = detect_description_body_drift(input) {
+            out.push(f);
+        }
     }
-    if let Some(f) = detect_stale_state_over_lore(input) {
-        out.push(f);
+    if applies("stale-state-over-lore", input.store) {
+        if let Some(f) = detect_stale_state_over_lore(input) {
+            out.push(f);
+        }
     }
     out
 }
@@ -183,6 +261,7 @@ pub fn detect_superseded_unlinked(input: &DetectorInput) -> Option<Finding> {
         entry_slug: input.slug.clone(),
         store: input.store,
         kind: "superseded-but-unlinked".to_string(),
+        confidence: Confidence::Confirmed,
         route,
         explanation: format!(
             "superseded by `{target}` but no forward link `[[{target}]]` in the body"
@@ -195,34 +274,72 @@ pub fn detect_superseded_unlinked(input: &DetectorInput) -> Option<Finding> {
     })
 }
 
-/// Dangling-link: the body contains `[[slug]]` references where `slug` is not
-/// in the known set for the same store. Same-store by format definition; a
-/// cross-store reference is ordinary prose, not a link.
+/// Dangling-link: the body contains `[[slug]]` references that resolve in
+/// NEITHER store's slug set (the union, call/0045). What an unresolved link
+/// means depends on the tier marker and the store's presence on this machine,
+/// so the one detector carries three states with distinct confidences and
+/// remedies. Every remedy leads with one safe action and keeps the
+/// append-only anti-action tail; a link is never dropped on one machine's
+/// absence alone.
 pub fn detect_dangling_link(input: &DetectorInput) -> Option<Finding> {
-    // Structural, per-user-only. The repo tier keys entries by their dated
-    // `### ` heading slug, so a bare `[[concept]]` ref cannot match by
-    // construction, and `audit_repo_memory` states the per-user structural
-    // detectors do not apply there. Self-guard, as the sibling detectors guard
-    // on their own applicability (`superseded_by`, `type: state`).
-    if !matches!(input.store, StoreLoc::PerUser) {
-        return None;
-    }
     for link in extract_wiki_links(&input.body) {
-        if !input.known_slugs.contains(&link) {
-            let route = DetectorInput::route_for(input.store);
-            return Some(Finding {
-                entry_slug: input.slug.clone(),
-                store: input.store,
-                kind: "dangling-link".to_string(),
-                route,
-                explanation: format!("body links `[[{link}]]` but no entry `{link}` exists in the {} store", input.store.as_str()),
-                suggestion: suggestion_for(
+        if input.known_slugs.contains(&link) {
+            continue;
+        }
+        let route = DetectorInput::route_for(input.store);
+        let (confidence, explanation, suggestion) = match (input.tier, input.store_present) {
+            // Tier declared in use, store absent on this machine: unresolvable
+            // here, possibly real elsewhere. Advisory; the lead action is the
+            // safe no-op.
+            (TierState::Stamped, false) => (
+                Confidence::ReviewPrompt,
+                format!(
+                    "review prompt: body links `[[{link}]]`, which resolves in neither store present on this machine (tier marker: stamped {}; per-user store absent here)",
+                    input.tier_provenance
+                ),
+                format!(
+                    "Leave the `[[{link}]]` link standing and report it. If this machine should carry the per-user store, initialize or seed it; the link may resolve on the machine that carries the store. Do not drop the link on this machine's evidence alone; do not edit the entry in place."
+                ),
+            ),
+            // Tier in use (declared, or a store observed ahead of its stamp),
+            // store present, target missing: dangling within a live graph.
+            (TierState::Stamped, true) | (TierState::Absent, true) => (
+                Confidence::ReviewPrompt,
+                format!(
+                    "review prompt: body links `[[{link}]]`, which resolves in neither the repo log nor the per-user store on this machine"
+                ),
+                suggestion_for(
                     route,
                     &input.slug,
-                    &format!("resolve the broken `[[{link}]]` reference (create the entry `{link}` or drop the link)"),
+                    &format!("resolve the broken `[[{link}]]` reference (create the entry `{link}` or correct the link)"),
                 ),
-            });
-        }
+            ),
+            // Tier never initialized, or declared out of use by retirement:
+            // genuinely dangling, confirmed, with the operator's initialization
+            // fork leading the remedy (call/0045 guardrails).
+            (TierState::Absent, false) | (TierState::Retired, _) => (
+                Confidence::Confirmed,
+                format!(
+                    "body links `[[{link}]]`, which resolves in neither the repo log nor the per-user tier ({})",
+                    match input.tier {
+                        TierState::Retired => format!("tier marker: retired {}", input.tier_provenance),
+                        _ => "tier marker: absent; the tier was never initialized".to_string(),
+                    }
+                ),
+                format!(
+                    "If a per-user store is intended, the operator initializes it and commits the tier marker; these findings then re-tier advisory. Otherwise fix the slug or drop the forward `[[{link}]]` link via a new appended correction to the repo MEMORY.md. Never edit the existing entry in place."
+                ),
+            ),
+        };
+        return Some(Finding {
+            entry_slug: input.slug.clone(),
+            store: input.store,
+            kind: "dangling-link".to_string(),
+            route,
+            confidence,
+            explanation,
+            suggestion,
+        });
     }
     None
 }
@@ -241,13 +358,16 @@ pub fn detect_room_touching(input: &DetectorInput) -> Option<Finding> {
             store: input.store,
             kind: "room-touching".to_string(),
             route: DetectorInput::route_for(input.store),
+            // Review prompt (call/0045): until the applied-receipts cross-check
+            // lands, the supersession is an unverified hypothesis. The label and
+            // the softened lead remedy travel in the prose, because the prose is
+            // what a weak agent obeys (W1).
+            confidence: Confidence::ReviewPrompt,
             explanation: format!(
-                "body cites `{room_ref}`; confirm the record is not superseded by the spine"
+                "review prompt: body cites `{room_ref}`; whether the spine superseded it is unverified until the applied-receipts cross-check lands"
             ),
-            // Bespoke: a room reference routes to MADR, not a memory edit/append.
-            // The imperative names the record and the room action explicitly.
             suggestion: format!(
-                "Confirm the cited record `{room_ref}`; if the spine superseded it, mark `Status: superseded` on the record via an audited MADR commit. Do not edit the memory entry or append to the log."
+                "Leave a review note: confirm whether the cited record `{room_ref}` is still current. Only after operator confirmation is the record marked `Status: superseded` via an audited MADR commit; do not act on this prompt alone. Do not edit the memory entry or append to the log."
             ),
         });
     }
@@ -261,13 +381,9 @@ pub fn detect_room_touching(input: &DetectorInput) -> Option<Finding> {
 /// (only fires on the `not/no` pattern, which is the shape the motivating
 /// failure took).
 pub fn detect_description_body_drift(input: &DetectorInput) -> Option<Finding> {
-    // Per-user-only. This keys on the frontmatter `description:` line, which the
-    // repo format lacks; `audit_repo_memory` feeds the `### ` heading as a
-    // stand-in, so a "not X" heading over a body that discusses X false-positives.
-    // Self-guard, matching the sibling detectors.
-    if !matches!(input.store, StoreLoc::PerUser) {
-        return None;
-    }
+    // Per-user-only by the APPLICABILITY table (the repo format has no
+    // per-entry description field); `detect` enforces the row, so no
+    // self-guard is needed here.
     let d = input.description.to_lowercase();
     let b = input.body.to_lowercase();
     // description says "not X" but body asserts X
@@ -282,6 +398,7 @@ pub fn detect_description_body_drift(input: &DetectorInput) -> Option<Finding> {
                         entry_slug: input.slug.clone(),
                         store: input.store,
                         kind: "description-body-drift".to_string(),
+                        confidence: Confidence::Confirmed,
                         route,
                         explanation: format!(
                             "description says `{neg}{token}` but the body asserts `{token}`"
@@ -334,6 +451,7 @@ pub fn detect_stale_state_over_lore(input: &DetectorInput) -> Option<Finding> {
         entry_slug: input.slug.clone(),
         store: input.store,
         kind: "stale-state-over-lore".to_string(),
+        confidence: Confidence::Confirmed,
         route,
         explanation: "State entry reads done but carries durable measured lore; mark the state superseded with a dated current-state block, do not delete the lore".to_string(),
         suggestion: suggestion_for(
@@ -382,6 +500,7 @@ pub fn detect_workaround_vs_plan<'a>(
                     entry_slug: entry.slug.clone(),
                     store: entry.store,
                     kind: "workaround-vs-plan".to_string(),
+                    confidence: Confidence::Confirmed,
                     route,
                     explanation: format!(
                         "Workaround entry shares a key term with Fact entry `{}` but neither cross-links the other; one may be a fix-of-the-moment the plan supersedes", other.slug
@@ -604,27 +723,95 @@ pub fn run_dream(args: &[String]) -> DreamOutcome {
     }
 }
 
-/// The full audit. Reads the per-user store (memory.rs) and the repo
-/// `MEMORY.md`; runs the detector engine over each entry; returns findings in
-/// detector-declaration order.
-pub fn run_audit(project_dir: &Path) -> Vec<Finding> {
-    let mut findings = Vec::new();
+/// The repo-side tier marker file (call/0045): the per-user tier's declared
+/// in-use state. Tool-written on first observed store (the CLI path stamps
+/// it); retired by the operator (`--retire-marker`); never silently
+/// re-stamped.
+pub const TIER_MARKER_FILE: &str = ".host-memory-tier";
 
-    // Per-user store
-    let home = env::var_os("HOME").map(PathBuf::from);
-    let per_user_store = home
-        .as_ref()
-        .and_then(|h| {
-            MemoryStore::open(&h.join(".host-memory"), project_dir).ok()
-        });
-    let per_user_entries = match &per_user_store {
-        Some(store) => store.list().unwrap_or_default(),
-        None => Vec::new(),
+/// The parsed tier marker: the declared state plus its provenance line (date
+/// and author of the stamp or the retirement), carried into coverage lines
+/// and finding explanations so a possibly-stale latch is judgeable at the
+/// same glance as the finding.
+pub struct TierMarker {
+    pub state: TierState,
+    pub provenance: String,
+}
+
+/// Read the tier marker from the project root. An absent or unreadable file
+/// is the Absent state: failing toward Absent is loud (the confirmed tier),
+/// where failing toward Stamped would silently defuse the teeth.
+pub fn read_tier_marker(project_dir: &Path) -> TierMarker {
+    let Ok(content) = fs::read_to_string(project_dir.join(TIER_MARKER_FILE)) else {
+        return TierMarker { state: TierState::Absent, provenance: String::new() };
     };
-    let per_user_slugs: BTreeSet<String> = per_user_entries
-        .iter()
-        .map(|e| e.slug.clone())
-        .collect();
+    let mut state = TierState::Absent;
+    let mut stamped = String::new();
+    let mut retired = String::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("status") {
+            match v.trim_start_matches([' ', '=']).trim() {
+                "stamped" => state = TierState::Stamped,
+                "retired" => state = TierState::Retired,
+                _ => {}
+            }
+        } else if let Some(v) = line.strip_prefix("stamped") {
+            stamped = v.trim_start_matches([' ', '=']).trim().to_string();
+        } else if let Some(v) = line.strip_prefix("retired") {
+            retired = v.trim_start_matches([' ', '=']).trim().to_string();
+        }
+    }
+    let provenance = match state {
+        TierState::Retired => retired,
+        _ => stamped,
+    };
+    TierMarker { state, provenance }
+}
+
+/// The full audit. Reads the per-user store (memory.rs), the repo `MEMORY.md`,
+/// and the tier marker; resolves links against the union of both stores; runs
+/// the detector engine over each entry; returns findings in
+/// detector-declaration order, per-user tier first.
+pub fn run_audit(project_dir: &Path) -> Vec<Finding> {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    run_audit_with_home(project_dir, home.as_deref())
+}
+
+/// The audit core with an explicit home (testable without env mutation). Pure
+/// read-side: the marker STAMP is a write and happens only in the CLI path,
+/// so the MCP consolidate surface stays read-only. Detection treats an
+/// observed-but-unstamped store as in use; the stamp is the durable record
+/// for other machines, not the detection input.
+pub fn run_audit_with_home(project_dir: &Path, home: Option<&Path>) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let marker = read_tier_marker(project_dir);
+
+    // Per-user store: `open` always succeeds (lazy materialization), so the
+    // presence signal is the directory itself.
+    let per_user_store = home.and_then(|h| MemoryStore::open(&h.join(".host-memory"), project_dir).ok());
+    let store_present = per_user_store.as_ref().map(|s| s.dir().exists()).unwrap_or(false);
+    let per_user_entries = match &per_user_store {
+        Some(store) if store_present => store.list().unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    // The union slug set (call/0045): a [[link]] resolves against the whole
+    // memory graph, not one tier.
+    let repo_memory = project_dir.join("MEMORY.md");
+    let repo_content = fs::read_to_string(&repo_memory).unwrap_or_default();
+    let repo_entries = parse_repo_memory_sections(&repo_content);
+    let mut union_slugs: BTreeSet<String> = per_user_entries.iter().map(|e| e.slug.clone()).collect();
+    for e in &repo_entries {
+        union_slugs.insert(e.slug.clone());
+    }
+
+    // The marker contradiction (call/0045): a store observed after retirement
+    // surfaces as a confirmed finding, never a silent re-stamp.
+    if store_present && marker.state == TierState::Retired {
+        findings.push(marker_contradiction_finding(&marker));
+    }
+
     let per_user_inputs: Vec<DetectorInput> = per_user_entries
         .iter()
         .map(|entry| DetectorInput {
@@ -635,54 +822,20 @@ pub fn run_audit(project_dir: &Path) -> Vec<Finding> {
             entry_type: entry.entry_type.clone(),
             store: StoreLoc::PerUser,
             store_dir: per_user_store.as_ref().map(|s| s.dir()),
-            known_slugs: &per_user_slugs,
+            known_slugs: &union_slugs,
+            tier: marker.state,
+            tier_provenance: &marker.provenance,
+            store_present,
         })
         .collect();
     for input in &per_user_inputs {
         findings.extend(detect(input));
     }
-    // Cross-entry detectors need a stable slice; rebuild with the per-user
-    // slugs BTreeSet outliving the call by tying it to the outer scope.
-    let per_user_inputs_ref: Vec<DetectorInput> = per_user_entries
-        .iter()
-        .map(|entry| DetectorInput {
-            slug: entry.slug.clone(),
-            description: entry.description.clone(),
-            body: entry.body.clone(),
-            superseded_by: entry.superseded_by.clone(),
-            entry_type: entry.entry_type.clone(),
-            store: StoreLoc::PerUser,
-            store_dir: per_user_store.as_ref().map(|s| s.dir()),
-            known_slugs: &per_user_slugs,
-        })
-        .collect();
-    findings.extend(detect_cross(&per_user_inputs_ref));
+    findings.extend(detect_cross(&per_user_inputs));
 
-    // Repo MEMORY.md (the append-only tier). Read entries at the section level;
-    // each `### ` heading begins a new entry. Cross-reference the same detectors
-    // that make sense for the repo format.
-    let repo_memory = project_dir.join("MEMORY.md");
-    let repo_findings = audit_repo_memory(&repo_memory);
-    findings.extend(repo_findings);
-
-    findings
-}
-
-/// The repo MEMORY.md audit. The repo format is `### <heading>` per entry
-/// with bullets underneath (no YAML frontmatter per entry); the structural
-/// per-user detectors do not apply. The room-touching detector and the
-/// append-only-violation detector are the load-bearing ones here.
-fn audit_repo_memory(path: &Path) -> Vec<Finding> {
-    let mut out = Vec::new();
-    let Ok(content) = fs::read_to_string(path) else {
-        return out;
-    };
-    let mut all_slugs: BTreeSet<String> = BTreeSet::new();
-    let entries = parse_repo_memory_sections(&content);
-    for e in &entries {
-        all_slugs.insert(e.slug.clone());
-    }
-    for entry in &entries {
+    // Repo MEMORY.md (the append-only tier), through the same engine and the
+    // same union; the applicability table decides which detectors run here.
+    for entry in &repo_entries {
         let input = DetectorInput {
             slug: entry.slug.clone(),
             description: entry.heading.clone(),
@@ -691,14 +844,34 @@ fn audit_repo_memory(path: &Path) -> Vec<Finding> {
             entry_type: EntryType::Fact,
             store: StoreLoc::Repo,
             store_dir: None,
-            known_slugs: &all_slugs,
+            known_slugs: &union_slugs,
+            tier: marker.state,
+            tier_provenance: &marker.provenance,
+            store_present,
         };
-        out.extend(detect(&input));
+        findings.extend(detect(&input));
     }
     // Append-only-violation: scan git history of MEMORY.md for in-place body
     // edits to existing sections. Returns one finding per edited section.
-    out.extend(detect_append_only_violations(path));
-    out
+    findings.extend(detect_append_only_violations(&repo_memory));
+    findings
+}
+
+/// The marker-contradiction finding. The spec's `Finding.entry` is null here;
+/// the printed locus is the marker itself.
+fn marker_contradiction_finding(marker: &TierMarker) -> Finding {
+    Finding {
+        entry_slug: "tier-marker".to_string(),
+        store: StoreLoc::Repo,
+        kind: "marker-contradiction".to_string(),
+        route: Route::Append,
+        confidence: Confidence::Confirmed,
+        explanation: format!(
+            "a per-user store is present on this machine but the tier marker is retired ({})",
+            marker.provenance
+        ),
+        suggestion: "The tier marker was retired but a per-user store exists here. The operator either re-opts in (append a correction that records the decision, remove the retired marker, and let the next dream run re-stamp) or removes the per-user store. Never edit the marker to stamped by hand.".to_string(),
+    }
 }
 
 /// Append-only-violation: HEURISTIC, HISTORY-BASED. An in-place edit to an
@@ -777,6 +950,7 @@ fn detect_append_only_violations(path: &Path) -> Vec<Finding> {
             entry_slug: slugify(&section),
             store: StoreLoc::Repo,
             kind: "append-only-violation".to_string(),
+            confidence: Confidence::Confirmed,
             route: Route::Append,
             explanation: format!(
                 "section `{section}` has body removals in git history; the repo MEMORY.md is append-only (CLAUDE.md section 6); if the body changed, append a correction with a forward [[link]] instead"
@@ -920,6 +1094,9 @@ mod tests {
             store: StoreLoc::PerUser,
             store_dir: None,
             known_slugs: slugs,
+            tier: TierState::Stamped,
+            tier_provenance: "",
+            store_present: true,
         }
     }
 
@@ -1044,15 +1221,17 @@ mod tests {
     }
 
     #[test]
-    fn dangling_link_is_per_user_only_not_repo() {
-        // Repo entries key by dated `### ` heading slug, so a bare `[[concept]]`
-        // ref cannot match; the detector must not fire on the repo tier.
-        let slugs = known(&["alpha"]);
-        let inp = repo_input("alpha", "x", "See [[specs-colocate-with-software]] which is missing.", &slugs);
-        let fs = detect(&inp);
-        assert!(!fs.iter().any(|f| f.kind == "dangling-link"));
-        // Still fires on the per-user tier.
-        let per_user = input("alpha", "x", "See [[beta]] which is missing.", &slugs);
+    fn dangling_resolves_against_union_not_one_store() {
+        // call/0045: a [[link]] resolves against the union of both stores, so
+        // a per-user concept slug satisfies a repo link.
+        let slugs = known(&["alpha", "specs-colocate-with-software"]);
+        let inp = repo_input("alpha", "x", "See [[specs-colocate-with-software]].", &slugs);
+        assert!(!detect(&inp).iter().any(|f| f.kind == "dangling-link"));
+        // Unresolved in the union still fires, on either tier.
+        let missing = known(&["alpha"]);
+        let repo = repo_input("alpha", "x", "See [[specs-colocate-with-software]].", &missing);
+        assert!(detect(&repo).iter().any(|f| f.kind == "dangling-link"));
+        let per_user = input("alpha", "x", "See [[beta]] which is missing.", &missing);
         assert!(detect(&per_user).iter().any(|f| f.kind == "dangling-link"));
     }
 
