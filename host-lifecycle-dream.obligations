@@ -37,8 +37,8 @@ transition-edge.Dream.dreaming.findings        => test:dream_transition_dreaming
 transition-edge.Dream.dreaming.error           => test:dream_transition_dreaming_to_error exercises=dream
 transition-rejected.Dream.status               => structural
 transition-terminal.Dream.status               => structural
-transition-edge.TierMarker.absent.stamped      => test:marker_transition_absent_to_stamped exercises=dream
-transition-edge.TierMarker.stamped.retired     => test:marker_transition_stamped_to_retired exercises=dream
+transition-edge.TierMarker.absent.stamped      => test:marker_transition_absent_to_stamped exercises=stamp_if_observed
+transition-edge.TierMarker.stamped.retired     => test:marker_transition_stamped_to_retired exercises=retire_marker
 transition-rejected.TierMarker.status          => structural
 transition-terminal.TierMarker.status          => structural
 surface-actor.DreamRun                         => structural
@@ -84,13 +84,13 @@ rule-failure.DetectAppendOnlyViolation.1       => test:dream_clean_on_clean_repo
 rule-entity-creation.DetectAppendOnlyViolation.1 => test:dream_append_only_violation_finding_created exercises=detect
 
 # --- Tier-marker lifecycle (call/0045) ---
-rule-success.StampMarker                       => test:marker_stamps_on_observed_store exercises=dream
-rule-failure.StampMarker.1                     => test:marker_stamp_only_from_absent exercises=dream
-rule-success.RetireMarker                      => test:marker_retires_from_stamped exercises=dream
-rule-failure.RetireMarker.1                    => test:marker_retire_only_from_stamped exercises=dream
-rule-success.MarkerContradiction               => test:marker_contradiction_after_retirement exercises=dream
-rule-failure.MarkerContradiction.1             => test:marker_no_contradiction_before_retirement exercises=dream
-rule-entity-creation.MarkerContradiction.1     => test:marker_contradiction_finding_created exercises=dream
+rule-success.StampMarker                       => test:marker_stamps_on_observed_store exercises=stamp_if_observed
+rule-failure.StampMarker.1                     => test:marker_stamp_only_from_absent exercises=stamp_if_observed
+rule-success.RetireMarker                      => test:marker_retires_from_stamped exercises=retire_marker
+rule-failure.RetireMarker.1                    => test:marker_retire_only_from_stamped exercises=retire_marker
+rule-success.MarkerContradiction               => test:marker_contradiction_after_retirement exercises=run_audit_with_home
+rule-failure.MarkerContradiction.1             => test:marker_no_contradiction_before_retirement exercises=run_audit_with_home
+rule-entity-creation.MarkerContradiction.1     => test:marker_contradiction_finding_created exercises=run_audit_with_home
 
 # --- Verdict lifecycle ---
 rule-success.StartDream                        => test:dream_start_inits_latch_and_status exercises=dream

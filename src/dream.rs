@@ -1411,6 +1411,298 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    // --- The write-tests matrix (plan/0076): states, kinds, exits ---
+
+    #[test]
+    fn marker_transition_absent_to_stamped() {
+        let proj = tmp_fixture("edge-stamp", "# M\n\n### E\n\nClean.\n");
+        let home = tmp_dir("edge-stamp-home");
+        materialized_store(&home, &proj);
+        assert_eq!(read_tier_marker(&proj).state, TierState::Absent);
+        stamp_if_observed(&proj, Some(&home)).expect("stamp");
+        assert_eq!(read_tier_marker(&proj).state, TierState::Stamped);
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn marker_transition_stamped_to_retired() {
+        let proj = tmp_fixture("edge-retire", "# M\n\n### E\n\nClean.\n");
+        let home = tmp_dir("edge-retire-home");
+        materialized_store(&home, &proj);
+        stamp_if_observed(&proj, Some(&home)).expect("stamp");
+        retire_marker(&proj).expect("retire");
+        assert_eq!(read_tier_marker(&proj).state, TierState::Retired);
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn marker_stamp_only_from_absent() {
+        let proj = tmp_fixture("stamp-guard", "# M\n\n### E\n\nClean.\n");
+        let home = tmp_dir("stamp-guard-home");
+        materialized_store(&home, &proj);
+        stamp_if_observed(&proj, Some(&home)).expect("first stamp");
+        // Stamped: no re-stamp. Retired: no re-stamp either.
+        assert!(stamp_if_observed(&proj, Some(&home)).is_none());
+        retire_marker(&proj).expect("retire");
+        assert!(stamp_if_observed(&proj, Some(&home)).is_none());
+        assert_eq!(read_tier_marker(&proj).state, TierState::Retired);
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn marker_retire_only_from_stamped() {
+        let proj = tmp_fixture("retire-guard", "# M\n\n### E\n\nClean.\n");
+        let home = tmp_dir("retire-guard-home");
+        // Absent: refuse.
+        assert!(retire_marker(&proj).is_err());
+        materialized_store(&home, &proj);
+        stamp_if_observed(&proj, Some(&home)).expect("stamp");
+        retire_marker(&proj).expect("retire from stamped");
+        // Retired: refuse again.
+        assert!(retire_marker(&proj).is_err());
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn marker_no_contradiction_before_retirement() {
+        let proj = tmp_fixture("no-contradict", "# M\n\n### E\n\nClean.\n");
+        let home = tmp_dir("no-contradict-home");
+        materialized_store(&home, &proj);
+        stamp_if_observed(&proj, Some(&home)).expect("stamp");
+        let findings = run_audit_with_home(&proj, Some(&home));
+        assert!(!findings.iter().any(|f| f.kind == "marker-contradiction"));
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn marker_contradiction_finding_created() {
+        let proj = tmp_fixture("contradict-shape", "# M\n\n### E\n\nClean.\n");
+        let home = tmp_dir("contradict-shape-home");
+        materialized_store(&home, &proj);
+        stamp_if_observed(&proj, Some(&home)).expect("stamp");
+        retire_marker(&proj).expect("retire");
+        let findings = run_audit_with_home(&proj, Some(&home));
+        let f = findings.iter().find(|f| f.kind == "marker-contradiction").expect("finding");
+        assert_eq!(f.entry_slug, "tier-marker");
+        assert_eq!(f.store, StoreLoc::Repo);
+        assert_eq!(f.route, Route::Append);
+        assert_eq!(f.confidence, Confidence::Confirmed);
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn drift_finding_created_per_user_only() {
+        // The APPLICABILITY row (repo has no per-entry description) is the
+        // enforcement: the same drifting text fires per-user and not on repo.
+        let slugs = known(&["alpha"]);
+        let per_user = input("alpha", "not stabilized yet", "The API is stabilized.", &slugs);
+        let f = detect(&per_user)
+            .into_iter()
+            .find(|f| f.kind == "description-body-drift")
+            .expect("per-user drift finding");
+        assert_eq!(f.confidence, Confidence::Confirmed);
+        assert_eq!(f.route, Route::Edit);
+        let repo = repo_input("alpha", "not stabilized yet", "The API is stabilized.", &slugs);
+        assert!(!detect(&repo).iter().any(|f| f.kind == "description-body-drift"));
+    }
+
+    #[test]
+    fn dangling_confirmed_without_marker() {
+        let slugs = known(&["alpha"]);
+        let mut inp = repo_input("alpha", "x", "See [[missing-concept]].", &slugs);
+        inp.tier = TierState::Absent;
+        inp.store_present = false;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("dangling finding");
+        assert_eq!(f.confidence, Confidence::Confirmed);
+        // Retirement re-escalates to confirmed too (the recorded pressure valve).
+        let mut retired = repo_input("alpha", "x", "See [[missing-concept]].", &slugs);
+        retired.tier = TierState::Retired;
+        retired.store_present = false;
+        let f2 = detect(&retired)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("dangling finding under retirement");
+        assert_eq!(f2.confidence, Confidence::Confirmed);
+    }
+
+    #[test]
+    fn dangling_not_confirmed_when_marker_present() {
+        let slugs = known(&["alpha"]);
+        let mut inp = repo_input("alpha", "x", "See [[missing-concept]].", &slugs);
+        inp.tier = TierState::Stamped;
+        inp.store_present = false;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("dangling finding");
+        assert_eq!(f.confidence, Confidence::ReviewPrompt);
+    }
+
+    #[test]
+    fn dangling_confirmed_finding_created() {
+        let slugs = known(&["alpha"]);
+        let mut inp = repo_input("alpha", "x", "See [[missing-concept]].", &slugs);
+        inp.tier = TierState::Absent;
+        inp.store_present = false;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("finding");
+        assert_eq!(f.route, Route::Append);
+        // The remedy leads with the operator's initialization fork and keeps
+        // the append-only anti-action tail (call/0045 guardrails).
+        assert!(f.suggestion.starts_with("If a per-user store is intended, the operator initializes"),
+            "initialization fork must lead: {}", f.suggestion);
+        assert!(f.suggestion.contains("appended correction"), "append-only action: {}", f.suggestion);
+        assert!(f.suggestion.contains("Never edit the existing entry in place"), "anti-edit tail: {}", f.suggestion);
+    }
+
+    #[test]
+    fn dangling_advisory_when_store_absent_here() {
+        let slugs = known(&["alpha"]);
+        let mut inp = repo_input("alpha", "x", "See [[missing-concept]].", &slugs);
+        inp.tier = TierState::Stamped;
+        inp.tier_provenance = "2026-07-22 t@t";
+        inp.store_present = false;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("finding");
+        assert_eq!(f.confidence, Confidence::ReviewPrompt);
+        // The lead action is the safe no-op, and a drop on one machine's
+        // evidence is forbidden in the string itself.
+        assert!(f.suggestion.starts_with("Leave the"), "safe no-op leads: {}", f.suggestion);
+        assert!(f.suggestion.contains("Do not drop the link on this machine's evidence alone"),
+            "machine-local drop forbidden: {}", f.suggestion);
+    }
+
+    #[test]
+    fn dangling_uninitialized_requires_marker() {
+        // The uninitialized-here shape exists only under a stamped marker:
+        // with the marker absent the same evidence is the confirmed state.
+        let slugs = known(&["alpha"]);
+        let mut inp = repo_input("alpha", "x", "See [[missing-concept]].", &slugs);
+        inp.tier = TierState::Absent;
+        inp.store_present = false;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("finding");
+        assert!(!f.suggestion.starts_with("Leave the"), "not the uninitialized shape: {}", f.suggestion);
+        assert_eq!(f.confidence, Confidence::Confirmed);
+    }
+
+    #[test]
+    fn dangling_uninitialized_finding_created() {
+        let slugs = known(&["alpha"]);
+        let mut inp = repo_input("alpha", "x", "See [[missing-concept]].", &slugs);
+        inp.tier = TierState::Stamped;
+        inp.tier_provenance = "2026-07-22 t@t";
+        inp.store_present = false;
+        let f = detect(&inp)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("finding");
+        assert_eq!(f.route, Route::Append);
+        assert!(f.explanation.contains("per-user store absent here"), "state named: {}", f.explanation);
+        assert!(f.explanation.contains("stamped 2026-07-22 t@t"), "provenance travels: {}", f.explanation);
+    }
+
+    #[test]
+    fn dangling_advisory_when_entry_missing() {
+        // Default helper context: stamped marker, store present.
+        let slugs = known(&["alpha"]);
+        let per_user = input("alpha", "x", "See [[beta]] which is missing.", &slugs);
+        let f = detect(&per_user)
+            .into_iter()
+            .find(|f| f.kind == "dangling-link")
+            .expect("finding");
+        assert_eq!(f.confidence, Confidence::ReviewPrompt);
+        assert!(f.suggestion.starts_with("Edit"), "per-user entry-missing edits in place: {}", f.suggestion);
+    }
+
+    #[test]
+    fn dangling_confirmed_only_with_marker_absent() {
+        // The invariant sweep: across the state matrix, confirmed dangling
+        // holds only while the tier is not in use (absent or retired).
+        let slugs = known(&["alpha"]);
+        let matrix = [
+            (TierState::Absent, false, Confidence::Confirmed),
+            (TierState::Retired, false, Confidence::Confirmed),
+            (TierState::Retired, true, Confidence::Confirmed),
+            (TierState::Stamped, false, Confidence::ReviewPrompt),
+            (TierState::Stamped, true, Confidence::ReviewPrompt),
+            (TierState::Absent, true, Confidence::ReviewPrompt),
+        ];
+        for (tier, present, expect) in matrix {
+            let mut inp = repo_input("alpha", "x", "See [[missing-concept]].", &slugs);
+            inp.tier = tier;
+            inp.store_present = present;
+            let f = detect(&inp)
+                .into_iter()
+                .find(|f| f.kind == "dangling-link")
+                .expect("finding");
+            assert_eq!(f.confidence, expect, "state ({tier:?}, store_present={present})");
+        }
+    }
+
+    #[test]
+    fn dream_confirmed_latch_sets() {
+        // A confirmed finding pushes the verdict to findings (exit 1).
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee [[missing-note]] here.\n", false);
+        assert!(outcome.findings.iter().any(|f| f.confidence == Confidence::Confirmed));
+        assert_eq!(outcome.exit_code, 1);
+    }
+
+    #[test]
+    fn dream_confirmed_latch_guarded() {
+        // Review prompts alone never set the confirmed latch: advisory exit.
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        assert!(!outcome.findings.iter().any(|f| f.confidence == Confidence::Confirmed));
+        assert_eq!(outcome.exit_code, 3);
+    }
+
+    #[test]
+    fn dream_verdict_advisory_on_review_prompt_only() {
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee plan/0042 for context.\n", false);
+        assert!(!outcome.findings.is_empty());
+        assert_eq!(outcome.exit_code, 3);
+    }
+
+    #[test]
+    fn dream_no_false_advisory_verdict() {
+        // Clean is 0, not 3; confirmed is 1, not 3.
+        let clean = dream_outcome("# M\n\n## L\n\n### X\n\nClean.\n", false);
+        assert_ne!(clean.exit_code, 3);
+        let confirmed = dream_outcome("# M\n\n## L\n\n### X\n\nSee [[missing-note]].\n", false);
+        assert_ne!(confirmed.exit_code, 3);
+    }
+
+    #[test]
+    fn advisory_verdict_never_saw_confirmed() {
+        // Invariant: an advisory verdict implies no confirmed finding.
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee call/0017.\n", false);
+        assert_eq!(outcome.exit_code, 3);
+        assert!(!outcome.findings.iter().any(|f| f.confidence == Confidence::Confirmed));
+    }
+
+    #[test]
+    fn findings_verdict_implies_confirmed() {
+        // Invariant: a findings verdict rests on at least one confirmed finding.
+        let outcome = dream_outcome("# M\n\n## L\n\n### X\n\nSee [[missing-note]].\n", false);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(outcome.findings.iter().any(|f| f.confidence == Confidence::Confirmed));
+    }
+
     // --- Helper tests (not in the obligations manifest) ---
 
     #[test]
