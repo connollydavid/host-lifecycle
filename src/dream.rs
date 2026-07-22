@@ -646,11 +646,13 @@ pub struct DreamOutcome {
 pub fn run_dream(args: &[String]) -> DreamOutcome {
     let mut fix_mode = false;
     let mut json = false;
+    let mut retire = false;
     let mut dir: PathBuf = PathBuf::from(".");
     for a in args {
         match a.as_str() {
             "--fix" => fix_mode = true,
             "--json" => json = true,
+            "--retire-marker" => retire = true,
             "-h" | "--help" => {
                 print_help();
                 return DreamOutcome {
@@ -686,6 +688,28 @@ pub fn run_dream(args: &[String]) -> DreamOutcome {
             };
         }
     };
+
+    // The operator's retirement act (call/0045): only from stamped, and the
+    // owed appended correction is named in the output. No audit runs.
+    if retire {
+        return match retire_marker(&dir) {
+            Ok(line) => {
+                eprintln!("host-lifecycle {line}");
+                DreamOutcome { exit_code: 0, findings: Vec::new(), fix_mode, json }
+            }
+            Err(e) => {
+                eprintln!("host-lifecycle dream: {e}");
+                DreamOutcome { exit_code: 2, findings: Vec::new(), fix_mode, json }
+            }
+        };
+    }
+
+    // The stamp (call/0045): dream's sole sanctioned repo-side write, CLI path
+    // only, loud so the operator commits it.
+    let home = env::var_os("HOME").map(PathBuf::from);
+    if let Some(line) = stamp_if_observed(&dir, home.as_deref()) {
+        eprintln!("host-lifecycle {line}");
+    }
 
     let findings = run_audit(&dir);
 
@@ -767,6 +791,89 @@ pub fn read_tier_marker(project_dir: &Path) -> TierMarker {
         _ => stamped,
     };
     TierMarker { state, provenance }
+}
+
+/// Stamp the tier marker if an initialized per-user store is observed on this
+/// machine and the marker is absent (call/0045): dream's sole sanctioned
+/// repo-side write, performed only in the CLI path. Returns the loud line to
+/// print so the operator commits the stamp (operator-attributable: the tool
+/// writes the file, the operator commits it). No-op under any other marker
+/// state; retirement is never overwritten (the contradiction finding carries
+/// that case).
+pub fn stamp_if_observed(project_dir: &Path, home: Option<&Path>) -> Option<String> {
+    let marker = read_tier_marker(project_dir);
+    if marker.state != TierState::Absent {
+        return None;
+    }
+    let store = home.and_then(|h| MemoryStore::open(&h.join(".host-memory"), project_dir).ok())?;
+    if !store.dir().exists() {
+        return None;
+    }
+    let provenance = provenance_line(project_dir);
+    let content = format!(
+        "# The per-user memory tier's in-use marker (call/0045). Tool-written by\n\
+         # `host-lifecycle dream` when it first observes an initialized store on a\n\
+         # machine; retire via `host-lifecycle dream --retire-marker` (an operator\n\
+         # act, recorded as an appended MEMORY.md correction). Never hand-edit.\n\
+         status  = stamped\n\
+         stamped = {provenance}\n"
+    );
+    if fs::write(project_dir.join(TIER_MARKER_FILE), content).is_err() {
+        return None;
+    }
+    Some(format!(
+        "dream: stamped the per-user tier marker ({TIER_MARKER_FILE}, {provenance}); commit it — the tier is now declared in use"
+    ))
+}
+
+/// Retire the tier marker: the operator's act, invoked via `--retire-marker`.
+/// Only from the stamped state; the returned line names the appended
+/// correction the operator owes. Refuses when there is nothing to retire.
+pub fn retire_marker(project_dir: &Path) -> Result<String, String> {
+    let marker = read_tier_marker(project_dir);
+    match marker.state {
+        TierState::Stamped => {}
+        TierState::Absent => return Err("no tier marker to retire (the tier was never declared in use)".to_string()),
+        TierState::Retired => return Err(format!("the tier marker is already retired ({})", marker.provenance)),
+    }
+    let provenance = provenance_line(project_dir);
+    let content = format!(
+        "# The per-user memory tier's in-use marker (call/0045). RETIRED: the\n\
+         # operator declared the tier out of use. A store observed after retirement\n\
+         # is a contradiction finding, never a silent re-stamp. Never hand-edit.\n\
+         status  = retired\n\
+         stamped = {}\n\
+         retired = {provenance}\n",
+        marker.provenance
+    );
+    fs::write(project_dir.join(TIER_MARKER_FILE), content)
+        .map_err(|e| format!("cannot write {TIER_MARKER_FILE}: {e}"))?;
+    Ok(format!(
+        "dream: retired the per-user tier marker ({provenance}). Record the retirement as a new dated MEMORY.md entry and commit both; unresolved cross-store links re-tier confirmed from here"
+    ))
+}
+
+/// The stamp/retirement provenance: date plus the git author, so the marker is
+/// operator-attributable and its age judgeable at a glance.
+fn provenance_line(project_dir: &Path) -> String {
+    let date = std::process::Command::new("date")
+        .arg("+%F")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown-date".to_string());
+    let who = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_dir)
+        .args(["config", "user.email"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-author".to_string());
+    format!("{date} {who}")
 }
 
 /// The full audit. Reads the per-user store (memory.rs), the repo `MEMORY.md`,
@@ -1020,10 +1127,11 @@ fn slugify(s: &str) -> String {
 }
 
 fn print_help() {
-    eprintln!("usage: host-lifecycle dream [<dir>] [--fix] [--json]");
-    eprintln!("  --fix    refuse the repo store; apply the structural-safe class to per-user (none yet)");
-    eprintln!("  --json   machine-readable findings");
-    eprintln!("  -h, --help  this help");
+    eprintln!("usage: host-lifecycle dream [<dir>] [--fix] [--json] [--retire-marker]");
+    eprintln!("  --fix            refuse the repo store; apply the structural-safe class to per-user (none yet)");
+    eprintln!("  --json           machine-readable findings");
+    eprintln!("  --retire-marker  operator act: declare the per-user tier out of use (record the appended correction)");
+    eprintln!("  -h, --help       this help");
 }
 
 fn print_text(findings: &[Finding]) {
@@ -1113,6 +1221,88 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("MEMORY.md"), memory_md).unwrap();
         dir
+    }
+
+    // --- Tier-marker lifecycle (plan/0076 #implement-marker) ---
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dream-{name}-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn materialized_store(home: &Path, proj: &Path) -> PathBuf {
+        let store = MemoryStore::open(&home.join(".host-memory"), proj).unwrap();
+        fs::create_dir_all(store.dir()).unwrap();
+        store.dir().to_path_buf()
+    }
+
+    #[test]
+    fn marker_stamps_on_observed_store() {
+        let proj = tmp_fixture("stamp", "# M\n\n### E\n\nClean.\n");
+        let home = tmp_dir("stamp-home");
+        // No store yet: no stamp.
+        assert!(stamp_if_observed(&proj, Some(&home)).is_none());
+        assert_eq!(read_tier_marker(&proj).state, TierState::Absent);
+        // Store observed: stamp, with provenance, loudly.
+        materialized_store(&home, &proj);
+        let msg = stamp_if_observed(&proj, Some(&home)).expect("stamp on observed store");
+        assert!(msg.contains(TIER_MARKER_FILE), "message names the file: {msg}");
+        let marker = read_tier_marker(&proj);
+        assert_eq!(marker.state, TierState::Stamped);
+        assert!(!marker.provenance.is_empty());
+        // A second run does not re-stamp.
+        assert!(stamp_if_observed(&proj, Some(&home)).is_none());
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn marker_retires_from_stamped() {
+        let proj = tmp_fixture("retire", "# M\n\n### E\n\nClean.\n");
+        let home = tmp_dir("retire-home");
+        // Nothing to retire before any stamp: refuse.
+        assert!(retire_marker(&proj).is_err());
+        materialized_store(&home, &proj);
+        stamp_if_observed(&proj, Some(&home)).expect("stamp");
+        let line = retire_marker(&proj).expect("retire from stamped");
+        assert!(line.contains("MEMORY.md"), "names the owed appended correction: {line}");
+        let marker = read_tier_marker(&proj);
+        assert_eq!(marker.state, TierState::Retired);
+        assert!(!marker.provenance.is_empty());
+        // Already retired: refuse; and no silent re-stamp.
+        assert!(retire_marker(&proj).is_err());
+        assert!(stamp_if_observed(&proj, Some(&home)).is_none());
+        assert_eq!(read_tier_marker(&proj).state, TierState::Retired);
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn marker_contradiction_after_retirement() {
+        let proj = tmp_fixture("contradict", "# M\n\n### E\n\nClean.\n");
+        let home = tmp_dir("contradict-home");
+        let store_dir = materialized_store(&home, &proj);
+        stamp_if_observed(&proj, Some(&home)).expect("stamp");
+        retire_marker(&proj).expect("retire");
+        // Store still present after retirement: confirmed contradiction finding.
+        let findings = run_audit_with_home(&proj, Some(&home));
+        let f = findings
+            .iter()
+            .find(|f| f.kind == "marker-contradiction")
+            .expect("contradiction finding");
+        assert_eq!(f.confidence, Confidence::Confirmed);
+        assert!(f.suggestion.contains("Never edit the marker"), "anti-hand-edit tail: {}", f.suggestion);
+        // Store removed: the contradiction clears.
+        fs::remove_dir_all(&store_dir).unwrap();
+        let findings = run_audit_with_home(&proj, Some(&home));
+        assert!(!findings.iter().any(|f| f.kind == "marker-contradiction"));
+        let _ = fs::remove_dir_all(&proj);
+        let _ = fs::remove_dir_all(&home);
     }
 
     // --- Helper tests (not in the obligations manifest) ---
