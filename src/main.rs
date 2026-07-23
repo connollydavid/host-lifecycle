@@ -6092,7 +6092,7 @@ fn read_workflows(worktree: &Path) -> String {
     text
 }
 
-/// `obligations <spec.allium> [--manifest <f>] [--tests <dir>] [--prove <dir>]` —
+/// `obligations <spec.allium> [--manifest <f>] [--tests <dir>]… [--prove <dir>]` —
 /// the remap-dictionary discipline for tests: every obligation `allium plan` derives
 /// from the spec MUST be dispositioned in the sibling `<stem>.obligations`
 /// manifest. Each line is `<id> => <disposition>`, where the disposition is
@@ -6158,7 +6158,10 @@ fn discharge_problems(spec: &Path, manifest: &Path) -> Result<Vec<String>, Strin
 fn obligations(args: &[String]) {
     let mut pos: Vec<&String> = Vec::new();
     let mut manifest_arg: Option<&String> = None;
-    let mut tests_arg: Option<&String> = None;
+    // Repeatable: a crate can hold its unit tests beside the code and its
+    // process-level tests in `tests/`, and an obligation is discharged wherever its
+    // test actually lives. One dir made a manifest choose which half to see.
+    let mut tests_dirs: Vec<&String> = Vec::new();
     let mut prove_arg: Option<&String> = None;
     let mut rederive_arg: Option<&String> = None;
     let mut record_digests_flag = false;
@@ -6171,7 +6174,9 @@ fn obligations(args: &[String]) {
                 i += 1;
             }
             "--tests" => {
-                tests_arg = args.get(i + 1);
+                if let Some(d) = args.get(i + 1) {
+                    tests_dirs.push(d);
+                }
                 i += 1;
             }
             "--prove" => {
@@ -6189,7 +6194,7 @@ fn obligations(args: &[String]) {
         i += 1;
     }
     let Some(spec) = pos.first() else {
-        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>] [--prove <dir>] [--rederive <dir>] [--record-digests] [--strict-discharge]");
+        eprintln!("host-lifecycle obligations <spec.allium> [--manifest <file>] [--tests <dir>]... [--prove <dir>] [--rederive <dir>] [--record-digests] [--strict-discharge]");
         process::exit(2);
     };
     if record_digests_flag && rederive_arg.is_none() {
@@ -6222,7 +6227,11 @@ fn obligations(args: &[String]) {
             process::exit(2);
         }
     };
-    let tests = tests_arg.map(|d| read_dir_recursive(Path::new(d.as_str())));
+    let tests = if tests_dirs.is_empty() {
+        None
+    } else {
+        Some(tests_dirs.iter().map(|d| read_dir_recursive(Path::new(d.as_str()))).collect::<Vec<_>>().join("\n"))
+    };
     let prove = prove_arg.map(|d| read_dir_recursive(Path::new(d.as_str())));
     // 3. Every obligation dispositioned; no stale dispositions; test/proof refs present (a
     //    presence *lint*, not discharge — #8). With `--rederive`, each rung's verifier is
@@ -10208,6 +10217,19 @@ mod software_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    // verify-build refreshes the fingerprint at its own call site and appends no
+    // receipt: confirming a rebuild is a state change, not a lifecycle event.
+    #[test]
+    fn verify_build_refreshes_the_envhash() {
+        let base = std::env::temp_dir().join(format!("hl-vbenv-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        software_verify_build(&base, &[]);
+        assert!(base.join(envhash::ENVHASH).is_file(), "the op recorded the fingerprint");
+        assert!(!base.join(LIFECYCLE_RECEIPTS).exists(), "and appended no provenance");
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // === plan/0074: the shared call site, and what each concern writes there ===
 
     // One materialize call produces BOTH artifacts, and they share no field name:
@@ -10240,17 +10262,22 @@ mod software_tests {
         let receipt = fs::read_to_string(host.join(LIFECYCLE_RECEIPTS)).expect("the event was recorded");
         let fingerprint = fs::read_to_string(host.join(envhash::ENVHASH)).expect("the state was recorded");
 
-        // Field names, one artifact against the other: the two sets are disjoint, so
-        // neither file can drift into restating the other's facts.
-        let keys = |text: &str| -> Vec<String> {
-            text.lines()
-                .filter_map(|l| l.trim().split_once(" = ").map(|(k, _)| k.to_string()))
-                .collect()
-        };
-        for k in keys(&receipt) {
-            assert!(!keys(&fingerprint).contains(&k), "`{k}` appears in both the receipt and the fingerprint");
+        // The declared partition, held against the two real files: every fact the
+        // fingerprint owns is absent from the receipt and the other way round. The
+        // Kani harness proves the partition has no overlap and no gap; this asserts
+        // the files obey it.
+        for fact in envhash::FACTS {
+            let token = envhash::fact_token(fact);
+            match envhash::artifact_of(fact) {
+                envhash::Artifact::Receipt => {
+                    assert!(!fingerprint.contains(token), "the fingerprint records the event fact `{token}`")
+                }
+                envhash::Artifact::EnvHash => {
+                    assert!(!receipt.contains(token), "the receipt records the state fact `{token}`")
+                }
+            }
         }
-        assert!(keys(&receipt).contains(&"disposition".to_string()), "the receipt records the event");
+        assert!(receipt.contains("disposition"), "the receipt records the event");
         assert!(fingerprint.contains("[envhash \"repo_path\"]"), "the fingerprint records the machine");
 
         // The verifying concerns read: the gate changes neither file, and reading the

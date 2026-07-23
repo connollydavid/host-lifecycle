@@ -384,7 +384,7 @@ mod tests {
     // An artifact is owed only when the commit gate consumes it: a component with no
     // hooks script is attested in its toolchain, never built by bootstrap.
     #[test]
-    fn bootstrap_abandons_on_step_failure() {
+    fn bootstrap_owes_only_the_gate_providers_artifact() {
         let base = std::env::temp_dir().join(format!("hl-boot-build-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
         let wt = base.join("software").join("gate").join("main");

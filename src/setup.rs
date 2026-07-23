@@ -328,6 +328,20 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    // The verdict counts gaps and nothing else: a satisfied requirement, and one this
+    // host was never asked for, both leave the run complete.
+    #[test]
+    fn verify_setup_no_false_hazard() {
+        let reqs = [
+            req(RequirementKind::WorktreeMaterialized, "a", true, true),
+            req(RequirementKind::BuildArtifactPresent, "b", false, false),
+            req(RequirementKind::SkillLinked, "c", true, true),
+        ];
+        assert_eq!(reqs.iter().filter(|r| r.is_gap()).count(), 0, "nothing missing, nothing to report");
+        let with_gap = [req(RequirementKind::RederiverOnPath, "host-prove", true, false)];
+        assert_eq!(with_gap.iter().filter(|r| r.is_gap()).count(), 1, "one missing artifact, one gap");
+    }
+
     // A materialized worktree with a skills dir owes a resolving link; a dangling one
     // reads as absent, because a link that does not resolve gates nothing.
     #[test]

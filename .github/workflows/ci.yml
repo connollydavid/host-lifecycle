@@ -87,7 +87,23 @@ jobs:
       - name: Build host-lifecycle (drives its own obligations check, no self-install)
         run: cargo build --release --locked
       - name: Discharge obligations (every obligation dispositioned, test refs exist)
-        run: ./target/release/host-lifecycle obligations host-lifecycle.allium --tests src
+        run: |
+          ./target/release/host-lifecycle obligations host-lifecycle.allium --tests src
+          ./target/release/host-lifecycle obligations host-lifecycle-materialize.allium --tests src --tests tests --strict-discharge
+
+  kani:
+    # The materialize surface declares a `kani:` rung (the two artifacts' schema
+    # disjointness), and a declared rung whose verifier no workflow runs is
+    # available, not discharged (plan/0048). This lane runs it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Kani (pinned)
+        run: |
+          cargo install --locked kani-verifier --version 0.67.0
+          cargo kani setup
+      - name: Verify the proof harnesses
+        run: cargo kani --output-format terse
 
   release:
     runs-on: ubuntu-latest

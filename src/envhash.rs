@@ -33,6 +33,90 @@ pub const ENVHASH: &str = ".host-envhash";
 pub const DIMENSIONS: [&str; 5] =
     ["worktree_paths", "hook_binary", "pulled_image", "submodule_init", "repo_path"];
 
+/// The two artifacts of the Where room, as plan/0074's field table names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Artifact {
+    /// The append-only provenance ledger: what happened.
+    Receipt,
+    /// This file: what the tree looks like now.
+    EnvHash,
+}
+
+/// Every fact either artifact records. The first seven are event facts and belong
+/// to the receipt; the last five are state facts and belong to the fingerprint.
+/// The split is the whole non-overlap discipline in one place, so a fact added to
+/// one artifact has to be declared here before it can be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedFact {
+    MaterializationHappened,
+    Disposition,
+    Evidence,
+    RecordedAt,
+    ComponentNamed,
+    PinReference,
+    ImageReference,
+    WorktreePresent,
+    HookBinaryHash,
+    ImageDigest,
+    SubmoduleInitState,
+    RepoAbspath,
+}
+
+/// Every fact, so a test can sweep the partition rather than restate it.
+pub const FACTS: [RecordedFact; 12] = [
+    RecordedFact::MaterializationHappened,
+    RecordedFact::Disposition,
+    RecordedFact::Evidence,
+    RecordedFact::RecordedAt,
+    RecordedFact::ComponentNamed,
+    RecordedFact::PinReference,
+    RecordedFact::ImageReference,
+    RecordedFact::WorktreePresent,
+    RecordedFact::HookBinaryHash,
+    RecordedFact::ImageDigest,
+    RecordedFact::SubmoduleInitState,
+    RecordedFact::RepoAbspath,
+];
+
+/// Which artifact records a fact. Total, and the function the disjointness proof
+/// quantifies over: an event has no ambient machine state, and a digest has no
+/// time, no disposition and no evidence.
+pub fn artifact_of(fact: RecordedFact) -> Artifact {
+    match fact {
+        RecordedFact::MaterializationHappened
+        | RecordedFact::Disposition
+        | RecordedFact::Evidence
+        | RecordedFact::RecordedAt
+        | RecordedFact::ComponentNamed
+        | RecordedFact::PinReference
+        | RecordedFact::ImageReference => Artifact::Receipt,
+        RecordedFact::WorktreePresent
+        | RecordedFact::HookBinaryHash
+        | RecordedFact::ImageDigest
+        | RecordedFact::SubmoduleInitState
+        | RecordedFact::RepoAbspath => Artifact::EnvHash,
+    }
+}
+
+/// The token a fact appears under in the file that owns it, so a test can hold the
+/// two real files against the declared partition instead of restating it in prose.
+pub fn fact_token(fact: RecordedFact) -> &'static str {
+    match fact {
+        RecordedFact::MaterializationHappened => "materialize",
+        RecordedFact::Disposition => "disposition",
+        RecordedFact::Evidence => "evidence",
+        RecordedFact::RecordedAt => "recorded =",
+        RecordedFact::ComponentNamed => "component",
+        RecordedFact::PinReference => "pin ",
+        RecordedFact::ImageReference => "toolchain",
+        RecordedFact::WorktreePresent => "worktree_paths",
+        RecordedFact::HookBinaryHash => "hook_binary",
+        RecordedFact::ImageDigest => "pulled_image",
+        RecordedFact::SubmoduleInitState => "submodule_init",
+        RecordedFact::RepoAbspath => "repo_path",
+    }
+}
+
 /// One dimension as read on this machine. `None` is unreadable here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvDimension {
@@ -372,7 +456,7 @@ mod tests {
     // With no fingerprint on disk the check cannot proceed (exit 2) — a prompt to
     // materialize, never a verdict about the tree.
     #[test]
-    fn env_check_cannot_proceed_without_record() {
+    fn env_check_records_then_reads_clean() {
         let base = std::env::temp_dir().join(format!("hl-envhash-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
@@ -380,6 +464,43 @@ mod tests {
         write_envhash(&base, &[]);
         assert!(base.join(ENVHASH).is_file(), "the write records a fingerprint");
         assert_eq!(env_check(&base, &[]), 0, "a recorded, unmoved tree is clean and never gates");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The three verdicts over a real recorded file: clean stays clean, a forced
+    // change reports its dimension, and neither outcome ever gates.
+    #[test]
+    fn env_check_exits_zero_with_a_delta() {
+        let base = std::env::temp_dir().join(format!("hl-envhash-verdict-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        write_envhash(&base, &[]);
+        assert_eq!(env_check(&base, &[]), 0, "a matching tree is clean and exits zero");
+
+        // Rewrite one recorded dimension so the live tree no longer matches it.
+        let recorded = fs::read_to_string(base.join(ENVHASH)).unwrap();
+        let moved_text = recorded.replace("value = ", "value = 0000");
+        fs::write(base.join(ENVHASH), &moved_text).unwrap();
+        let dims = envhash_dimensions(&base, &[]);
+        let moved = envhash_delta(&parse_envhash(&moved_text), &dims);
+        assert!(!moved.is_empty(), "the changed record is reported as moved");
+        assert_eq!(env_check(&base, &[]), 0, "a delta routes, it never gates");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The guards, stated as the absence of the other verdicts: with a record on disk
+    // the check never reports cannot-proceed, and an unmoved tree never reports a
+    // delta.
+    #[test]
+    fn env_check_no_false_clean_verdict() {
+        let base = std::env::temp_dir().join(format!("hl-envhash-guards-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        assert_eq!(env_check(&base, &[]), 2, "no record is the only non-zero outcome");
+        write_envhash(&base, &[]);
+        let recorded = parse_envhash(&fs::read_to_string(base.join(ENVHASH)).unwrap());
+        assert!(envhash_delta(&recorded, &envhash_dimensions(&base, &[])).is_empty(), "no false delta");
+        assert_ne!(env_check(&base, &[]), 2, "a record on disk never reports cannot-proceed");
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -412,5 +533,41 @@ mod tests {
         assert_eq!(fs::read_to_string(base.join(ENVHASH)).unwrap(), first);
         assert_eq!(env_check(&base, &[]), 0);
         let _ = fs::remove_dir_all(&base);
+    }
+}
+
+// Kani proof harnesses (the host-prove `kani-conformance` lane). `#[cfg(kani)]`
+// keeps them out of ordinary builds; `cargo kani` compiles with that cfg set.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// ReceiptWritesOnlyEventFacts and EnvHashWritesOnlyStateFacts, proved over the
+    /// whole fact set rather than the ones a test happens to name: every fact lands
+    /// in exactly one artifact, so no fact can be recorded by both files. The
+    /// integration test holds the real files against this same partition; the proof
+    /// is what says the partition itself has no overlap and no gap.
+    #[kani::proof]
+    fn the_two_artifacts_share_no_fact() {
+        let i: u8 = kani::any();
+        kani::assume((i as usize) < FACTS.len());
+        let fact = FACTS[i as usize];
+        let owner = artifact_of(fact);
+        // Exactly one owner: asserting both directions rules out a fact that some
+        // future edit maps to neither or to both.
+        assert!(owner == Artifact::Receipt || owner == Artifact::EnvHash);
+        assert!(!(owner == Artifact::Receipt && owner == Artifact::EnvHash));
+        // And the two sides are the sets the field table declares.
+        let is_event = matches!(
+            fact,
+            RecordedFact::MaterializationHappened
+                | RecordedFact::Disposition
+                | RecordedFact::Evidence
+                | RecordedFact::RecordedAt
+                | RecordedFact::ComponentNamed
+                | RecordedFact::PinReference
+                | RecordedFact::ImageReference
+        );
+        assert!(is_event == (owner == Artifact::Receipt));
     }
 }

@@ -42,7 +42,6 @@ enum Writer {
     materialize
     install_hooks
     verify_build
-    image_pull
     bootstrap
     verify_setup
 }
@@ -249,15 +248,15 @@ surface MaterializeOp {
         MaterializeFails(project)
 }
 
--- The three remaining state-changing ops, each an envhash writer and none a
--- receipt writer: installing hooks (also the worktree gate, Bug A), confirming
--- the image digest on a verify-build, and pulling the toolchain image.
+-- The two remaining state-changing ops, each an envhash writer and none a
+-- receipt writer: installing hooks (also the worktree gate, Bug A) and verifying
+-- a build. Pulling the toolchain image is not a third op: the pull happens
+-- inside the verify-build rebuild, so that op is where the image digest moves.
 surface StateChangingOps {
     facing project: Project
     provides:
         HooksInstalled(project)
         BuildVerified(project)
-        ImagePulled(project)
 }
 
 surface EnvCheckOp {
@@ -381,22 +380,6 @@ rule RefreshEnvHashOnBuildVerified {
     ensures: envhash.recorded = true
     ensures: Write.created(
         writer: verify_build,
-        artifact: envhash,
-        facts: {
-            worktree_present,
-            hook_binary_hash,
-            image_digest,
-            submodule_init_state,
-            repo_abspath
-        }
-    )
-}
-
-rule RefreshEnvHashOnImagePull {
-    when: ImagePulled(project)
-    ensures: envhash.recorded = true
-    ensures: Write.created(
-        writer: image_pull,
         artifact: envhash,
         facts: {
             worktree_present,
@@ -539,9 +522,8 @@ invariant EnvHashWritesOnlyStateFacts {
         })
 }
 
--- Only the materialize op appends provenance. Installing hooks, verifying a
--- build and pulling an image all change state, so they write the fingerprint
--- alone.
+-- Only the materialize op appends provenance. Installing hooks and verifying a
+-- build change state, so they write the fingerprint alone.
 invariant OnlyMaterializeWritesReceipt {
     for w in Writes where w.artifact = receipt:
         w.writer = materialize
