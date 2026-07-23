@@ -10208,6 +10208,64 @@ mod software_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    // === plan/0074: the shared call site, and what each concern writes there ===
+
+    // One materialize call produces BOTH artifacts, and they share no field name:
+    // the receipt's keys are event-level, the fingerprint's are state-level. The
+    // verifying concerns write neither.
+    #[test]
+    fn materialize_envhash_write_records_state_facts() {
+        let base = std::env::temp_dir().join(format!("hl-callsite-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let host = base.join("host");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        let g = |cwd: &Path, args: &[&str]| assert!(git_ok(cwd, args), "git {args:?}");
+        g(&src, &["init", "-q", "-b", "main"]);
+        g(&src, &["config", "user.email", "t@t"]);
+        g(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("readme.txt"), "seed").unwrap();
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-qm", "seed"]);
+        let pin = git_out(&src, &["rev-parse", "HEAD"]).unwrap();
+        let recipe = vec![Software {
+            name: "demo".into(), url: src.to_string_lossy().to_string(), pin,
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None,
+            repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        }];
+
+        software_materialize(&host, &recipe, false);
+        let receipt = fs::read_to_string(host.join(LIFECYCLE_RECEIPTS)).expect("the event was recorded");
+        let fingerprint = fs::read_to_string(host.join(envhash::ENVHASH)).expect("the state was recorded");
+
+        // Field names, one artifact against the other: the two sets are disjoint, so
+        // neither file can drift into restating the other's facts.
+        let keys = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.trim().split_once(" = ").map(|(k, _)| k.to_string()))
+                .collect()
+        };
+        for k in keys(&receipt) {
+            assert!(!keys(&fingerprint).contains(&k), "`{k}` appears in both the receipt and the fingerprint");
+        }
+        assert!(keys(&receipt).contains(&"disposition".to_string()), "the receipt records the event");
+        assert!(fingerprint.contains("[envhash \"repo_path\"]"), "the fingerprint records the machine");
+
+        // The verifying concerns read: the gate changes neither file, and planning the
+        // bootstrap sequence changes nothing at all.
+        let before = (receipt.clone(), fingerprint.clone());
+        let _ = setup::verify_setup(&host, &recipe);
+        let _ = bootstrap::plan_steps(&host, &recipe);
+        assert_eq!(
+            (fs::read_to_string(host.join(LIFECYCLE_RECEIPTS)).unwrap(), fs::read_to_string(host.join(envhash::ENVHASH)).unwrap()),
+            before,
+            "the completeness gate and the step planner write nothing"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // === plan/0074: the materialize receipt (#18), event facts only ===
 
     fn materialize_fixture(name: &str, toolchain: Option<&str>) -> Software {

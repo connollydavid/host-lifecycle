@@ -209,13 +209,38 @@ pub fn envhash_delta(recorded: &[EnvDimension], current: &[EnvDimension]) -> Vec
     moved
 }
 
+/// Keep the fingerprint out of the history. It describes one machine — its
+/// absolute paths, its installed binary, its runtime — so committing it would
+/// publish local state and make every other clone read a delta that means
+/// nothing. The tool that writes the file is the one that owes the ignore line,
+/// because an adopter who never heard of the file cannot be expected to add it.
+fn ensure_gitignored(root: &Path, entry: &str) {
+    let path = root.join(".gitignore");
+    let cur = fs::read_to_string(&path).unwrap_or_default();
+    if cur.lines().any(|l| l.trim() == entry) {
+        return;
+    }
+    let mut next = cur;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(&format!(
+        "\n# The local environment fingerprint: this machine's state, never shared.\n{entry}\n"
+    ));
+    if let Err(e) = write_atomic(&path, &next) {
+        eprintln!("host-lifecycle: cannot record {entry} in .gitignore: {e}");
+    }
+}
+
 /// Write the fingerprint from the live tree. Called by every op that changes the
 /// tree; it appends no receipt, because a state change is not an event.
 pub fn write_envhash(root: &Path, recipe: &[Software]) {
     let dims = envhash_dimensions(root, recipe);
     if let Err(e) = write_atomic(&root.join(ENVHASH), &envhash_text(&dims)) {
         eprintln!("host-lifecycle: cannot write {ENVHASH}: {e}");
+        return;
     }
+    ensure_gitignored(root, ENVHASH);
 }
 
 /// `env --check <dir>`: recompute, diff, print the route. Advisory by
@@ -355,6 +380,22 @@ mod tests {
         write_envhash(&base, &[]);
         assert!(base.join(ENVHASH).is_file(), "the write records a fingerprint");
         assert_eq!(env_check(&base, &[]), 0, "a recorded, unmoved tree is clean and never gates");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The writer owes the ignore line: the fingerprint describes one machine, so it
+    // never enters the history, and adding the line twice is a no-op.
+    #[test]
+    fn install_hooks_write_is_envhash_only() {
+        let base = std::env::temp_dir().join(format!("hl-envhash-ignore-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        write_envhash(&base, &[]);
+        let first = fs::read_to_string(base.join(".gitignore")).unwrap();
+        assert!(first.lines().any(|l| l.trim() == ENVHASH), "the fingerprint is ignored");
+        write_envhash(&base, &[]);
+        assert_eq!(fs::read_to_string(base.join(".gitignore")).unwrap(), first, "the line is added once");
+        assert!(!base.join(crate::LIFECYCLE_RECEIPTS).exists(), "the fingerprint writer appends no provenance");
         let _ = fs::remove_dir_all(&base);
     }
 
