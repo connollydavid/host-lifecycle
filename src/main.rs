@@ -5017,9 +5017,54 @@ fn add_worktree(bare: &Path, path: &Path, args: &[&str]) -> bool {
 /// already exist. The bare clone needs its remote-tracking refspec set by hand —
 /// `git clone --bare` does not write one — before a `fetch`/`worktree` resolves a
 /// remote branch.
+/// The toolchain image *reference* (registry, name and tag), never its digest:
+/// `docker.io/clux/muslrust:1.95.0-stable@sha256:15a7…` -> `docker.io/clux/muslrust:1.95.0-stable`.
+/// The receipt records the event's context; the digest is ambient machine state the
+/// envhash owns, and recording it here would make the two artifacts overlap (plan/0074).
+fn image_reference(toolchain: &str) -> &str {
+    toolchain.split('@').next().unwrap_or(toolchain).trim()
+}
+
+/// The materialize receipt's evidence: event-level facts only — how much was realized for
+/// which component, the pin by reference, and the toolchain image reference. Never a hook
+/// binary hash, an absolute path, a submodule init state or an image digest; those are the
+/// envhash's dimensions, and the two files share no fact by name (plan/0074).
+fn materialize_evidence(s: &Software, items: usize) -> String {
+    let mut e = format!("{items} item(s) realized for {} at pin {} (reference)", s.name, short(&s.pin));
+    if let Some(t) = &s.toolchain {
+        e.push_str(&format!("; toolchain {}", image_reference(t)));
+    }
+    e
+}
+
+/// Append one component's materialize receipt (#18): the EVENT, in the same append-only
+/// shape as the `embed` receipt, under a `materialize` phase the lifecycle manifest does
+/// not declare — so it records provenance without becoming a gated obligation. Advisory on
+/// failure: the worktrees are already realized, and losing the note is not worth undoing
+/// them.
+fn append_materialize_receipt(root: &Path, s: &Software, items: usize) {
+    let r = Receipt {
+        phase: "materialize".to_string(),
+        component: Some(s.name.clone()),
+        disposition: "done".to_string(),
+        evidence: Some(materialize_evidence(s, items)),
+        reason: None,
+        tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
+        recorded: Some(today()),
+    };
+    match append_receipt(root, &r) {
+        Ok(()) => println!("receipt  materialize ({})", s.name),
+        Err(e) => eprintln!("host-lifecycle: cannot record the materialize receipt for {}: {e}", s.name),
+    }
+}
+
 fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
     let mut made = 0usize;
     for s in recipe {
+        // What this component realized in THIS run: a component whose worktrees all
+        // existed already is not an event, so it leaves no receipt and a re-run of a
+        // materialized tree appends nothing.
+        let before = made;
         // Where-room invariant (issue #2): refuse to materialize a recipe whose name, branch,
         // or any worktree branch escapes the host root. `software --check` HAZARDs the same,
         // but materialize runs first in the fresh-clone flow and clones/creates worktrees, so
@@ -5157,6 +5202,9 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
                 println!("handle   {label} -> {target_s}");
                 made += 1;
             }
+        }
+        if made > before {
+            append_materialize_receipt(root, s, made - before);
         }
     }
     println!("-- {made} item(s) materialized");
@@ -10106,6 +10154,92 @@ mod software_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    // === plan/0074: the materialize receipt (#18), event facts only ===
+
+    fn materialize_fixture(name: &str, toolchain: Option<&str>) -> Software {
+        Software {
+            name: name.into(),
+            url: "https://example.invalid/x.git".into(),
+            pin: "241a8703f2b1c4d5e6f708192a3b4c5d6e7f8091".into(),
+            branch: "main".into(),
+            worktrees: vec![],
+            lines: vec![],
+            build: None,
+            toolchain: toolchain.map(|t| t.into()),
+            deploy: None,
+            artifact: None,
+            repro_exempt: None,
+            hooks: None,
+            deps_bundle: None,
+            builds: vec![],
+        }
+    }
+
+    // The receipt's evidence names the component and carries the pin by reference: it is
+    // the event that happened, and the pin is context, never an adherence claim.
+    #[test]
+    fn materialize_receipt_names_its_components() {
+        let base = std::env::temp_dir().join(format!("hl-mr-names-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let s = materialize_fixture("host-lint", None);
+        append_materialize_receipt(&base, &s, 2);
+        let rs = read_all_receipts(&base);
+        let r = rs.iter().find(|r| r.phase == "materialize").expect("materialize receipt written");
+        assert_eq!(r.component.as_deref(), Some("host-lint"));
+        assert!(r.evidence.as_deref().unwrap().contains("241a8703f2b1"), "the pin rides as a reference");
+        assert_eq!(r.disposition, "done");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // One realized component appends exactly one stanza, and a second realized run appends
+    // another beside it: the file is append-only, so nothing is rewritten.
+    #[test]
+    fn realized_run_appends_one_receipt() {
+        let base = std::env::temp_dir().join(format!("hl-mr-append-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let s = materialize_fixture("host-prove", None);
+        append_materialize_receipt(&base, &s, 1);
+        let after_first = fs::read_to_string(base.join(LIFECYCLE_RECEIPTS)).unwrap();
+        append_materialize_receipt(&base, &s, 3);
+        let text = fs::read_to_string(base.join(LIFECYCLE_RECEIPTS)).unwrap();
+        assert_eq!(text.matches("[receipt \"materialize\" \"host-prove\"]").count(), 2);
+        assert!(text.starts_with(&after_first), "the earlier stanza survives the append verbatim");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The write records the toolchain image REFERENCE and never its digest: the digest is
+    // an envhash dimension, and the two artifacts share no fact (plan/0074's field table).
+    #[test]
+    fn materialize_receipt_write_records_event_facts() {
+        let tc = "docker.io/clux/muslrust:1.95.0-stable@sha256:15a72a4abf1c593b0bea63a4a8f20e95";
+        assert_eq!(image_reference(tc), "docker.io/clux/muslrust:1.95.0-stable");
+        let s = materialize_fixture("host-lifecycle", Some(tc));
+        let e = materialize_evidence(&s, 2);
+        assert!(e.contains("docker.io/clux/muslrust:1.95.0-stable"), "the image reference is recorded");
+        assert!(!e.contains("sha256:"), "the image digest never crosses into the receipt");
+    }
+
+    // The state facts the envhash owns never appear in a receipt: no digest, no hook binary
+    // hash, no absolute repo path, no submodule init state.
+    #[test]
+    fn receipt_records_only_event_facts() {
+        let base = std::env::temp_dir().join(format!("hl-mr-facts-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let s = materialize_fixture("host-grammar", Some("ghcr.io/x/toolchain:1@sha256:deadbeef"));
+        append_materialize_receipt(&base, &s, 1);
+        let text = fs::read_to_string(base.join(LIFECYCLE_RECEIPTS)).unwrap();
+        for state_fact in ["sha256:", "submodule", "/home/", "hook"] {
+            assert!(!text.contains(state_fact), "receipt carries the state fact `{state_fact}`");
+        }
+        for event_fact in ["disposition = done", "recorded = ", "tool = host-lifecycle@"] {
+            assert!(text.contains(event_fact), "receipt is missing the event fact `{event_fact}`");
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // A materialized component carrying a spec must have its CI lane: a `.allium`
     // without `allium check`+`analyse`, or a `.tla` without TLC, is a HAZARD.
     #[test]
@@ -10801,6 +10935,20 @@ mod software_tests {
         // A clean check is clean (VerdictClean): a matching pin yields no hazard.
         assert_eq!(software_check(&host, &recipe), 0, "matching pin is clean");
 
+        // plan/0074 (#18): the run that realized the worktrees appended exactly one
+        // materialize receipt for the component, and it records the event, not the tree.
+        let receipts = |h: &Path| {
+            fs::read_to_string(h.join(LIFECYCLE_RECEIPTS))
+                .unwrap_or_default()
+                .matches("[receipt \"materialize\" \"demo\"]")
+                .count()
+        };
+        assert_eq!(receipts(&host), 1, "one realized run, one receipt");
+        assert!(
+            !fs::read_to_string(host.join(LIFECYCLE_RECEIPTS)).unwrap().contains(&host.to_string_lossy().to_string()),
+            "the receipt carries no absolute repo path (an envhash dimension)"
+        );
+
         // issue #8 review: the gitdir-link gate FIRES when `.git` is missing, and a re-materialize
         // self-heals the link (call/0039) — the negative path the pass-only assertions missed.
         let gitlink = host.join("software").join("demo").join(".git");
@@ -10809,6 +10957,9 @@ mod software_tests {
         software_materialize(&host, &recipe, false);
         assert_eq!(fs::read_to_string(&gitlink).unwrap(), "gitdir: ./.bare\n", "re-materialize self-heals the .git link");
         assert_eq!(software_check(&host, &recipe), 0, "self-healed link is clean again");
+        // A run that realized nothing is not an event: the idempotent re-run appends no
+        // second receipt (plan/0074).
+        assert_eq!(receipts(&host), 1, "a no-op re-materialize records nothing");
 
         // Re-materialize after the worktree is removed: `worktree prune` clears the
         // stale admin entry, so the canonical is re-created rather than hard-failing
@@ -10818,6 +10969,9 @@ mod software_tests {
         software_materialize(&host, &recipe, false);
         assert!(canon.is_dir(), "canonical re-created after removal + prune");
         assert_eq!(git_out(&canon, &["rev-parse", "HEAD"]).unwrap(), pin);
+        // That re-materialize realized a worktree again, so it is a second event beside
+        // the first: the provenance file accretes, it never rewrites.
+        assert_eq!(receipts(&host), 2, "the second realizing run appends a second receipt");
 
         let _ = fs::remove_dir_all(&base);
     }
