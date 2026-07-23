@@ -29,10 +29,6 @@ use crate::{Software, load_software, sha256_file, write_atomic};
 /// shared and never committed.
 pub const ENVHASH: &str = ".host-envhash";
 
-/// The dimensions, in recorded order. Each is one `[envhash "<kind>"]` stanza.
-pub const DIMENSIONS: [&str; 5] =
-    ["worktree_paths", "hook_binary", "pulled_image", "submodule_init", "repo_path"];
-
 /// The two artifacts of the Where room, as plan/0074's field table names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Artifact {
@@ -236,10 +232,14 @@ pub fn envhash_dimensions(root: &Path, recipe: &[Software]) -> Vec<EnvDimension>
         submodule_state(root).as_deref().and_then(sha256_text),
         sha256_text(&root.to_string_lossy()),
     ];
-    DIMENSIONS
+    // The dimensions ARE the state facts, read off the declared partition rather
+    // than restated: a fact the partition assigns to the receipt cannot become a
+    // stanza here, and the proof harness is what makes that assignment total.
+    FACTS
         .iter()
+        .filter(|f| artifact_of(**f) == Artifact::EnvHash)
         .zip(values)
-        .map(|(kind, value)| EnvDimension { kind: (*kind).to_string(), value })
+        .map(|(fact, value)| EnvDimension { kind: fact_token(*fact).to_string(), value })
         .collect()
 }
 
