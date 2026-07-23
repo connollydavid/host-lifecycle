@@ -277,7 +277,7 @@ pub fn envhash_dimensions(root: &Path, recipe: &[Software]) -> Vec<EnvDimension>
                 // The partition assigns every other fact to the receipt; this arm is
                 // unreachable, and saying so keeps the match exhaustive rather than
                 // silently defaulting a new state fact to "unreadable".
-                other => unreachable!("{other:?} is a receipt fact, not a fingerprint dimension"),
+                _ => unreachable!("the partition assigns every other fact to the receipt"),
             },
         })
         .collect()
@@ -455,9 +455,11 @@ pub fn env_check(root: &Path, recipe: &[Software]) -> i32 {
     } else {
         println!(
             "-- {} dimension(s) moved since the fingerprint was recorded. This is advisory: nothing is gated, and \
-             the fingerprint is re-recorded by the next `software --materialize <dir>` or `--install-hooks <dir>`. \
+             the fingerprint is re-recorded by the next `host-lifecycle software --materialize {}` or `--install-hooks {}`. \
              Act on the lines above only where one says to.",
-            moved.len()
+            moved.len(),
+            root.display(),
+            root.display()
         );
     }
     0
@@ -677,37 +679,30 @@ mod kani_proofs {
         }
     }
 
-    /// ReceiptWritesOnlyEventFacts and EnvHashWritesOnlyStateFacts: no fact carries
-    /// a token belonging to the other artifact, over every fact the type admits.
-    /// The property is stated in terms of the TOKENS the writers actually emit, so
-    /// it binds the files rather than restating the partition function.
+    /// ReceiptWritesOnlyEventFacts and EnvHashWritesOnlyStateFacts: every fact the
+    /// type admits lands in exactly one artifact, and in the one the field table
+    /// declares. Quantified over the type through `fact_of`, so a variant nobody
+    /// added to `FACTS` is still covered; the companion harness proves the array
+    /// holds them all, and the exhaustive `tokens_never_cross_artifacts` test
+    /// carries the token half, where byte comparison is cheap. (Asserting the
+    /// tokens HERE made the harness take tens of minutes to say the same thing.)
     #[kani::proof]
     fn the_two_artifacts_share_no_fact() {
         let i: u8 = kani::any();
         kani::assume(i < 12);
         let fact = fact_of(i);
-        let token = fact_token(fact);
-        match artifact_of(fact) {
-            // A fingerprint stanza is one of the five dimension names, and never a
-            // receipt key: no `disposition`, no `evidence`, no `recorded =`.
-            Artifact::EnvHash => assert!(
-                token == "worktree_paths"
-                    || token == "hook_binary"
-                    || token == "pulled_image"
-                    || token == "submodule_init"
-                    || token == "repo_path"
-            ),
-            // A receipt key is one of the seven event keys, and never a dimension.
-            Artifact::Receipt => assert!(
-                token == "materialize"
-                    || token == "disposition"
-                    || token == "evidence"
-                    || token == "recorded ="
-                    || token == "component"
-                    || token == "pin "
-                    || token == "toolchain"
-            ),
-        }
+        let is_event = matches!(
+            fact,
+            RecordedFact::MaterializationHappened
+                | RecordedFact::Disposition
+                | RecordedFact::Evidence
+                | RecordedFact::RecordedAt
+                | RecordedFact::ComponentNamed
+                | RecordedFact::PinReference
+                | RecordedFact::ImageReference
+        );
+        assert!(is_event == (artifact_of(fact) == Artifact::Receipt));
+        assert!(!is_event == (artifact_of(fact) == Artifact::EnvHash));
     }
 
     /// `FACTS` is the array the fingerprint iterates, so it must hold every fact the
