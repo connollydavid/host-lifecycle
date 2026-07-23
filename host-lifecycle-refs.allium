@@ -77,16 +77,25 @@ entity Origin {
 
 -- One reference as written, with the facts the resolver reads: which room it
 -- names, whether a numbered entry matches, and whether it carries an anchor.
--- `in_link` and `in_fence` are the document facts the sweep needs: a reference
--- already inside a markdown link renders, and one inside fenced code is an
--- example rather than a reference.
+-- `in_link` and `quoted` are the document facts the sweep needs: a reference
+-- already inside a markdown link renders, and one inside a fence or inline code
+-- is an example rather than a reference.
 entity Reference {
     kind: RefKind
     room: String
+    -- Whether THIS repository owns the room the reference names. A software
+    -- repository has no `plan/` or `call/` room: the numbers in its documents
+    -- belong to its governing host, and the reference carries no repository to
+    -- look in. Without this fact the sweep called those references dead and
+    -- reddened every software repository for citing the decisions that govern it.
+    room_present: Boolean
     entry_matched: Boolean
     has_anchor: Boolean
     in_link: Boolean
-    in_fence: Boolean
+    -- Quoted rather than referred: inside a fence, or inside inline code. A
+    -- document that teaches the rule shows references, and showing is not
+    -- referring.
+    quoted: Boolean
     excluded: Boolean
 }
 
@@ -203,8 +212,9 @@ rule ResolveIssueWithoutOrigin {
 -- document claims exists and does not. Mechanically evidenced, so it gates.
 rule DetectDeadPointer {
     when: reference: Reference.created
-    requires: reference.kind = register and not reference.entry_matched
-              and not reference.in_fence and not reference.excluded
+    requires: reference.kind = register and reference.room_present
+              and not reference.entry_matched
+              and not reference.quoted and not reference.excluded
     ensures: Finding.created(reference: reference, weight: dead_pointer)
 }
 
@@ -214,7 +224,7 @@ rule DetectDeadPointer {
 rule DetectUnrenderedIssue {
     when: reference: Reference.created
     requires: reference.kind = issue and not reference.in_link
-              and not reference.in_fence and not reference.excluded
+              and not reference.quoted and not reference.excluded
     ensures: Finding.created(reference: reference, weight: unrendered)
 }
 
@@ -273,12 +283,20 @@ invariant ExcludedIsNeverReported {
         not f.reference.excluded
 }
 
--- A fenced reference is an example. The tell gate reads its own fixtures the
--- same way, and a checker that reported them would make every document that
--- teaches the rule fail it.
-invariant FencedIsNeverReported {
+-- A quoted reference is an example, whether it sits in a fence or in inline
+-- code. The tell gate reads its own fixtures the same way, and a checker that
+-- reported them would make every document that teaches the rule fail it.
+invariant QuotedIsNeverReported {
     for f in Findings:
-        not f.reference.in_fence
+        not f.reference.quoted
+}
+
+-- Only the room's owner can hold a dead pointer. A repository without the room
+-- is not the reference's host, so its citation of another project's register is
+-- unresolved-here rather than broken.
+invariant DeadPointerNeedsTheRoom {
+    for f in Findings where f.weight = dead_pointer:
+        f.reference.room_present
 }
 
 -- Only a register reference can be a dead pointer: an issue number names work in

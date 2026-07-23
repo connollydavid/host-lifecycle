@@ -26,6 +26,7 @@ mod memory;
 // reuses the engine.
 mod dream;
 mod bootstrap;
+mod refs;
 mod envhash;
 mod setup;
 
@@ -131,8 +132,10 @@ fn main() {
         Some("dream") => dream::dream(&args[2..]),
         Some("env") => envhash::env(&args[2..]),
         Some("bootstrap") => bootstrap::bootstrap(&args[2..]),
+        Some("resolve") => refs::resolve(&args[2..]),
+        Some("refs") => refs::refs(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|bootstrap|env|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks|dream> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|bootstrap|env|resolve|refs|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks|dream> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  scaffold <dir> <rev> [--dry-run] — scaffold rooms + write the stamp (the primitive; call/0041)");
@@ -162,6 +165,8 @@ fn main() {
             eprintln!("  release <component> ...       — the gated, tool-carried release sequence (verify -> build -> tag -> receipt)");
             eprintln!("  env --check <dir>             — which local-environment dimensions moved since the fingerprint was recorded (advisory)");
             eprintln!("  bootstrap <dir>               — run the fresh-clone setup sequence (submodules, materialize, skills, build, hooks, re-deriver), then the completeness gate");
+            eprintln!("  resolve <ref> [--markdown|--url] — where a plan/NNNN, call/NNNN or #N reference points");
+            eprintln!("  refs --check <dir>            — references the site cannot render: dead register pointers (gates) and bare issue numbers (advisory)");
             process::exit(2);
         }
     }
@@ -1896,6 +1901,21 @@ fn load_lintignore(root: &Path) -> Vec<String> {
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// The authored markdown of a project: every tracked `.md` the exclusion list does
+/// not name. One list, not two (plan/0077): an operator who has decided a file is a
+/// record should not have to say so once per checker, and the record layer is
+/// exactly what a reference sweep must never press to be rewritten.
+pub fn authored_docs(root: &Path) -> Vec<String> {
+    let ignore = load_lintignore(root);
+    let Some(out) = git_out(root, &["ls-files", "*.md"]) else { return Vec::new() };
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|rel| !host_lint::path_ignored(rel, &ignore))
+        .map(String::from)
+        .collect()
 }
 
 /// The prose-hygiene audit (plan/0030 D4): run host-lint's `--docs` engine in-process via
