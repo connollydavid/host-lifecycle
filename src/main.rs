@@ -26,6 +26,7 @@ mod memory;
 // reuses the engine.
 mod dream;
 mod envhash;
+mod setup;
 
 /// The canonical template a project adopts from; recorded in the stamp.
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/host-template";
@@ -144,6 +145,7 @@ fn main() {
             eprintln!("  software --check <dir>        — verify each canonical worktree is at its recorded pin");
             eprintln!("  software --verify-build <dir> — rebuild from the pin and prove the artifact reproduces");
             eprintln!("  software --install-hooks <dir>— install each component's commit hooks + verified binary");
+            eprintln!("  software --verify-setup <dir> — the completeness gate: every local artifact the recipe requires of this host is present");
             eprintln!("  software --teardown [--item <n>] <dir> — remove a component's worktrees + store (guards unsaved work; --force overrides)");
             eprintln!("  prose <dir>                   — audit authored markdown for prose tropes in-process (host-lint --docs; the verify recheck)");
             eprintln!("  reconcile <dir>               — re-check each `host-reconcile`-annotated restatement against the spine truth (the reflective-practice reconcile arm)");
@@ -4071,6 +4073,7 @@ fn software(args: &[String]) {
             "--check" => mode = Some("check"),
             "--verify-build" => mode = Some("verify-build"),
             "--install-hooks" => mode = Some("install-hooks"),
+            "--verify-setup" => mode = Some("verify-setup"),
             "--teardown" => mode = Some("teardown"),
             "--partial" => partial = true,
             "--lock" => {
@@ -4096,11 +4099,11 @@ fn software(args: &[String]) {
         i += 1;
     }
     let Some(dir) = pos.first() else {
-        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--install-hooks|--teardown|--lock <name>> [--item <name>[@<branch>]] [--force] [--partial] <dir>");
+        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--verify-setup|--install-hooks|--teardown|--lock <name>> [--item <name>[@<branch>]] [--force] [--partial] <dir>");
         process::exit(2);
     };
     let Some(mode) = mode else {
-        eprintln!("host-lifecycle software needs --materialize, --check, --verify-build, --install-hooks, --teardown, or --lock <name>");
+        eprintln!("host-lifecycle software needs --materialize, --check, --verify-build, --verify-setup, --install-hooks, --teardown, or --lock <name>");
         process::exit(2);
     };
     let root = match fs::canonicalize(Path::new(dir.as_str())) {
@@ -4143,6 +4146,7 @@ fn software(args: &[String]) {
         }
         "verify-build" => software_verify_build(&root, &recipe),
         "install-hooks" => software_install_hooks(&root, &recipe),
+        "verify-setup" => process::exit(setup::verify_setup(&root, &recipe)),
         "teardown" => software_teardown(&root, &recipe, force),
         "lock" => software_lock(&root, &recipe, lock_name.expect("--lock sets lock_name")),
         _ => unreachable!(),
