@@ -25,6 +25,7 @@ mod memory;
 // `dream` is wired below; the MCP memory_consolidate tool (#extend-mcp)
 // reuses the engine.
 mod dream;
+mod envhash;
 
 /// The canonical template a project adopts from; recorded in the stamp.
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/host-template";
@@ -126,6 +127,7 @@ fn main() {
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
         Some("dream") => dream::dream(&args[2..]),
+        Some("env") => envhash::env(&args[2..]),
         _ => {
             eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
@@ -154,6 +156,7 @@ fn main() {
             eprintln!("  manifest --check <path>       — the lifecycle manifest is well-formed (orders unique, requires resolve)");
             eprintln!("  receipt --record <phase> ...  — append a phase receipt (done|skip); --list prints the current set");
             eprintln!("  release <component> ...       — the gated, tool-carried release sequence (verify -> build -> tag -> receipt)");
+            eprintln!("  env --check <dir>             — which local-environment dimensions moved since the fingerprint was recorded (advisory)");
             process::exit(2);
         }
     }
@@ -4209,6 +4212,9 @@ fn software_install_hooks(root: &Path, recipe: &[Software]) {
     if installed == 0 && failed == 0 {
         println!("no components declare a `hooks` script; nothing to install");
     }
+    // A state change, not a lifecycle event: the installed binary's hash moved, so the
+    // fingerprint is refreshed and no receipt is appended (plan/0074).
+    envhash::write_envhash(root, recipe);
     if failed > 0 {
         process::exit(1);
     }
@@ -4600,6 +4606,10 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
         eprintln!("-- verify-build INCOMPLETE: {verified} verified, {deferred} deferred, {exempt} exempt, {unverifiable} UNVERIFIABLE — reproducibility NOT attested");
         process::exit(1);
     }
+    // The rebuild ran in the recorded toolchain, which pulls the image if it was
+    // absent: the image digest dimension is the one this op moves, so it refreshes
+    // the fingerprint and, like every state change, appends no receipt (plan/0074).
+    envhash::write_envhash(root, recipe);
     if verified > 0 {
         println!("-- {verified} build(s) reproduced their recorded artifact ({deferred} deferred, {exempt} exempt)");
     } else {
@@ -5207,6 +5217,11 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
             append_materialize_receipt(root, s, made - before);
         }
     }
+    // The second writer at this call site (plan/0074): the run's event went to the
+    // provenance ledger, and the tree's new state goes to the fingerprint. The two
+    // share no fact, and the fingerprint is refreshed even when nothing was realized,
+    // because a re-run still observes the current tree.
+    envhash::write_envhash(root, recipe);
     println!("-- {made} item(s) materialized");
 }
 
@@ -10632,6 +10647,13 @@ mod software_tests {
         // worktree off its pin → blocked
         assert_eq!(install_hooks(&base, &[mk("0000000000000000000000000000000000000000", "x")]), (0, 1));
 
+        // plan/0074: installing hooks moved the binary's hash, so the op refreshes the
+        // fingerprint — and appends no receipt, because a state change is not an event.
+        software_install_hooks(&base, &[mk(&pin, "deadbeef")]);
+        let fingerprint = fs::read_to_string(base.join(envhash::ENVHASH)).expect("install-hooks records the fingerprint");
+        assert!(fingerprint.contains("[envhash \"hook_binary\"]"));
+        assert!(!base.join(LIFECYCLE_RECEIPTS).exists(), "install-hooks appends no provenance");
+
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -10944,6 +10966,13 @@ mod software_tests {
                 .count()
         };
         assert_eq!(receipts(&host), 1, "one realized run, one receipt");
+        // The same call site refreshed the fingerprint (plan/0074's two orthogonal
+        // writers), and the two files share no fact by name.
+        let fingerprint = fs::read_to_string(host.join(envhash::ENVHASH)).expect("materialize records the fingerprint");
+        assert!(fingerprint.contains("[envhash \"worktree_paths\"]"), "the fingerprint records the tree");
+        for event_fact in ["disposition", "evidence", "recorded ="] {
+            assert!(!fingerprint.contains(event_fact), "the fingerprint carries the event fact `{event_fact}`");
+        }
         assert!(
             !fs::read_to_string(host.join(LIFECYCLE_RECEIPTS)).unwrap().contains(&host.to_string_lossy().to_string()),
             "the receipt carries no absolute repo path (an envhash dimension)"
