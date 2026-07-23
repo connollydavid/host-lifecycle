@@ -327,6 +327,22 @@ pub fn write_envhash(root: &Path, recipe: &[Software]) {
     ensure_gitignored(root, ENVHASH);
 }
 
+/// What a moved dimension MEANS, and whether it implies an action. A line that
+/// names a dimension and stops is not a route: the weak-agent probe read
+/// `moved hook_binary` plus "nothing is gated" and concluded there was nothing to
+/// do, which is right about the gate and wrong about the tree (plan/0074
+/// fen-acceptance). Each line now says what changed and what, if anything, to run.
+fn dimension_meaning(kind: &str) -> &'static str {
+    match kind {
+        "worktree_paths" => "a component worktree appeared or disappeared; run `software --verify-setup <dir>` to see whether the setup is still complete",
+        "hook_binary" => "the installed commit-gate binary changed (rebuilt or reinstalled); if that was not you, re-run `software --install-hooks <dir>`",
+        "pulled_image" => "the locally pulled toolchain image is a different digest; rebuild with `software --verify-build <dir>` to confirm the artifact still reproduces",
+        "submodule_init" => "a submodule was initialized or de-initialized; run `git submodule update --init` if one is missing",
+        "repo_path" => "the repository sits at a different absolute path than when the fingerprint was recorded (a move or a second clone); nothing to fix",
+        _ => "this dimension differs from the recorded fingerprint",
+    }
+}
+
 /// `env --check <dir>`: recompute, diff, print the route. Advisory by
 /// construction — `0` clean, `0` with a delta, `2` when nothing is recorded yet.
 pub fn env_check(root: &Path, recipe: &[Software]) -> i32 {
@@ -342,7 +358,7 @@ pub fn env_check(root: &Path, recipe: &[Software]) -> i32 {
     let current = envhash_dimensions(root, recipe);
     let moved = envhash_delta(&recorded, &current);
     for kind in &moved {
-        println!("moved    {kind}");
+        println!("moved    {kind} — {}", dimension_meaning(kind));
     }
     for d in &current {
         if d.value.is_none() {
@@ -352,7 +368,12 @@ pub fn env_check(root: &Path, recipe: &[Software]) -> i32 {
     if moved.is_empty() {
         println!("-- the tree matches the recorded fingerprint");
     } else {
-        println!("-- {} dimension(s) moved since the fingerprint was recorded; advisory, nothing is gated", moved.len());
+        println!(
+            "-- {} dimension(s) moved since the fingerprint was recorded. This is advisory: nothing is gated, and \
+             the fingerprint is re-recorded by the next `software --materialize <dir>` or `--install-hooks <dir>`. \
+             Act on the lines above only where one says to.",
+            moved.len()
+        );
     }
     0
 }
