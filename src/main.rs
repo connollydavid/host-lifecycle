@@ -128,6 +128,7 @@ fn main() {
         Some("reconcile") => reconcile(&args[2..]),
         Some("entrance") => entrance(&args[2..]),
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
+        Some("migrate-recipe") => migrate_recipe(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
         Some("dream") => dream::dream(&args[2..]),
         Some("env") => envhash::env(&args[2..]),
@@ -135,7 +136,7 @@ fn main() {
         Some("resolve") => refs::resolve(&args[2..]),
         Some("refs") => refs::refs(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|bootstrap|env|resolve|refs|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks|dream> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|bootstrap|env|resolve|refs|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|migrate-recipe|tasks|dream> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  scaffold <dir> <rev> [--dry-run] — scaffold rooms + write the stamp (the primitive; call/0041)");
@@ -155,6 +156,7 @@ fn main() {
             eprintln!("  prose <dir>                   — audit authored markdown for prose tropes in-process (host-lint --docs; the verify recheck)");
             eprintln!("  reconcile <dir>               — re-check each `host-reconcile`-annotated restatement against the spine truth (the reflective-practice reconcile arm)");
             eprintln!("  entrance [--check] <dir>    — hold the single-file entrance to the spine: cover the phases + wired tools, generate the .host stamp block (plan/0040)");
+            eprintln!("  migrate-recipe <dir>          — rewrite retired .host-software keys to their current names (idempotent)");
             eprintln!("  migrate-receipts <dir>        — re-home the receipts family: applied-set to .host-receipts, operational receipts to .host-lifecycle-receipts (plan/0037)");
             eprintln!("  upgrade <dir>                 — list template UPGRADING.md actions newer than the stamp");
             eprintln!("  book <dir> [--dry-run]        — generate mdBook/src/ + SUMMARY.md (lifecycle order) for mdBook");
@@ -8629,6 +8631,90 @@ fn receipt_gate(phases: &[Phase], receipts: &[Receipt], has_where: bool, compone
 /// `.host-receipts` into `.host-lifecycle-receipts`, and leave the adopt/upgrade receipts in
 /// `.host-receipts`. Writes atomically and reports what moved; a project already on the new
 /// layout is a no-op. The agent runs one command and never hand-edits the files.
+/// The recipe keys a release once named and no longer does, and what became of
+/// each: a retired spelling carries its replacement, a key no release ever read
+/// carries none and is removed. Adding a row here is what makes a rename
+/// migratable by the tool rather than by hand (call/0046, call/0047).
+const RETIRED_RECIPE_KEYS: [(&str, Option<&str>); 2] =
+    [("repro-exempt", Some("repro-waiver")), ("hermetic-exempt", None)];
+
+/// Rewrite a recipe's retired keys, returning the new text and one line per
+/// change. Pure, so the migration is unit-tested without a filesystem, and
+/// idempotent: a recipe with no retired key comes back byte-identical.
+fn migrate_recipe_text(text: &str) -> (String, Vec<String>) {
+    let mut out: Vec<String> = Vec::new();
+    let mut changes: Vec<String> = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let mut done = false;
+        for (retired, replacement) in RETIRED_RECIPE_KEYS {
+            if !trimmed.starts_with(retired) {
+                continue;
+            }
+            // `key = value` only: a longer key that merely starts with this one
+            // is a different key.
+            let rest = trimmed[retired.len()..].trim_start();
+            if !rest.starts_with('=') {
+                continue;
+            }
+            match replacement {
+                Some(current) => {
+                    let indent = &line[..line.len() - trimmed.len()];
+                    out.push(format!("{indent}{current}{}", &trimmed[retired.len()..]));
+                    changes.push(format!("rename   line {}: `{retired}` -> `{current}`", n + 1));
+                }
+                None => changes.push(format!(
+                    "drop     line {}: `{retired}` was never read by any release; the case it meant to record belongs in `repro-waiver`",
+                    n + 1
+                )),
+            }
+            done = true;
+            break;
+        }
+        if !done {
+            out.push(line.to_string());
+        }
+    }
+    let mut text_out = out.join("\n");
+    if text.ends_with('\n') {
+        text_out.push('\n');
+    }
+    (text_out, changes)
+}
+
+/// `migrate-recipe <dir>`: the tool-carried form of a recipe key rename, the
+/// sibling of `migrate-receipts`. An adopter should never be told to hand-edit a
+/// file the tool can rewrite: the hand edit is where a weak agent renames the
+/// wrong line, and where a busy operator renames none of them.
+fn migrate_recipe(args: &[String]) {
+    let dir = args.iter().find(|a| !a.starts_with("--")).map(String::as_str).unwrap_or(".");
+    let root = match fs::canonicalize(Path::new(dir)) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("host-lifecycle: not a directory: {dir}");
+            process::exit(2);
+        }
+    };
+    let path = root.join(SOFTWARE);
+    let Ok(text) = fs::read_to_string(&path) else {
+        eprintln!("host-lifecycle: no {SOFTWARE} in {} — nothing to migrate", root.display());
+        process::exit(2);
+    };
+    let (migrated, changes) = migrate_recipe_text(&text);
+    if changes.is_empty() {
+        println!("-- {SOFTWARE} carries no retired key; nothing to migrate");
+        return;
+    }
+    for c in &changes {
+        println!("{c}");
+    }
+    if let Err(e) = write_atomic(&path, &migrated) {
+        eprintln!("host-lifecycle: cannot write {SOFTWARE}: {e}");
+        process::exit(2);
+    }
+    println!("-- {} change(s) written to {SOFTWARE}; commit them with the upgrade", changes.len());
+}
+
 fn migrate_receipts(args: &[String]) {
     let dir = args.iter().find(|a| !a.starts_with("--")).map(String::as_str).unwrap_or(".");
     let root = match fs::canonicalize(Path::new(dir)) {
@@ -10465,6 +10551,31 @@ mod software_tests {
             assert!(text.contains(event_fact), "receipt is missing the event fact `{event_fact}`");
         }
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // The migration is tool-carried, so an adopter renames nothing by hand: the
+    // retired spelling becomes the current one, the key no release ever read is
+    // dropped, and a recipe with neither comes back byte-identical.
+    #[test]
+    fn migrate_recipe_renames_the_retired_key_and_drops_the_dead_one() {
+        let before = "[software \"c\"]\n\turl = u\n\trepro-exempt = call/0031\n\thermetic-exempt = call/0032\n\tpin = p\n";
+        let (after, changes) = migrate_recipe_text(before);
+        assert!(after.contains("\trepro-waiver = call/0031"), "the retired spelling is renamed: {after}");
+        assert!(!after.contains("repro-exempt"), "and does not survive: {after}");
+        assert!(!after.contains("hermetic-exempt"), "the key no release read is dropped: {after}");
+        assert!(after.contains("\tpin = p"), "every other line is untouched: {after}");
+        assert_eq!(changes.len(), 2, "one line per change: {changes:?}");
+
+        // Idempotent: running it again changes nothing at all.
+        let (again, none) = migrate_recipe_text(&after);
+        assert_eq!(again, after);
+        assert!(none.is_empty());
+
+        // A key that merely starts with a retired name is a different key.
+        let unrelated = "[software \"c\"]\n\trepro-exempt-note = x\n";
+        let (kept, no_change) = migrate_recipe_text(unrelated);
+        assert_eq!(kept, unrelated);
+        assert!(no_change.is_empty());
     }
 
     // The rename keeps an adopter's recipe working while telling them it moved:

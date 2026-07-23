@@ -414,3 +414,35 @@ fn refs_fix_refuses_with_the_reason() {
     assert!(text.contains("#17"), "naming a real reference from this tree, never a placeholder: {text}");
     let _ = fs::remove_dir_all(&base);
 }
+
+// The migration through the real binary: it rewrites the recipe, says what it
+// changed, and a second run reports nothing to do.
+#[test]
+fn migrate_recipe_is_tool_carried_and_idempotent() {
+    let base = fixture("migrate-recipe");
+    fs::write(
+        base.join(".host-software"),
+        "[software \"c\"]\n\turl = u\n\tpin = p\n\trepro-exempt = call/0031\n\thermetic-exempt = call/0032\n",
+    )
+    .unwrap();
+    let dir = base.to_string_lossy().to_string();
+
+    let (code, text) = run(&["migrate-recipe", &dir]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("`repro-exempt` -> `repro-waiver`"), "it names the rename: {text}");
+    assert!(text.contains("never read by any release"), "and why the other line goes: {text}");
+    let after = fs::read_to_string(base.join(".host-software")).unwrap();
+    assert!(after.contains("repro-waiver = call/0031") && !after.contains("hermetic-exempt"), "{after}");
+
+    let (code, text) = run(&["migrate-recipe", &dir]);
+    assert_eq!(code, 0);
+    assert!(text.contains("no retired key"), "a second run has nothing to do: {text}");
+    assert_eq!(fs::read_to_string(base.join(".host-software")).unwrap(), after, "and changes nothing");
+
+    // A tree with no recipe at all says so rather than reporting success.
+    let empty = fixture("migrate-recipe-none");
+    let (code, text) = run(&["migrate-recipe", &empty.to_string_lossy()]);
+    assert_eq!(code, 2, "no recipe is not a clean migration: {text}");
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&empty);
+}
