@@ -17,7 +17,6 @@
 //! defers to another attest host) is not required here, so a non-build host does
 //! not hazard on an artifact it was never meant to hold.
 
-use std::fs;
 use std::path::Path;
 
 use crate::{Software, declared_rung_tokens, git_hooks_dir, rung_rederiver_problem, worktree_dir};
@@ -25,7 +24,9 @@ use crate::{Software, declared_rung_tokens, git_hooks_dir, rung_rederiver_proble
 /// The classes of local artifact a bootstrapped tree carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequirementKind {
+    SubmodulesInitialized,
     WorktreeMaterialized,
+    GateArtifactRecorded,
     HostHookInstalled,
     WorktreeHookInstalled,
     BuildArtifactPresent,
@@ -36,6 +37,8 @@ pub enum RequirementKind {
 impl RequirementKind {
     fn label(&self) -> &'static str {
         match self {
+            RequirementKind::SubmodulesInitialized => "submodules initialized",
+            RequirementKind::GateArtifactRecorded => "gate provider records its artifact",
             RequirementKind::WorktreeMaterialized => "worktree materialized",
             RequirementKind::HostHookInstalled => "host repository gated",
             RequirementKind::WorktreeHookInstalled => "worktree gated",
@@ -45,17 +48,28 @@ impl RequirementKind {
         }
     }
 
-    /// What to run to install the missing thing. A gate whose remedy an agent has
-    /// to infer is a gate that gets bypassed.
-    fn remedy(&self) -> &'static str {
+    /// What to run to install the missing thing, against THIS tree. A remedy an
+    /// agent has to complete itself is a remedy that gets pasted with its
+    /// placeholder intact, so the root is interpolated rather than named `<dir>`.
+    fn remedy(&self, root: &Path, rederiver: Option<&Path>) -> String {
+        let dir = root.display();
         match self {
-            RequirementKind::WorktreeMaterialized => "host-lifecycle software --materialize <dir>",
-            RequirementKind::HostHookInstalled | RequirementKind::WorktreeHookInstalled => {
-                "host-lifecycle software --install-hooks <dir>"
+            RequirementKind::SubmodulesInitialized => format!("git -C {dir} submodule update --init"),
+            RequirementKind::WorktreeMaterialized => format!("host-lifecycle software --materialize {dir}"),
+            RequirementKind::GateArtifactRecorded => {
+                "record `artifact = <path> <sha256>` for the component that declares `hooks`; the commit gate installs that binary".to_string()
             }
-            RequirementKind::BuildArtifactPresent => "build the component in its recorded toolchain",
-            RequirementKind::RederiverOnPath => "install host-prove on PATH (cargo install --path software/host-prove/main --root ~/.local)",
-            RequirementKind::SkillLinked => "regenerate the skill links (link-skills.sh)",
+            RequirementKind::HostHookInstalled | RequirementKind::WorktreeHookInstalled => {
+                format!("host-lifecycle software --install-hooks {dir}")
+            }
+            RequirementKind::BuildArtifactPresent => {
+                format!("build the component in its recorded toolchain: host-lifecycle software --verify-build {dir}")
+            }
+            RequirementKind::RederiverOnPath => match rederiver {
+                Some(w) => format!("cargo install --path {} --root ~/.local (and put ~/.local/bin on PATH)", w.display()),
+                None => "no component in the recipe deploys the shared re-deriver; record one, or drop the deeper rung the specs declare".to_string(),
+            },
+            RequirementKind::SkillLinked => format!("host-lifecycle bootstrap {dir}"),
         }
     }
 }
@@ -68,6 +82,10 @@ pub struct Requirement {
     pub target: String,
     pub required: bool,
     pub present: bool,
+    /// Why this host does not carry the requirement, printed on the `n-a` line.
+    /// Two different conditions make a build artifact unrequired, and a line that
+    /// blames the wrong one teaches the reader something false about their tree.
+    pub note: String,
 }
 
 impl Requirement {
@@ -90,22 +108,32 @@ fn hooks_installed(hooks_dir: &Path, bin_name: &str) -> bool {
     ["pre-commit", "commit-msg", bin_name].iter().all(|f| hooks_dir.join(f).is_file())
 }
 
-/// The skill directories a materialized worktree offers, by name.
-fn worktree_skills(worktree: &Path) -> Vec<String> {
-    let Ok(rd) = fs::read_dir(worktree.join("skills")) else { return Vec::new() };
-    let mut names: Vec<String> = rd
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    names.sort();
-    names
-}
-
 /// Read the recipe and the live tree into the requirement set this host carries.
+///
+/// One rule governs every probe here: a probe that cannot run produces a
+/// requirement that is ABSENT, never a requirement that is skipped. A skipped
+/// requirement can never be a gap, and a gate that drops what it cannot read is
+/// the green-over-a-half-made-tree this plan exists to close.
 pub fn setup_requirements(root: &Path, recipe: &[Software]) -> Vec<Requirement> {
     let mut reqs: Vec<Requirement> = Vec::new();
     let mut rung_declared = false;
+
+    // The orchestrator inits the submodules first, so the gate owes that step a
+    // class; otherwise a tree with every submodule absent verifies complete.
+    let uninitialized = crate::bootstrap::uninitialized_submodules(root);
+    if crate::bootstrap::declares_submodules(root) {
+        reqs.push(Requirement {
+            kind: RequirementKind::SubmodulesInitialized,
+            target: match uninitialized.first() {
+                Some(first) => format!("{first} and {} other(s)", uninitialized.len().saturating_sub(1)),
+                None => "all declared submodules".to_string(),
+            },
+            required: true,
+            present: uninitialized.is_empty(),
+            note: String::new(),
+        });
+    }
+
     for s in recipe {
         let worktree = worktree_dir(root, &s.name, &s.branch);
         let materialized = worktree.is_dir();
@@ -114,6 +142,7 @@ pub fn setup_requirements(root: &Path, recipe: &[Software]) -> Vec<Requirement> 
             target: s.name.clone(),
             required: true,
             present: materialized,
+            note: String::new(),
         });
         if !materialized {
             // Every remaining requirement for this component reads the worktree, so
@@ -123,70 +152,98 @@ pub fn setup_requirements(root: &Path, recipe: &[Software]) -> Vec<Requirement> 
         }
         for b in s.builds_view() {
             if let Some((path, _)) = b.artifact {
+                // Two conditions, both about role, and each with its own reason: the
+                // artifact is required LOCALLY only when something local consumes it
+                // (today the commit gate, which installs the hooks binary from the
+                // worktree) and only when this host is the one the recipe expects to
+                // build it. The `n-a` line names which condition applied, because
+                // "not this host's role" over a build this host does perform teaches
+                // the reader something false about their own tree.
+                let consumed = s.hooks.is_some();
+                let ours = built_here(b.attest_host);
+                let note = if !consumed {
+                    "no local consumer: this artifact is attested in its toolchain, not installed here".to_string()
+                } else {
+                    format!("built on {}, not here", b.attest_host.unwrap_or("another host"))
+                };
                 reqs.push(Requirement {
                     kind: RequirementKind::BuildArtifactPresent,
                     target: match b.platform {
                         Some(p) => format!("{} [{p}]", s.name),
                         None => s.name.clone(),
                     },
-                    // Two conditions, both about role. The artifact is required LOCALLY
-                    // only when something local consumes it — today that is the commit
-                    // gate, which installs the hooks binary from the worktree — and only
-                    // when this host is the one the recipe expects to build it. A
-                    // component whose artifact exists to be attested in a container, or
-                    // on another attest host, is not this tree's obligation: requiring it
-                    // would hazard every clone that has not run the heavy build lane.
-                    required: s.hooks.is_some() && built_here(b.attest_host),
+                    required: consumed && ours,
                     present: worktree.join(path).is_file(),
+                    note,
                 });
             }
         }
         if !declared_rung_tokens(&worktree).is_empty() {
             rung_declared = true;
         }
-        for skill in worktree_skills(&worktree) {
-            let linked = root.join(".claude").join("skills").join(&skill).exists();
-            reqs.push(Requirement {
-                kind: RequirementKind::SkillLinked,
-                target: skill,
-                required: true,
-                present: linked,
-            });
-        }
     }
+
+    // Skills: the gate reads exactly the sources the orchestrator writes, so
+    // anything bootstrap links is something the gate can miss. Reading a narrower
+    // set left the majority of this project's links unwatched.
+    for (skill, _) in crate::bootstrap::skill_sources(root, recipe) {
+        let linked = root.join(".claude").join("skills").join(&skill).exists();
+        reqs.push(Requirement {
+            kind: RequirementKind::SkillLinked,
+            target: skill,
+            required: true,
+            present: linked,
+            note: String::new(),
+        });
+    }
+
     // The gate providers: a component declaring a hooks script gates every commit
     // surface, so its absence anywhere is a gap (plan/0074, Bug A).
     for s in recipe.iter().filter(|s| s.hooks.is_some()) {
-        let Some((art_path, _)) = &s.artifact else { continue };
-        let bin_name = Path::new(art_path).file_name().unwrap_or_default().to_string_lossy().to_string();
-        if let Some(hooks) = git_hooks_dir(root) {
+        // A hooks script with no recorded artifact is a recipe defect, not a reason
+        // to stop asking: the installer refuses that component outright, so the gate
+        // must say so rather than fall silent about every hook it implies.
+        let Some((art_path, _)) = &s.artifact else {
             reqs.push(Requirement {
-                kind: RequirementKind::HostHookInstalled,
+                kind: RequirementKind::GateArtifactRecorded,
                 target: s.name.clone(),
                 required: true,
-                present: hooks_installed(&hooks, &bin_name),
+                present: false,
+                note: String::new(),
             });
-        }
+            continue;
+        };
+        let bin_name = Path::new(art_path).file_name().unwrap_or_default().to_string_lossy().to_string();
+        reqs.push(Requirement {
+            kind: RequirementKind::HostHookInstalled,
+            target: s.name.clone(),
+            required: true,
+            // An unresolvable hooks directory is an ungated repository, which is
+            // exactly the state worth reporting.
+            present: git_hooks_dir(root).is_some_and(|h| hooks_installed(&h, &bin_name)),
+            note: String::new(),
+        });
         for c in recipe {
             let worktree = worktree_dir(root, &c.name, &c.branch);
             if !worktree.is_dir() {
                 continue;
             }
-            let Some(hooks) = git_hooks_dir(&worktree) else { continue };
             reqs.push(Requirement {
                 kind: RequirementKind::WorktreeHookInstalled,
                 target: format!("software/{}/{}", c.name, c.branch),
                 required: true,
-                present: hooks_installed(&hooks, &bin_name),
+                present: git_hooks_dir(&worktree).is_some_and(|h| hooks_installed(&h, &bin_name)),
+                note: String::new(),
             });
         }
     }
     if rung_declared {
         reqs.push(Requirement {
             kind: RequirementKind::RederiverOnPath,
-            target: "host-prove".to_string(),
+            target: "the shared re-deriver".to_string(),
             required: true,
             present: rung_rederiver_problem("kani:").is_none(),
+            note: String::new(),
         });
     }
     reqs
@@ -196,19 +253,25 @@ pub fn setup_requirements(root: &Path, recipe: &[Software]) -> Vec<Requirement> 
 /// verdict. `0` complete, `1` hazarded, matching `software --check`'s convention.
 pub fn verify_setup(root: &Path, recipe: &[Software]) -> i32 {
     let reqs = setup_requirements(root, recipe);
+    let rederiver = crate::bootstrap::rederiver_worktree(root, recipe);
     let mut gaps = 0usize;
     for r in &reqs {
         if r.is_gap() {
-            println!("HAZARD   {} — {} is missing; run: {}", r.target, r.kind.label(), r.kind.remedy());
+            println!(
+                "HAZARD   {} — {} is missing; run: {}",
+                r.target,
+                r.kind.label(),
+                r.kind.remedy(root, rederiver.as_deref())
+            );
             gaps += 1;
         } else if !r.required {
-            println!("n-a      {} — {} (not this host's role)", r.target, r.kind.label());
+            println!("n-a      {} — {} ({})", r.target, r.kind.label(), r.note);
         } else {
             println!("ok       {} — {}", r.target, r.kind.label());
         }
     }
     if gaps > 0 {
-        eprintln!("-- setup INCOMPLETE: {gaps} required local artifact(s) missing; install them and re-run");
+        println!("-- setup INCOMPLETE: {gaps} required local artifact(s) missing; install them and re-run");
         return 1;
     }
     println!("-- setup complete: every artifact the recipe requires of this host is present");
@@ -218,9 +281,10 @@ pub fn verify_setup(root: &Path, recipe: &[Software]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn req(kind: RequirementKind, target: &str, required: bool, present: bool) -> Requirement {
-        Requirement { kind, target: target.to_string(), required, present }
+        Requirement { kind, target: target.to_string(), required, present, note: String::new() }
     }
 
     // The gate's only detector: a required artifact that is not present.
@@ -243,7 +307,9 @@ mod tests {
         let r = req(RequirementKind::WorktreeHookInstalled, "software/host-lint/main", true, false);
         assert!(r.is_gap());
         assert_eq!(r.target, "software/host-lint/main");
-        assert!(r.kind.remedy().contains("--install-hooks"), "the remedy installs the missing thing");
+        let remedy = r.kind.remedy(Path::new("/tmp/tree"), None);
+        assert!(remedy.contains("--install-hooks"), "the remedy installs the missing thing");
+        assert!(remedy.contains("/tmp/tree"), "and it names this tree, never a `<dir>` to paste");
     }
 
     // Host-role awareness: a build the recipe defers to another attest host is not
@@ -258,6 +324,7 @@ mod tests {
             target: "host-lint [aarch64]".to_string(),
             required: built_here(Some("plan9")),
             present: false,
+            note: "built on plan9, not here".to_string(),
         };
         assert!(!elsewhere.is_gap());
     }
@@ -275,6 +342,64 @@ mod tests {
             assert!(r.required && !r.present);
         }
         assert_eq!(reqs.iter().filter(|r| r.is_gap()).count(), 1);
+    }
+
+    /// A recipe whose component declares the commit gate, with a materialized
+    /// worktree: the shape every gate defect hid behind. No test passed one of these
+    /// into `setup_requirements` before, so the whole host-and-worktree requirement
+    /// generator ran uncovered, and two fail-open paths lived in it.
+    fn gate_provider_fixture(base: &Path, artifact: bool) -> Vec<Software> {
+        let wt = base.join("software").join("gate").join("main");
+        fs::create_dir_all(&wt).unwrap();
+        vec![Software {
+            name: "gate".into(),
+            url: "u".into(),
+            pin: "p".into(),
+            branch: "main".into(),
+            worktrees: vec![],
+            lines: vec![],
+            build: None,
+            toolchain: None,
+            deploy: None,
+            artifact: artifact.then(|| ("bin/gate".to_string(), "sha".to_string())),
+            repro_exempt: None,
+            hooks: Some("hooks-script".into()),
+            deps_bundle: None,
+            builds: vec![],
+        }]
+    }
+
+    // The gate asks for a hook on the host repository AND on every materialized
+    // worktree, and an unresolvable hooks directory reads as ungated rather than as
+    // no requirement at all. Fail-open here is how a half-made tree passed.
+    #[test]
+    fn setup_requires_a_hook_on_every_commit_surface() {
+        let base = std::env::temp_dir().join(format!("hl-setup-cover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let recipe = gate_provider_fixture(&base, true);
+
+        let reqs = setup_requirements(&base, &recipe);
+        let host_hooks: Vec<&Requirement> =
+            reqs.iter().filter(|r| r.kind == RequirementKind::HostHookInstalled).collect();
+        let wt_hooks: Vec<&Requirement> =
+            reqs.iter().filter(|r| r.kind == RequirementKind::WorktreeHookInstalled).collect();
+        assert_eq!(host_hooks.len(), 1, "the host repository is a commit surface");
+        assert_eq!(wt_hooks.len(), 1, "so is every materialized worktree");
+        assert!(host_hooks[0].is_gap() && wt_hooks[0].is_gap(), "neither is gated in a bare fixture");
+        assert_eq!(verify_setup(&base, &recipe), 1, "and the run says so");
+
+        // A hooks-declaring component with no recorded artifact is a recipe defect,
+        // not a reason to stop asking: the gate names it rather than falling silent
+        // about every hook it implies.
+        let no_artifact = gate_provider_fixture(&base, false);
+        let reqs = setup_requirements(&base, &no_artifact);
+        assert!(
+            reqs.iter().any(|r| r.kind == RequirementKind::GateArtifactRecorded && r.is_gap()),
+            "a gate provider with no artifact is a gap, not a silence"
+        );
+        assert_eq!(verify_setup(&base, &no_artifact), 1, "and it never reads as complete");
+        let _ = fs::remove_dir_all(&base);
     }
 
     // A hooks gap is detected per commit surface, and a complete setup therefore
@@ -350,7 +475,6 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         let wt = base.join("software").join("comp").join("main");
         fs::create_dir_all(wt.join("skills").join("tend")).unwrap();
-        assert_eq!(worktree_skills(&wt), vec!["tend".to_string()]);
         let recipe = [Software {
             name: "comp".into(),
             url: "u".into(),

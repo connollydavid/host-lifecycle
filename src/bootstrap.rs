@@ -65,10 +65,44 @@ fn submodule_paths(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether the project declares any submodule at all, from git rather than a
+/// `.gitmodules` parse: `path = x` and `path=x` are both legal config, and a
+/// parser that misses one reports "no submodules" over a tree full of them.
+pub fn declares_submodules(root: &Path) -> bool {
+    !submodule_status(root).is_empty()
+}
+
+/// The declared submodules that are not populated here. `git submodule status`
+/// marks an uninitialized one with a leading `-`.
+pub fn uninitialized_submodules(root: &Path) -> Vec<String> {
+    submodule_status(root)
+        .into_iter()
+        .filter(|(init, _)| !init)
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn submodule_status(root: &Path) -> Vec<(bool, String)> {
+    let Ok(out) = process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["submodule", "status"])
+        .stderr(process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1).map(|p| (!l.starts_with('-'), p.to_string())))
+        .collect()
+}
+
 fn submodules_populated(root: &Path) -> bool {
-    submodule_paths(root)
-        .iter()
-        .all(|p| p.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false))
+    uninitialized_submodules(root).is_empty()
 }
 
 /// Every skill a materialized worktree or an initialized submodule offers, as
@@ -83,6 +117,19 @@ pub fn skill_sources(root: &Path, recipe: &[Software]) -> Vec<(String, PathBuf)>
         .collect();
     dirs.extend(submodule_paths(root).into_iter().filter(|p| p.is_dir()));
     for dir in dirs {
+        // A component that ships one root SKILL.md is linked under its own name.
+        // Missing this form meant the orchestrator produced a strictly smaller set of
+        // links than the script it replaces, and the gate could not see the difference.
+        if dir.join("SKILL.md").is_file() {
+            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                let component = if name == "main" {
+                    dir.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or(name)
+                } else {
+                    name
+                };
+                out.push((component.to_string(), dir.clone()));
+            }
+        }
         let Ok(rd) = fs::read_dir(dir.join("skills")) else { continue };
         let mut found: Vec<(String, PathBuf)> = rd
             .filter_map(|e| e.ok())
@@ -92,6 +139,8 @@ pub fn skill_sources(root: &Path, recipe: &[Software]) -> Vec<(String, PathBuf)>
         found.sort();
         out.extend(found);
     }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -108,17 +157,42 @@ fn skills_linked(root: &Path, recipe: &[Software]) -> bool {
 fn artifact_owed(root: &Path, recipe: &[Software]) -> Vec<(String, String, PathBuf)> {
     let mut out = Vec::new();
     for s in recipe.iter().filter(|s| s.hooks.is_some()) {
-        let (Some((path, _)), Some(build)) = (&s.artifact, &s.build) else { continue };
         let worktree = worktree_dir(root, &s.name, &s.branch);
-        if worktree.is_dir() && !worktree.join(path).is_file() {
-            out.push((s.name.clone(), build.clone(), worktree));
+        if !worktree.is_dir() {
+            continue;
+        }
+        // Through `builds_view()`, the same accessor the completeness gate reads: a
+        // component using the per-platform `[build]` form has no flat `artifact` or
+        // `build` field, and reading only the flat fields made the orchestrator and
+        // the gate disagree about whether there was anything to build.
+        for b in s.builds_view() {
+            let (Some((path, _)), Some(build)) = (b.artifact, b.build) else { continue };
+            if b.attest_host.is_some_and(|h| h != std::env::consts::OS) {
+                continue;
+            }
+            if !worktree.join(path).is_file() {
+                out.push((s.name.clone(), build.to_string(), worktree.clone()));
+            }
         }
     }
     out
 }
 
-/// The component that carries the shared re-deriver, when a declared rung needs
-/// one and it does not run here.
+/// The worktree of the component that carries the shared re-deriver, whatever the
+/// recipe calls it. host-prove is the one driver every deeper rung goes through
+/// (call/0018), so the BINARY name is generic; the component name and its path are
+/// not, and matching a literal against the `deploy` line (which names the deployed
+/// worktree, not the component) skipped the step for every adopter but this one.
+pub fn rederiver_worktree(root: &Path, recipe: &[Software]) -> Option<PathBuf> {
+    recipe
+        .iter()
+        .find(|s| s.name == "host-prove" || s.deploy.as_deref() == Some("host-prove"))
+        .map(|s| worktree_dir(root, &s.name, &s.branch))
+        .filter(|d| d.is_dir())
+}
+
+/// The re-deriver install this tree owes: a declared rung, a driver that does not
+/// run here, and a component to install it from.
 fn rederiver_owed(root: &Path, recipe: &[Software]) -> Option<PathBuf> {
     let declared = recipe.iter().any(|s| {
         let wt = worktree_dir(root, &s.name, &s.branch);
@@ -127,11 +201,7 @@ fn rederiver_owed(root: &Path, recipe: &[Software]) -> Option<PathBuf> {
     if !declared || rung_rederiver_problem("kani:").is_none() {
         return None;
     }
-    recipe
-        .iter()
-        .find(|s| s.deploy.as_deref() == Some("host-prove"))
-        .map(|s| worktree_dir(root, &s.name, &s.branch))
-        .filter(|d| d.is_dir())
+    rederiver_worktree(root, recipe)
 }
 
 /// The sequence, in order. The steps are fixed; what varies is which of them the
@@ -266,22 +336,26 @@ pub fn bootstrap(args: &[String]) {
                 }
             }
             StepKind::BuildArtifact => {
+                // Bootstrap does NOT run the recorded build. That recipe is written
+                // for the digest-pinned toolchain container, where the vendored deps
+                // are staged and the target is installed; shelling it into the ambient
+                // toolchain either fails opaquely on a fresh clone or, worse, succeeds
+                // and installs a binary that is not the canonical one. The step reports
+                // what is owed and where to run it, and the gate reports the gap.
                 for (name, build, worktree) in artifact_owed(&root, &recipe) {
-                    println!("build    {name}: {build}");
-                    let ok = process::Command::new("sh")
-                        .arg("-c")
-                        .arg(&build)
-                        .current_dir(&worktree)
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-                    if !ok {
-                        eprintln!("host-lifecycle: the recorded build for {name} failed; the commit gate needs its binary");
-                        process::exit(1);
-                    }
+                    println!("owed     {name} artifact is absent; it is built in the recorded toolchain, not here");
+                    println!("         reproduce it: host-lifecycle software --verify-build {}", root.display());
+                    println!("         or build it locally in {}: {build}", worktree.display());
                 }
             }
-            StepKind::InstallHooks => crate::software_install_hooks(&root, &recipe),
+            StepKind::InstallHooks => {
+                // The non-exiting form: a hook that cannot be installed (its binary is
+                // not built yet) is reported and the run continues to the gate, which
+                // is what states the verdict. An orchestrator that dies here would
+                // report nothing about the rest of the tree.
+                let (installed, failed) = crate::install_hooks(&root, &recipe);
+                println!("hooks    {installed} target(s) gated, {failed} could not be");
+            }
             StepKind::InstallRederiver => {
                 if let Some(worktree) = rederiver_owed(&root, &recipe) {
                     println!("install  host-prove from {}", worktree.display());

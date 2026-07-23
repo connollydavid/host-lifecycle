@@ -163,8 +163,11 @@ fn bootstrap_completion_starts_the_gate() {
     let _ = fs::remove_dir_all(&base);
 }
 
-// A step that fails ends the run there: the orchestrator reports the failure rather
-// than a setup it never finished, and the gate never speaks for it.
+// A step the orchestrator cannot perform does not end the run: the artifact it
+// cannot build is reported as owed, the run reaches the gate anyway, and the gate
+// states the verdict. Bootstrap never builds the recorded recipe itself — that
+// recipe is written for the pinned toolchain container, not for whatever rust is
+// on this machine.
 #[test]
 fn bootstrap_abandons_on_step_failure() {
     let base = fixture("bootfail");
@@ -182,15 +185,21 @@ fn bootstrap_abandons_on_step_failure() {
     fs::write(
         host.join(".host-software"),
         format!(
-            "[software \"gate\"]\n\turl = {}\n\tpin = {pin2}\n\thooks = hooks-script\n\tbuild = exit 3\n\tartifact = bin/gate 0000\n",
+            "[software \"gate\"]\n\turl = {}\n\tpin = {pin2}\n\thooks = hooks-script\n\tbuild = touch ambient-build-ran\n\tartifact = bin/gate 0000\n",
             src.to_string_lossy()
         ),
     )
     .unwrap();
     let dir = host.to_string_lossy().to_string();
     let (code, text) = run(&["bootstrap", &dir]);
-    assert_eq!(code, 1, "the failed step ends the run: {text}");
-    assert!(text.contains("the commit gate needs its binary"), "it says which step failed: {text}");
+    assert_eq!(code, 1, "the gate's verdict is the run's: {text}");
+    assert!(text.contains("owed     gate artifact is absent"), "the owed artifact is named: {text}");
+    assert!(text.contains("--verify-build"), "and the toolchain-correct way to produce it: {text}");
+    assert!(
+        !host.join("software").join("gate").join("main").join("ambient-build-ran").exists(),
+        "the recorded build is never shelled into the ambient toolchain"
+    );
+    assert!(text.contains("HAZARD"), "the gate reports the gap it left: {text}");
     assert!(!text.contains("setup complete"), "and never reports a setup it did not finish");
     let _ = fs::remove_dir_all(&base);
 }

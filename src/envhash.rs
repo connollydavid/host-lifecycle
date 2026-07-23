@@ -211,12 +211,24 @@ fn worktree_paths(root: &Path, recipe: &[Software]) -> String {
 
 /// The installed tell-gate binary, if the repo carries one: its hash moves when
 /// a hook is reinstalled or rebuilt, which is the drift #19 was filed for.
-fn hook_binary_hash(root: &Path) -> Option<String> {
+fn hook_binary_hash(root: &Path, recipe: &[Software]) -> Option<String> {
     let hooks = crate::git_hooks_dir(root)?;
-    for name in ["host-lint", "host-lint.exe"] {
-        let p = hooks.join(name);
-        if p.is_file() {
-            return sha256_file(&p);
+    // The binary's name comes from the hooks-declaring component's recorded
+    // artifact, exactly as the installer derives it. A literal name here made the
+    // dimension permanently unreadable for every adopter whose gate is called
+    // something else, so the one drift #19 was filed for could never fire.
+    let names: Vec<String> = recipe
+        .iter()
+        .filter(|s| s.hooks.is_some())
+        .filter_map(|s| s.artifact.as_ref())
+        .filter_map(|(p, _)| Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    for name in names {
+        for candidate in [name.clone(), format!("{name}.exe")] {
+            let p = hooks.join(candidate);
+            if p.is_file() {
+                return sha256_file(&p);
+            }
         }
     }
     None
@@ -227,7 +239,7 @@ pub fn envhash_dimensions(root: &Path, recipe: &[Software]) -> Vec<EnvDimension>
     let image = recipe.iter().find_map(|s| s.toolchain.as_deref()).and_then(pulled_image_digest);
     let values = [
         sha256_text(&worktree_paths(root, recipe)),
-        hook_binary_hash(root),
+        hook_binary_hash(root, recipe),
         image,
         submodule_state(root).as_deref().and_then(sha256_text),
         sha256_text(&root.to_string_lossy()),
@@ -311,8 +323,11 @@ fn ensure_gitignored(root: &Path, entry: &str) {
     next.push_str(&format!(
         "\n# The local environment fingerprint: this machine's state, never shared.\n{entry}\n"
     ));
-    if let Err(e) = write_atomic(&path, &next) {
-        eprintln!("host-lifecycle: cannot record {entry} in .gitignore: {e}");
+    match write_atomic(&path, &next) {
+        // Announced, because this edits a TRACKED file: an op the operator ran to
+        // check something should not leave a dirty tree they never hear about.
+        Ok(()) => println!("gitignore {entry} recorded in .gitignore (commit that line)"),
+        Err(e) => eprintln!("host-lifecycle: cannot record {entry} in .gitignore: {e}"),
     }
 }
 
@@ -332,14 +347,15 @@ pub fn write_envhash(root: &Path, recipe: &[Software]) {
 /// `moved hook_binary` plus "nothing is gated" and concluded there was nothing to
 /// do, which is right about the gate and wrong about the tree (plan/0074
 /// fen-acceptance). Each line now says what changed and what, if anything, to run.
-fn dimension_meaning(kind: &str) -> &'static str {
+fn dimension_meaning(kind: &str, root: &Path) -> String {
+    let dir = root.display();
     match kind {
-        "worktree_paths" => "a component worktree appeared or disappeared; run `software --verify-setup <dir>` to see whether the setup is still complete",
-        "hook_binary" => "the installed commit-gate binary changed (rebuilt or reinstalled); if that was not you, re-run `software --install-hooks <dir>`",
-        "pulled_image" => "the locally pulled toolchain image is a different digest; rebuild with `software --verify-build <dir>` to confirm the artifact still reproduces",
-        "submodule_init" => "a submodule was initialized or de-initialized; run `git submodule update --init` if one is missing",
-        "repo_path" => "the repository sits at a different absolute path than when the fingerprint was recorded (a move or a second clone); nothing to fix",
-        _ => "this dimension differs from the recorded fingerprint",
+        "worktree_paths" => format!("a component worktree appeared or disappeared; run `host-lifecycle software --verify-setup {dir}` to see whether the setup is still complete"),
+        "hook_binary" => format!("the installed commit-gate binary changed; run `host-lifecycle software --install-hooks {dir}` to restore the recorded gate"),
+        "pulled_image" => format!("the locally pulled toolchain image is a different digest; run `host-lifecycle software --verify-build {dir}` to confirm the artifact still reproduces"),
+        "submodule_init" => format!("a submodule was initialized or de-initialized; run `git -C {dir} submodule update --init` (idempotent)"),
+        "repo_path" => "the repository sits at a different absolute path than when the fingerprint was recorded (a move or a second clone); nothing to fix".to_string(),
+        _ => "this dimension differs from the recorded fingerprint".to_string(),
     }
 }
 
@@ -358,15 +374,23 @@ pub fn env_check(root: &Path, recipe: &[Software]) -> i32 {
     let current = envhash_dimensions(root, recipe);
     let moved = envhash_delta(&recorded, &current);
     for kind in &moved {
-        println!("moved    {kind} — {}", dimension_meaning(kind));
+        println!("moved    {kind} — {}", dimension_meaning(kind, root));
     }
     for d in &current {
         if d.value.is_none() {
             println!("unread   {} (not readable on this machine; never reported as moved)", d.kind);
         }
     }
+    let unread = current.iter().filter(|d| d.value.is_none()).count();
     if moved.is_empty() {
-        println!("-- the tree matches the recorded fingerprint");
+        if unread > 0 {
+            println!(
+                "-- matches on the {} dimension(s) this machine could read; {unread} went unread (listed above) and were not compared",
+                current.len() - unread
+            );
+        } else {
+            println!("-- the tree matches the recorded fingerprint");
+        }
     } else {
         println!(
             "-- {} dimension(s) moved since the fingerprint was recorded. This is advisory: nothing is gated, and \

@@ -17,11 +17,13 @@
 # at #write-tests each was pointed at the test that actually discharges it, and
 # `--strict-discharge` is clean.
 #
-# The schema disjointness of the two artifacts is proved, not merely tested: the
-# fact partition is a total function in src/envhash.rs, and the harness quantifies
-# over the whole fact set, so no fact can be recorded by both files and none can be
-# recorded by neither. The integration test holds the two real files against that
-# same partition.
+# The schema disjointness of the two artifacts: the fact partition is a total
+# function in src/envhash.rs and the harness quantifies over the whole fact set, so
+# the PARTITION has no overlap and no gap. What each writer then does with it is a
+# separate claim: the fingerprint derives its stanza names from the partition, so
+# its conformance follows; the receipt writer does not consult it, so the receipt's
+# conformance is asserted by test, not proved. The claim is stated at that width
+# because the review found the earlier wording carrying more than the proof does.
 #
 # Worktree-hook coverage (CompleteSetupCoversWorktreeHooks) is NOT proved. The
 # property is about directories on disk carrying a script and a binary, which no
@@ -138,18 +140,18 @@ rule-success.AbandonBootstrap                  => test:bootstrap_abandons_on_ste
 rule-failure.AbandonBootstrap.1                => test:bootstrap_completion_starts_the_gate exercises=bootstrap
 
 # --- Invariants (behavioural) ---
-# The first two are the schema disjointness the plan owes a Kani harness; the
-# sixth is worktree-hook coverage, the other owed harness. Both promote to
-# `kani:` at #write-tests with their CI lane.
+# The first two are the schema disjointness, discharged by the proof harness. The
+# worktree-coverage invariant below is discharged by a test that runs the real
+# requirement builder; it is not proved, for the reason recorded in the header.
 invariant.ReceiptWritesOnlyEventFacts          => kani:the_two_artifacts_share_no_fact inputs=src/envhash.rs
 invariant.EnvHashWritesOnlyStateFacts          => kani:the_two_artifacts_share_no_fact inputs=src/envhash.rs
 invariant.OnlyMaterializeWritesReceipt         => test:install_hooks_write_is_envhash_only exercises=LIFECYCLE_RECEIPTS
 invariant.VerifyingOpsWriteNothing             => test:materialize_envhash_write_records_state_facts exercises=verify_setup
 invariant.ReceiptOnlyForRealizedRun            => test:materialize_run_aborts_on_failure exercises=--materialize
-invariant.CompleteSetupCoversWorktreeHooks     => test:complete_setup_implies_every_worktree_hooked exercises=hooks_installed
+invariant.CompleteSetupCoversWorktreeHooks     => test:setup_requires_a_hook_on_every_commit_surface exercises=setup_requirements
 invariant.BuildArtifactRequiredOnlyOnBuildHost => test:non_build_host_never_gaps_on_the_artifact exercises=built_here
 invariant.GapsAreMissingArtifacts              => test:every_gap_is_a_missing_required_artifact exercises=is_gap
-invariant.WorktreeRequirementNamesItsWorktree  => test:worktree_hook_gap_names_the_worktree exercises=RequirementKind
+invariant.WorktreeRequirementNamesItsWorktree  => test:setup_requires_a_hook_on_every_commit_surface exercises=WorktreeHookInstalled
 invariant.UnreadableDimensionNeverMoves        => test:unreadable_dimension_never_marked_moved exercises=envhash_delta
 invariant.DeltasNameObservedMoves              => test:every_delta_names_a_readable_moved_dimension exercises=envhash_delta
 invariant.CannotProceedOnlyWithoutRecord       => test:cannot_proceed_only_without_an_envhash exercises=env_check
