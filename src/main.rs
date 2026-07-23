@@ -1751,7 +1751,11 @@ struct Software {
     /// `build`/`toolchain` — the recorded deterministic recipe (run by `--verify-build`);
     /// `deploy` — which line (canonical name or a `worktree` dir) is the deployed line;
     /// `artifact` — `<path> <sha256>` the deployed artifact must hash to (attestation);
-    /// `repro_exempt` — `call/NNNN` authorizing a not-yet-reproducible migrated build.
+    /// `repro_waiver` — `call/NNNN` authorizing an exception to the reproducibility
+    /// property. It covers two cases since call/0046 folded the second in: a
+    /// migrated build that does not reproduce byte for byte yet, and a component
+    /// that cannot vendor its dependencies offline. Written `repro-waiver`; the
+    /// retired `repro-exempt` still parses and warns (call/0047).
     build: Option<String>,
     toolchain: Option<String>,
     deploy: Option<String>,
@@ -4598,10 +4602,10 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
             }
             if let Some(cite) = b.repro_exempt {
                 if cited_decision_exists(root, cite) {
-                    println!("EXEMPT   {tag} repro-exempt ({cite}) — rebuild comparison skipped");
+                    println!("WAIVED   {tag} repro-waiver ({cite}) — rebuild comparison skipped");
                     exempt += 1;
                 } else {
-                    println!("DRIFT    {tag} repro-exempt cites missing decision {cite}");
+                    println!("DRIFT    {tag} repro-waiver cites missing decision {cite}");
                     bad += 1;
                 }
                 continue;
@@ -4819,7 +4823,14 @@ fn parse_software(text: &str) -> Vec<Software> {
                     };
                     b.artifact = Some((unq(path, i), unq(sha, i)));
                 }
-                "repro-exempt" => b.repro_exempt = Some(unq(val, i)),
+                "repro-waiver" => b.repro_exempt = Some(unq(val, i)),
+                // The retired spelling, still read so an adopter's recipe keeps
+                // working across the rename, and reported so it does not stay
+                // (call/0047, deprecate-then-retire).
+                "repro-exempt" => {
+                    eprintln!("warn     `repro-exempt` is retired; rename it to `repro-waiver` (agentic-host call/0047)");
+                    b.repro_exempt = Some(unq(val, i));
+                }
                 "attest-host" => b.attest_host = Some(unq(val, i)),
                 _ => {}
             }
@@ -4874,7 +4885,11 @@ fn parse_software(text: &str) -> Vec<Software> {
                 };
                 cur.artifact = Some((unq(path, i), unq(sha, i)));
             }
-            "repro-exempt" => cur.repro_exempt = Some(unq(val, i)),
+            "repro-waiver" => cur.repro_exempt = Some(unq(val, i)),
+            "repro-exempt" => {
+                eprintln!("warn     `repro-exempt` is retired; rename it to `repro-waiver` (agentic-host call/0047)");
+                cur.repro_exempt = Some(unq(val, i));
+            }
             "hooks" => cur.hooks = Some(unq(val, i)),
             "deps-bundle" => {
                 // `deps-bundle = <url> <sha256>` — a pinned vendored-dependency bundle.
@@ -5858,9 +5873,9 @@ fn provenance_problems_owed(root: &Path, s: &Software, owed: &mut Vec<String>) -
         // An exemption must cite a real decision.
         if let Some(cite) = b.repro_exempt {
             if cited_decision_exists(root, cite) {
-                println!("warn     {tag} build is repro-exempt ({cite}) — reproducibility not proven");
+                println!("warn     {tag} carries a repro-waiver ({cite}) — reproducibility not proven");
             } else {
-                println!("DRIFT    {tag} repro-exempt cites missing decision {cite}");
+                println!("DRIFT    {tag} repro-waiver cites missing decision {cite}");
                 bad += 1;
             }
         }
@@ -10448,6 +10463,29 @@ mod software_tests {
         }
         for event_fact in ["disposition = done", "recorded = ", "tool = host-lifecycle@"] {
             assert!(text.contains(event_fact), "receipt is missing the event fact `{event_fact}`");
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The rename keeps an adopter's recipe working while telling them it moved:
+    // both spellings parse to the same waiver, and the retired one is reported
+    // (call/0047, the deprecate-then-retire discipline).
+    #[test]
+    fn both_waiver_spellings_parse_and_the_retired_one_is_reported() {
+        let base = std::env::temp_dir().join(format!("hl-waiver-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let recipe = |key: &str| {
+            format!("[software \"c\"]\n\turl = u\n\tpin = p\n\t{key} = call/0031\n")
+        };
+        for key in ["repro-waiver", "repro-exempt"] {
+            fs::write(base.join(SOFTWARE), recipe(key)).unwrap();
+            let parsed = load_software(&base);
+            assert_eq!(
+                parsed[0].repro_exempt.as_deref(),
+                Some("call/0031"),
+                "`{key}` records the waiver's decision"
+            );
         }
         let _ = fs::remove_dir_all(&base);
     }
