@@ -236,7 +236,16 @@ fn hook_binary_hash(root: &Path, recipe: &[Software]) -> Option<String> {
 
 /// Read every dimension on this machine. Unreadable dimensions carry `None`.
 pub fn envhash_dimensions(root: &Path, recipe: &[Software]) -> Vec<EnvDimension> {
-    let image = recipe.iter().find_map(|s| s.toolchain.as_deref()).and_then(pulled_image_digest);
+    // EVERY declared toolchain, not the first: a recipe with two images would
+    // otherwise record one and report "matches" while the other moved.
+    let mut digests: Vec<String> = recipe
+        .iter()
+        .filter_map(|s| s.toolchain.as_deref())
+        .filter_map(pulled_image_digest)
+        .collect();
+    digests.sort();
+    digests.dedup();
+    let image = if digests.is_empty() { None } else { sha256_text(&digests.join("\n")) };
     let values = [
         sha256_text(&worktree_paths(root, recipe)),
         hook_binary_hash(root, recipe),
@@ -290,16 +299,34 @@ pub fn parse_envhash(text: &str) -> Vec<EnvDimension> {
     out
 }
 
-/// The dimensions that moved: read now, differing from what was recorded. A
-/// dimension unreadable now never moves, whatever the record says, so a machine
-/// without a container runtime stays silent about the image.
+/// The one dimension whose probe is optional by design: a machine with no
+/// container runtime cannot read an image digest, and that silence is the settled
+/// behaviour rather than a finding.
+fn optional_probe(kind: &str) -> bool {
+    kind == "pulled_image"
+}
+
+/// The dimensions that moved: read now and differing from the record, OR recorded
+/// before and no longer readable at all. The second case matters because the
+/// founding evidence of this work was a commit gate that had gone MISSING: an
+/// absent hook binary makes its dimension unreadable, and a delta that skipped
+/// every unreadable dimension stayed silent about exactly the drift it was built
+/// to notice. Only the optional probe keeps that silence.
 pub fn envhash_delta(recorded: &[EnvDimension], current: &[EnvDimension]) -> Vec<String> {
     let mut moved = Vec::new();
     for c in current {
-        let Some(now) = &c.value else { continue };
         let was = recorded.iter().find(|r| r.kind == c.kind).and_then(|r| r.value.as_deref());
-        if was != Some(now.as_str()) {
-            moved.push(c.kind.clone());
+        match &c.value {
+            Some(now) => {
+                if was != Some(now.as_str()) {
+                    moved.push(c.kind.clone());
+                }
+            }
+            None => {
+                if was.is_some() && !optional_probe(&c.kind) {
+                    moved.push(c.kind.clone());
+                }
+            }
         }
     }
     moved
@@ -351,7 +378,7 @@ fn dimension_meaning(kind: &str, root: &Path) -> String {
     let dir = root.display();
     match kind {
         "worktree_paths" => format!("a component worktree appeared or disappeared; run `host-lifecycle software --verify-setup {dir}` to see whether the setup is still complete"),
-        "hook_binary" => format!("the installed commit-gate binary changed; run `host-lifecycle software --install-hooks {dir}` to restore the recorded gate"),
+        "hook_binary" => format!("the installed commit-gate binary changed or is gone; run `host-lifecycle software --install-hooks {dir}` to restore the recorded gate"),
         "pulled_image" => format!("the locally pulled toolchain image is a different digest; run `host-lifecycle software --verify-build {dir}` to confirm the artifact still reproduces"),
         "submodule_init" => format!("a submodule was initialized or de-initialized; run `git -C {dir} submodule update --init` (idempotent)"),
         "repo_path" => "the repository sits at a different absolute path than when the fingerprint was recorded (a move or a second clone); nothing to fix".to_string(),
@@ -468,12 +495,20 @@ mod tests {
     }
 
     // The settled image rule: with no container runtime the dimension is unreadable,
-    // so it never appears as moved even though the record holds a digest.
+    // so it never appears as moved even though the record holds a digest. That
+    // silence is for the OPTIONAL probe alone.
     #[test]
     fn unreadable_dimension_never_marked_moved() {
         let recorded = vec![dim("pulled_image", Some("sha256:old"))];
         let current = vec![dim("pulled_image", None)];
         assert!(envhash_delta(&recorded, &current).is_empty());
+
+        // A recorded gate binary that is now unreadable is GONE, which is the drift
+        // this work was filed for; skipping it stayed silent about the one thing the
+        // fingerprint exists to notice.
+        let recorded = vec![dim("hook_binary", Some("aaa"))];
+        let current = vec![dim("hook_binary", None)];
+        assert_eq!(envhash_delta(&recorded, &current), vec!["hook_binary".to_string()]);
     }
 
     // Every reported delta names a dimension read on this machine (the mirror of

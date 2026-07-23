@@ -132,7 +132,7 @@ fn main() {
         Some("env") => envhash::env(&args[2..]),
         Some("bootstrap") => bootstrap::bootstrap(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|bootstrap|env|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks|dream> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  scaffold <dir> <rev> [--dry-run] — scaffold rooms + write the stamp (the primitive; call/0041)");
@@ -4146,6 +4146,11 @@ fn software(args: &[String]) {
                 );
             }
             println!("-- all components at their pinned SHA; no worktree-symlink hazards");
+            // This check answers pin-versus-recorded and says nothing about whether
+            // THIS clone is set up: it stayed green through a tree with no hooks
+            // installed, which is the gap that produced plan/0074. Route to the
+            // command that answers the other question, without gating on it.
+            println!("-- setup completeness is a different question; run: host-lifecycle software --verify-setup {dir}");
         }
         "verify-build" => software_verify_build(&root, &recipe),
         "install-hooks" => software_install_hooks(&root, &recipe),

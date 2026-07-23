@@ -282,12 +282,25 @@ fn link_skills(root: &Path, recipe: &[Software]) -> bool {
     for (name, src) in skill_sources(root, recipe) {
         let dest = dest_root.join(&name);
         if dest.exists() {
+            // Something is there; whether it is the RIGHT thing is the question. A
+            // link resolving into another checkout (a copied tree) or an operator's
+            // own directory would otherwise read as satisfied forever.
+            let same = fs::canonicalize(&dest).ok() == fs::canonicalize(&src).ok();
+            if !same {
+                println!("conflict .claude/skills/{name} exists and does not resolve to {}", src.display());
+                ok = false;
+            }
             continue;
         }
         // A stale link that no longer resolves is replaced rather than kept: a
         // dangling link gates nothing and trips every tree walker.
         let _ = fs::remove_file(&dest);
-        if let Err(e) = crate::make_handle(&dest, &src) {
+        // Relative, matching what a project's own link script writes: an absolute
+        // link survives a COPY of the tree by pointing back at the original, which
+        // resolves, so nothing reports it while the skills belong to another
+        // checkout.
+        let target = pathdiff(&dest_root, &src);
+        if let Err(e) = crate::make_handle(&dest, &target) {
             eprintln!("host-lifecycle: cannot link skill {name}: {e}");
             ok = false;
         } else {
@@ -372,6 +385,28 @@ pub fn bootstrap(args: &[String]) {
                 }
             }
             StepKind::VerifySetup => process::exit(crate::setup::verify_setup(&root, &recipe)),
+        }
+    }
+}
+
+/// `src` expressed relative to `from`, falling back to the absolute path when the
+/// two share no root (an off-tree store, a different drive).
+fn pathdiff(from: &Path, src: &Path) -> PathBuf {
+    let (Ok(from), Ok(src)) = (fs::canonicalize(from), fs::canonicalize(src)) else {
+        return src.to_path_buf();
+    };
+    let mut up = PathBuf::new();
+    let mut base = from.as_path();
+    loop {
+        if let Ok(rest) = src.strip_prefix(base) {
+            return up.join(rest);
+        }
+        match base.parent() {
+            Some(p) => {
+                up.push("..");
+                base = p;
+            }
+            None => return src,
         }
     }
 }
