@@ -58,9 +58,14 @@ pub enum Weight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
     pub kind: RefKind,
-    /// `plan` or `call` for a register reference; the issue number's repository
-    /// is not carried by the reference, so this is empty for an issue.
+    /// `plan` or `call` for a register reference.
     pub room: String,
+    /// The repository an issue names, as written: `owner/repo` or a bare
+    /// component name. Empty for a register reference, and empty for a bare `#N`,
+    /// which is the case this tool refuses to guess at: in this very tree most
+    /// bare numbers name host-lifecycle issues while the origin remote is the
+    /// host, so a guessed link would be confidently wrong.
+    pub repo: String,
     pub number: String,
     pub anchor: Option<String>,
 }
@@ -69,31 +74,48 @@ pub struct Reference {
 /// and `#17` are references; anything else is not.
 pub fn parse_reference(text: &str) -> Option<Reference> {
     let t = text.trim();
-    if let Some(n) = t.strip_prefix('#') {
-        if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+    // A register reference first: `plan/0074#write-spec` ends in an anchor, not in
+    // an issue number, and reading it as an issue would reject it outright.
+    if let Some((room, rest)) = t.split_once('/') {
+        if ROOMS.contains(&room) {
+            let (number, anchor) = match rest.split_once('#') {
+                Some((n, a)) => (n, Some(a.to_string())),
+                None => (rest, None),
+            };
+            // Four digits is the register's shape; `plan/074` and `plan/00741` are
+            // not references, so a typo reads as malformed rather than resolving
+            // somewhere else.
+            if number.len() == 4 && number.chars().all(|c| c.is_ascii_digit()) {
+                return Some(Reference {
+                    kind: RefKind::Register,
+                    room: room.to_string(),
+                    repo: String::new(),
+                    number: number.to_string(),
+                    anchor,
+                });
+            }
             return None;
         }
-        return Some(Reference {
-            kind: RefKind::Issue,
-            room: String::new(),
-            number: n.to_string(),
-            anchor: None,
-        });
     }
-    let (room, rest) = t.split_once('/')?;
-    if !ROOMS.contains(&room) {
+    // An issue: `owner/repo#N`, `component#N`, or a bare `#N` whose repository is
+    // not written (which `emit` refuses to guess at).
+    let (repo, n) = t.rsplit_once('#')?;
+    if n.is_empty() || n.len() > 6 || !n.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    let (number, anchor) = match rest.split_once('#') {
-        Some((n, a)) => (n, Some(a.to_string())),
-        None => (rest, None),
-    };
-    // Four digits is the register's shape; `plan/074` and `plan/00741` are not
-    // references, so a typo reads as malformed rather than resolving elsewhere.
-    if number.len() != 4 || !number.chars().all(|c| c.is_ascii_digit()) {
+    if repo.contains(char::is_whitespace) || repo.matches('/').count() > 1 {
         return None;
     }
-    Some(Reference { kind: RefKind::Register, room: room.to_string(), number: number.to_string(), anchor })
+    if !repo.is_empty() && !repo.starts_with(|c: char| c.is_alphanumeric()) {
+        return None;
+    }
+    Some(Reference {
+        kind: RefKind::Issue,
+        room: String::new(),
+        repo: repo.to_string(),
+        number: n.to_string(),
+        anchor: None,
+    })
 }
 
 /// The path a register reference names: a milestone directory's README, or a
@@ -123,6 +145,16 @@ pub fn entry_path(root: &Path, reference: &Reference) -> Option<PathBuf> {
 /// The repository's forge coordinates, from the origin remote: `owner/repo`.
 /// `None` in a repository with no remote, which is why a URL can fail to build
 /// while a path cannot.
+/// The default branch of the origin remote, for a blob URL. `main` only as a
+/// last resort: a repository on `master` was handed a 404.
+pub fn default_branch(root: &Path) -> String {
+    crate::git_out(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .and_then(|r| r.trim().rsplit('/').next().map(str::to_string))
+        .or_else(|| crate::git_out(root, &["symbolic-ref", "--short", "HEAD"]).map(|r| r.trim().to_string()))
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| "main".to_string())
+}
+
 pub fn origin_slug(root: &Path) -> Option<String> {
     let url = crate::git_out(root, &["remote", "get-url", "origin"])?;
     let url = url.trim().trim_end_matches(".git");
@@ -151,10 +183,17 @@ pub fn resolution_of(root: &Path, reference: &Reference) -> Resolution {
         },
         // An issue resolves to a forge URL, and only where the remote says which
         // forge and which repository.
-        RefKind::Issue => match origin_slug(root) {
-            Some(_) => Resolution::Resolved,
-            None => Resolution::UnresolvedHere,
-        },
+        // An issue resolves when it names its repository (or can take an owner
+        // from the origin); a bare number names nothing this tool can resolve.
+        RefKind::Issue => {
+            let named = reference.repo.contains('/');
+            let owned = !reference.repo.is_empty() && origin_slug(root).is_some();
+            if named || owned {
+                Resolution::Resolved
+            } else {
+                Resolution::UnresolvedHere
+            }
+        }
     }
 }
 
@@ -178,13 +217,36 @@ pub fn emit(root: &Path, reference: &Reference, emission: Emission) -> Result<St
             if emission == Emission::Path {
                 return Err(format!("#{} names work in a forge, not a path", reference.number));
             }
-            let slug = origin_slug(root)
-                .ok_or_else(|| "no github origin remote, so an issue number cannot become a URL".to_string())?;
+            // A bare `#N` names no repository, and guessing the local origin is how
+            // a link ends up pointing at the wrong tracker: in this host most bare
+            // numbers name host-lifecycle issues while the origin is the host.
+            if reference.repo.is_empty() {
+                return Err(format!(
+                    "#{} names no repository. Write it as owner/repo#{} (or component#{}) so the link is unambiguous",
+                    reference.number, reference.number, reference.number
+                ));
+            }
+            let slug = if reference.repo.contains('/') {
+                reference.repo.clone()
+            } else {
+                // A bare component name takes the origin's owner: `host-lint#25`
+                // beside an origin of `connollydavid/agentic-host` is
+                // `connollydavid/host-lint`.
+                let owner = origin_slug(root)
+                    .and_then(|s| s.split_once('/').map(|(o, _)| o.to_string()))
+                    .ok_or_else(|| {
+                        format!(
+                            "no github origin remote, so `{}#{}` cannot be given an owner; write owner/repo#{}",
+                            reference.repo, reference.number, reference.number
+                        )
+                    })?;
+                format!("{owner}/{}", reference.repo)
+            };
             match emission {
                 Emission::FullUrl => Ok(format!("https://github.com/{slug}/issues/{}", reference.number)),
                 Emission::MarkdownLink => Ok(format!(
-                    "[{}#{}](https://github.com/{slug}/issues/{})",
-                    slug, reference.number, reference.number
+                    "[{slug}#{}](https://github.com/{slug}/issues/{})",
+                    reference.number, reference.number
                 )),
                 Emission::Path => unreachable!("answered above, before the remote is read"),
             }
@@ -206,7 +268,7 @@ pub fn emit(root: &Path, reference: &Reference, emission: Emission) -> Result<St
                 Emission::FullUrl => {
                     let slug = origin_slug(root)
                         .ok_or_else(|| "no github origin remote, so a URL cannot be built".to_string())?;
-                    Ok(format!("https://github.com/{slug}/blob/main/{rel}{anchor}"))
+                    Ok(format!("https://github.com/{slug}/blob/{}/{rel}{anchor}", default_branch(root)))
                 }
             }
         }
@@ -257,6 +319,7 @@ fn scan_line(line: &str) -> Vec<(Reference, bool, bool)> {
                         Reference {
                             kind: RefKind::Register,
                             room: room.to_string(),
+                            repo: String::new(),
                             number: digits,
                             anchor,
                         },
@@ -272,14 +335,30 @@ fn scan_line(line: &str) -> Vec<(Reference, bool, bool)> {
         }
         // An issue reference: `#N`, not preceded by a word character (which would
         // make it an anchor or a fragment) and not inside a link.
-        if bytes[i] == '#'
-            && (i == 0 || !(bytes[i - 1].is_alphanumeric() || bytes[i - 1] == '/' || bytes[i - 1] == '-'))
-        {
+        if bytes[i] == '#' {
+            // What precedes the `#`: a repository name makes this a complete
+            // reference, a word character makes it a fragment rather than one.
+            let mut r = i;
+            while r > 0 && (bytes[r - 1].is_alphanumeric() || bytes[r - 1] == '-' || bytes[r - 1] == '/' || bytes[r - 1] == '_' || bytes[r - 1] == '.') {
+                r -= 1;
+            }
+            let written: String = bytes[r..i].iter().collect();
             let digits: String = bytes[i + 1..].iter().take_while(|c| c.is_ascii_digit()).collect();
-            if !digits.is_empty() {
+            // A CSS colour is not an issue: `#0077cc` and `#123456` are six hex
+            // digits, and an issue number followed by a hex letter is not a number.
+            let hex_tail = bytes
+                .get(i + 1 + digits.chars().count())
+                .is_some_and(|c| c.is_ascii_hexdigit() && !c.is_ascii_digit());
+            if !digits.is_empty() && digits.len() <= 6 && !hex_tail && !(digits.len() == 6 && written.is_empty()) {
                 let end = i + 1 + digits.chars().count();
                 out.push((
-                    Reference { kind: RefKind::Issue, room: String::new(), number: digits, anchor: None },
+                    Reference {
+                        kind: RefKind::Issue,
+                        room: String::new(),
+                        repo: written,
+                        number: digits,
+                        anchor: None,
+                    },
                     enclosing_link(&bytes, i, end),
                     in_inline_code(&bytes, i),
                 ));
@@ -361,9 +440,21 @@ pub fn scan_document(text: &str, file: &str, root: &Path) -> Vec<Finding> {
 /// pointer, `2` on a usage error.
 pub fn refs_check(root: &Path) -> i32 {
     let docs = crate::authored_docs(root);
+    if docs.is_empty() {
+        // A clean verdict over nothing is the fail-unsafe shape: a cold reader
+        // cannot tell it from a real pass.
+        eprintln!(
+            "host-lifecycle: no authored markdown found under {} (not a git repository, or nothing tracked?)",
+            root.display()
+        );
+        return 2;
+    }
+    let rooms_here: Vec<&str> = ROOMS.iter().copied().filter(|r| root.join(r).is_dir()).collect();
     let mut findings: Vec<Finding> = Vec::new();
+    let mut unchecked_registers = 0usize;
     for doc in &docs {
         let Ok(text) = fs::read_to_string(root.join(doc)) else { continue };
+        unchecked_registers += count_unowned_registers(&text, root);
         findings.extend(scan_document(&text, doc, root));
     }
     let dead: Vec<&Finding> = findings.iter().filter(|f| f.weight == Weight::DeadPointer).collect();
@@ -397,15 +488,54 @@ pub fn refs_check(root: &Path) -> i32 {
     }
     if !debt.is_empty() {
         println!(
-            "-- {} bare issue reference(s) in {} file(s). Advisory: the site cannot render them and a reader outside the forge cannot follow them. Write each as a markdown link: `host-lifecycle resolve '#N' --markdown {}`.",
+            "-- {} doc(s) swept. {} bare issue reference(s) in {} file(s): they name no repository, so the site cannot render them and a reader cannot tell whose tracker they mean.",
+            docs.len(),
             debt.len(),
-            by_file.len(),
+            by_file.len()
+        );
+        println!("   Advisory: nothing is blocked. No flag fixes this; each reference is an edit.");
+        println!(
+            "   Write each as owner/repo#N inside a link. For one of them: host-lifecycle resolve connollydavid/host-lifecycle{} --markdown {}",
+            debt[0].text,
             root.display()
         );
         return 3;
     }
-    println!("-- every reference in the authored docs resolves and renders");
+    println!(
+        "-- {} doc(s) swept; every reference in them resolves and renders",
+        docs.len()
+    );
+    if unchecked_registers > 0 {
+        println!(
+            "   {unchecked_registers} register reference(s) name a room this repository does not hold ({}); they belong to its governing host and were not checked",
+            if rooms_here.is_empty() { "no plan/ or call/ room here".to_string() } else { format!("rooms here: {}", rooms_here.join(", ")) }
+        );
+    }
     0
+}
+
+/// References this repository cannot check, because it does not own their room.
+/// Counted rather than reported: they are somebody else's registers, and a clean
+/// line that did not mention them would claim coverage it does not have.
+fn count_unowned_registers(text: &str, root: &Path) -> usize {
+    let mut n = 0;
+    let mut fenced = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        for (reference, _, in_code) in scan_line(line) {
+            if !in_code && reference.kind == RefKind::Register && !owns_room(root, &reference) {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// `host-lifecycle resolve <ref> [--markdown|--url] [<dir>]`.
@@ -445,12 +575,27 @@ pub fn resolve(args: &[String]) {
 /// `host-lifecycle refs --check <dir>`.
 pub fn refs(args: &[String]) {
     let mut check = false;
+    let mut fix = false;
     let mut pos: Vec<&String> = Vec::new();
     for a in args {
         match a.as_str() {
             "--check" => check = true,
+            "--fix" => fix = true,
             _ => pos.push(a),
         }
+    }
+    // `--fix` exists only to refuse, with the reason. The weak-agent probe read a
+    // report of 293 bare references and typed `refs --fix` twice, against a line
+    // that said no flag fixes this; a usage error would have taught it nothing, so
+    // the flag answers the question it was really asking.
+    if fix {
+        eprintln!(
+            "host-lifecycle: there is no --fix for references. A bare `#N` names no repository, and only the author knows which tracker it meant: rewriting it would be guessing."
+        );
+        eprintln!(
+            "  Do this instead: pick one reference, run `host-lifecycle resolve owner/repo#N --markdown <dir>`, and paste the link it prints."
+        );
+        process::exit(2);
     }
     if !check {
         eprintln!("host-lifecycle refs --check <dir>");

@@ -347,3 +347,69 @@ fn resolve_emits_the_form_asked_for() {
     assert!(text.contains("unresolved here"), "{text}");
     let _ = fs::remove_dir_all(&base);
 }
+
+// The forge emissions, which no test reached until the review mutated them and
+// watched every test stay green: a reference that names its repository resolves
+// to that repository's tracker, and a bare number is refused rather than pointed
+// at whichever remote happens to be local.
+#[test]
+fn resolve_builds_forge_urls_from_the_named_repository() {
+    let base = host_fixture("refs-forge");
+    git(&base, &["remote", "add", "origin", "https://github.com/anowner/arepo.git"]);
+    fs::write(base.join("README.md"), "x\n").unwrap();
+    commit_all(&base);
+    let dir = base.to_string_lossy().to_string();
+
+    let (code, text) = run(&["resolve", "anowner/other#17", "--url", &dir]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(text.trim(), "https://github.com/anowner/other/issues/17");
+
+    let (code, text) = run(&["resolve", "other#17", "--markdown", &dir]);
+    assert_eq!(code, 0, "a bare component name takes the origin's owner: {text}");
+    assert_eq!(text.trim(), "[anowner/other#17](https://github.com/anowner/other/issues/17)");
+
+    let (code, text) = run(&["resolve", "#17", "--url", &dir]);
+    assert_eq!(code, 1, "a bare number names no repository: {text}");
+    assert!(text.contains("names no repository"), "{text}");
+
+    // A register URL uses the repository's own default branch, not a literal.
+    let (code, text) = run(&["resolve", "plan/0074", "--url", &dir]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("/blob/main/plan/0074-materialize/README.md"), "{text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// A checker that cannot read anything must not report a clean tree, and the
+// record layer is excluded whether or not the project has authored its list.
+#[test]
+fn refs_check_fails_closed_on_an_empty_corpus() {
+    let base = fixture("refs-empty");
+    let (code, text) = run(&["refs", "--check", &base.to_string_lossy()]);
+    assert_eq!(code, 2, "nothing to sweep is not a pass: {text}");
+    assert!(text.contains("no authored markdown"), "{text}");
+
+    let host = host_fixture("refs-noignore");
+    // No .host-lintignore at all, as a freshly scaffolded project has.
+    fs::write(host.join("MEMORY.md"), "the log cites plan/0099 and #17\n").unwrap();
+    fs::write(host.join("README.md"), "clean\n").unwrap();
+    commit_all(&host);
+    let (code, text) = run(&["refs", "--check", &host.to_string_lossy()]);
+    assert_eq!(code, 0, "the append-only log is excluded by construction: {text}");
+    assert!(!text.contains("MEMORY.md"), "{text}");
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&host);
+}
+
+// The refusal a weak agent's invented flag deserves: the reason, and the action
+// that does work.
+#[test]
+fn refs_fix_refuses_with_the_reason() {
+    let base = host_fixture("refs-fix");
+    fs::write(base.join("README.md"), "see #17\n").unwrap();
+    commit_all(&base);
+    let (code, text) = run(&["refs", "--fix", &base.to_string_lossy()]);
+    assert_eq!(code, 2);
+    assert!(text.contains("no --fix"), "{text}");
+    assert!(text.contains("resolve owner/repo#N --markdown"), "and names what does work: {text}");
+    let _ = fs::remove_dir_all(&base);
+}

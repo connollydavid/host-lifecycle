@@ -15,6 +15,12 @@
 # The outcomes that end a process (the sweep's exit split, a resolve that cannot
 # resolve) run the built binary from tests/exit_paths.rs, because a unit test
 # cannot observe an exit and a spawned stale binary would silently pass.
+#
+# The cast round mutated two forge-URL constructions and watched every test stay
+# green, so the issue emissions now have a test that gives its fixture a real
+# remote and asserts the URLs byte for byte. Every `exercises=` token below is an
+# identifier in src/refs.rs or a path the test names, never a word the output
+# happens to print.
 
 # --- Spec-integrity (covered by the check/analyse lane) ---
 enum-comparable.RefKind                        => structural
@@ -38,7 +44,7 @@ surface-provides.RefsSweep                     => structural
 transition-edge.Sweep.sweeping.clean           => test:refs_check_splits_clean_advisory_and_dead exercises=refs
 transition-edge.Sweep.sweeping.advisory        => test:refs_check_splits_clean_advisory_and_dead exercises=refs
 transition-edge.Sweep.sweeping.dead            => test:refs_check_splits_clean_advisory_and_dead exercises=refs
-transition-edge.Sweep.sweeping.error           => test:resolve_emits_the_form_asked_for exercises=resolve
+transition-edge.Sweep.sweeping.error           => test:refs_check_fails_closed_on_an_empty_corpus exercises=refs
 
 # --- Resolving one reference ---
 rule-success.ResolveRegister                   => test:resolves_a_register_reference_to_its_entry exercises=emit
@@ -47,44 +53,44 @@ rule-entity-creation.ResolveRegister.1         => test:reports_the_three_resolut
 rule-success.ResolveUnresolvedHere             => test:reports_unresolved_here_rather_than_guessing exercises=emit
 rule-failure.ResolveUnresolvedHere.1           => test:resolves_a_register_reference_to_its_entry exercises=entry_path
 rule-entity-creation.ResolveUnresolvedHere.1   => test:reports_the_three_resolution_outcomes exercises=resolution_of
-rule-success.ResolveIssue                      => test:resolve_emits_the_form_asked_for exercises=resolve
-rule-failure.ResolveIssue.1                    => test:url_needs_an_origin_and_the_anchor_survives exercises=origin_slug
-rule-entity-creation.ResolveIssue.1            => test:parses_the_reference_shapes exercises=parse_reference
-rule-success.ResolveIssueWithoutOrigin         => test:url_needs_an_origin_and_the_anchor_survives exercises=emit
-rule-failure.ResolveIssueWithoutOrigin.1       => test:resolve_emits_the_form_asked_for exercises=resolve
-rule-entity-creation.ResolveIssueWithoutOrigin.1 => test:url_needs_an_origin_and_the_anchor_survives exercises=Emission
+rule-success.ResolveIssue                      => test:resolve_builds_forge_urls_from_the_named_repository exercises=resolve
+rule-failure.ResolveIssue.1                    => test:resolve_builds_forge_urls_from_the_named_repository exercises=resolve
+rule-entity-creation.ResolveIssue.1            => test:resolve_builds_forge_urls_from_the_named_repository exercises=resolve
+rule-success.ResolveIssueWithoutOrigin         => test:resolve_builds_forge_urls_from_the_named_repository exercises=resolve
+rule-failure.ResolveIssueWithoutOrigin.1       => test:url_needs_an_origin_and_the_anchor_survives exercises=origin_slug
+rule-entity-creation.ResolveIssueWithoutOrigin.1 => test:url_needs_an_origin_and_the_anchor_survives exercises=emit
 
 # --- The sweep's two detectors ---
 rule-success.DetectDeadPointer                 => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=scan_document
 rule-failure.DetectDeadPointer.1               => test:a_repository_without_the_room_owns_no_dead_pointer exercises=scan_document
-rule-entity-creation.DetectDeadPointer.1       => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=DeadPointer
-rule-success.DetectUnrenderedIssue             => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=Unrendered
-rule-failure.DetectUnrenderedIssue.1           => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=in_link
+rule-entity-creation.DetectDeadPointer.1       => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=scan_document
+rule-success.DetectUnrenderedIssue             => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=scan_document
+rule-failure.DetectUnrenderedIssue.1           => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=enclosing_link
 rule-entity-creation.DetectUnrenderedIssue.1   => test:refs_check_splits_clean_advisory_and_dead exercises=refs
 
 # --- The verdict lifecycle ---
 rule-success.StartSweep                        => test:refs_check_splits_clean_advisory_and_dead exercises=refs
-rule-success.RecordFinding                     => test:refs_check_splits_clean_advisory_and_dead exercises=Advisory
-rule-failure.RecordFinding.1                   => test:refs_check_never_reports_the_record_layer exercises=host-lintignore
-rule-success.RecordDeadPointer                 => test:refs_check_splits_clean_advisory_and_dead exercises=DEAD
+rule-success.RecordFinding                     => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+rule-failure.RecordFinding.1                   => test:refs_check_fails_closed_on_an_empty_corpus exercises=MEMORY.md
+rule-success.RecordDeadPointer                 => test:refs_check_splits_clean_advisory_and_dead exercises=refs
 rule-failure.RecordDeadPointer.1               => test:a_repository_without_the_room_owns_no_dead_pointer exercises=scan_document
-rule-success.VerdictDead                       => test:refs_check_splits_clean_advisory_and_dead exercises=DEAD
+rule-success.VerdictDead                       => test:refs_check_splits_clean_advisory_and_dead exercises=refs
 rule-failure.VerdictDead.1                     => test:refs_check_never_reports_the_record_layer exercises=refs
-rule-success.VerdictAdvisory                   => test:refs_check_splits_clean_advisory_and_dead exercises=Advisory
+rule-success.VerdictAdvisory                   => test:refs_check_splits_clean_advisory_and_dead exercises=refs
 rule-failure.VerdictAdvisory.1                 => test:refs_check_never_reports_the_record_layer exercises=refs
 rule-success.VerdictClean                      => test:refs_check_never_reports_the_record_layer exercises=refs
 rule-failure.VerdictClean.1                    => test:refs_check_splits_clean_advisory_and_dead exercises=refs
-rule-success.VerdictError                      => test:resolve_emits_the_form_asked_for exercises=resolve
+rule-success.VerdictError                      => test:refs_check_fails_closed_on_an_empty_corpus exercises=refs
 rule-failure.VerdictError.1                    => test:refs_check_splits_clean_advisory_and_dead exercises=refs
 
 # --- Invariants ---
-invariant.ExcludedIsNeverReported              => test:refs_check_never_reports_the_record_layer exercises=host-lintignore
+invariant.ExcludedIsNeverReported              => test:refs_check_fails_closed_on_an_empty_corpus exercises=MEMORY.md
 invariant.QuotedIsNeverReported                => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=scan_document
 invariant.DeadPointerNeedsTheRoom              => test:a_repository_without_the_room_owns_no_dead_pointer exercises=scan_document
-invariant.DeadPointerIsAlwaysRegister          => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=DeadPointer
-invariant.LinkedIssueIsNeverReported           => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=in_link
+invariant.DeadPointerIsAlwaysRegister          => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=scan_document
+invariant.LinkedIssueIsNeverReported           => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=enclosing_link
 invariant.AnchorSurvivesResolution             => test:url_needs_an_origin_and_the_anchor_survives exercises=emit
-invariant.UrlNeedsOrigin                       => test:url_needs_an_origin_and_the_anchor_survives exercises=origin_slug
-invariant.CleanVerdictSawNothing               => test:refs_check_never_reports_the_record_layer exercises=refs
-invariant.AdvisoryNeverSawDeadPointer          => test:refs_check_splits_clean_advisory_and_dead exercises=Advisory
-invariant.DeadVerdictSawDeadPointer            => test:refs_check_splits_clean_advisory_and_dead exercises=DEAD
+invariant.UrlNeedsOrigin                       => test:resolve_builds_forge_urls_from_the_named_repository exercises=resolve
+invariant.CleanVerdictSawNothing               => test:refs_check_fails_closed_on_an_empty_corpus exercises=refs
+invariant.AdvisoryNeverSawDeadPointer          => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+invariant.DeadVerdictSawDeadPointer            => test:refs_check_splits_clean_advisory_and_dead exercises=refs

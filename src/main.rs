@@ -1909,13 +1909,32 @@ fn load_lintignore(root: &Path) -> Vec<String> {
 /// exactly what a reference sweep must never press to be rewritten.
 pub fn authored_docs(root: &Path) -> Vec<String> {
     let ignore = load_lintignore(root);
-    let Some(out) = git_out(root, &["ls-files", "*.md"]) else { return Vec::new() };
-    out.lines()
+    // Tracked AND untracked-but-not-ignored: an agent that authors a document,
+    // runs a checker and sees clean before committing has verified nothing.
+    let Some(out) = git_out(root, &["ls-files", "--cached", "--others", "--exclude-standard", "*.md"]) else {
+        return Vec::new();
+    };
+    let mut docs: Vec<String> = out
+        .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .filter(|rel| !host_lint::path_ignored(rel, &ignore))
+        // The record layer, excluded whether or not the project has authored its
+        // exclusion list: a fresh scaffold writes no list, and a checker that
+        // pressed a new adopter to rewrite their append-only log would be breaking
+        // the record on day one (call/0009).
+        .filter(|rel| !is_record_layer(rel))
         .map(String::from)
-        .collect()
+        .collect();
+    docs.sort();
+    docs.dedup();
+    docs
+}
+
+/// The append-only records every checker excludes by construction.
+fn is_record_layer(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    name == "MEMORY.md" || name.starts_with(".host-receipts") || name.starts_with(".host-lifecycle-receipts")
 }
 
 /// The prose-hygiene audit (plan/0030 D4): run host-lint's `--docs` engine in-process via
