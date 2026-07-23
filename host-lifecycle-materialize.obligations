@@ -17,13 +17,14 @@
 # at #write-tests each was pointed at the test that actually discharges it, and
 # `--strict-discharge` is clean.
 #
-# The schema disjointness of the two artifacts: the fact partition is a total
-# function in src/envhash.rs and the harness quantifies over the whole fact set, so
-# the PARTITION has no overlap and no gap. What each writer then does with it is a
-# separate claim: the fingerprint derives its stanza names from the partition, so
-# its conformance follows; the receipt writer does not consult it, so the receipt's
-# conformance is asserted by test, not proved. The claim is stated at that width
-# because the review found the earlier wording carrying more than the proof does.
+# The schema disjointness of the two artifacts is proved over the TOKENS the
+# writers emit, quantified over every variant the fact type admits (not over a
+# hand-maintained array: a second harness proves the array is total, because the
+# fingerprint iterates it). What the proof does NOT establish is that either file's
+# writer consults the partition: the fingerprint does, by an exhaustive match that
+# binds each stanza name to its own value, and the receipt does not, so the
+# receipt's conformance is asserted by `receipt_records_only_event_facts` and by
+# the two-file sweep in `materialize_envhash_write_records_state_facts`.
 #
 # Worktree-hook coverage (CompleteSetupCoversWorktreeHooks) is NOT proved. The
 # property is about directories on disk carrying a script and a binary, which no
@@ -81,7 +82,7 @@ transition-edge.EnvCheck.checking.cannot_proceed => test:env_check_cannot_procee
 transition-edge.CompletenessRun.verifying.complete => test:one_gap_blocks_a_complete_verdict exercises=verify_setup
 transition-edge.CompletenessRun.verifying.hazarded => test:verify_setup_hazarded_verdict exercises=--verify-setup
 transition-edge.BootstrapRun.bootstrapping.bootstrapped => test:bootstrap_completion_starts_the_gate exercises=bootstrap
-transition-edge.BootstrapRun.bootstrapping.abandoned => test:bootstrap_abandons_on_step_failure exercises=bootstrap
+transition-edge.BootstrapRun.bootstrapping.abandoned => test:bootstrap_abandons_on_a_failed_step exercises=bootstrap
 
 # --- The materialize event and its two orthogonal writers (#18) ---
 rule-success.StartMaterialize                  => test:materialize_run_reaches_realized exercises=--materialize
@@ -91,7 +92,6 @@ rule-success.AbortMaterialize                  => test:materialize_run_aborts_on
 rule-failure.AbortMaterialize.1                => test:materialize_then_check_roundtrip exercises=software_materialize
 rule-success.AppendMaterializeReceipt          => test:realized_run_appends_one_receipt exercises=append_materialize_receipt
 rule-entity-creation.AppendMaterializeReceipt.1 => test:materialize_receipt_names_its_components exercises=append_materialize_receipt
-rule-entity-creation.AppendMaterializeReceipt.2 => test:materialize_receipt_write_records_event_facts exercises=materialize_evidence
 rule-success.RefreshEnvHashOnMaterialize       => test:materialize_envhash_write_records_state_facts exercises=software_materialize
 rule-entity-creation.RefreshEnvHashOnMaterialize.1 => test:materialize_envhash_write_records_state_facts exercises=ENVHASH
 
@@ -102,7 +102,7 @@ rule-success.InstallHooksCoversWorktrees       => test:install_hooks_copies_scri
 rule-success.RefreshEnvHashOnInstallHooks      => test:install_hooks_copies_script_and_binary_at_pin exercises=software_install_hooks
 rule-entity-creation.RefreshEnvHashOnInstallHooks.1 => test:install_hooks_write_is_envhash_only exercises=write_envhash
 rule-success.RecordBootstrapHooks              => test:bootstrap_completion_starts_the_gate exercises=bootstrap
-rule-failure.RecordBootstrapHooks.1            => test:bootstrap_abandons_on_step_failure exercises=bootstrap
+rule-failure.RecordBootstrapHooks.1            => test:bootstrap_abandons_on_a_failed_step exercises=bootstrap
 rule-success.RefreshEnvHashOnBuildVerified     => test:verify_build_refreshes_the_envhash exercises=software_verify_build
 rule-entity-creation.RefreshEnvHashOnBuildVerified.1 => test:verify_build_refreshes_the_envhash exercises=ENVHASH
 
@@ -122,11 +122,11 @@ rule-failure.VerdictEnvClean.1                 => test:env_check_exits_zero_with
 
 # --- The completeness gate: recipe versus live tree ---
 rule-success.StartVerifySetup                  => test:one_gap_blocks_a_complete_verdict exercises=verify_setup
-rule-success.DetectMissingArtifact             => test:missing_required_artifact_gaps exercises=is_gap
+rule-success.DetectMissingArtifact             => test:setup_requires_a_hook_on_every_commit_surface exercises=setup_requirements
 rule-failure.DetectMissingArtifact.1           => test:present_or_unrequired_artifact_never_gaps exercises=is_gap
-rule-entity-creation.DetectMissingArtifact.1   => test:gap_names_its_requirement exercises=setup_requirements
-rule-success.RecordGap                         => test:verify_setup_no_false_hazard exercises=is_gap
-rule-failure.RecordGap.1                       => test:verify_setup_no_false_hazard exercises=is_gap
+rule-entity-creation.DetectMissingArtifact.1   => test:setup_requires_a_hook_on_every_commit_surface exercises=setup_requirements
+rule-success.RecordGap                         => test:setup_requires_a_hook_on_every_commit_surface exercises=verify_setup
+rule-failure.RecordGap.1                       => test:one_gap_blocks_a_complete_verdict exercises=verify_setup
 rule-success.VerdictSetupHazarded              => test:verify_setup_hazarded_verdict exercises=--verify-setup
 rule-failure.VerdictSetupHazarded.1            => test:one_gap_blocks_a_complete_verdict exercises=verify_setup
 rule-success.VerdictSetupComplete              => test:one_gap_blocks_a_complete_verdict exercises=verify_setup
@@ -135,9 +135,9 @@ rule-failure.VerdictSetupComplete.1            => test:verify_setup_hazarded_ver
 # --- The orchestrator: makes the state, verifies none of it ---
 rule-success.StartBootstrap                    => test:bootstrap_start_inits_its_latch exercises=plan_steps
 rule-success.CompleteBootstrap                 => test:bootstrap_completion_starts_the_gate exercises=bootstrap
-rule-failure.CompleteBootstrap.1               => test:bootstrap_abandons_on_step_failure exercises=bootstrap
-rule-success.AbandonBootstrap                  => test:bootstrap_abandons_on_step_failure exercises=bootstrap
-rule-failure.AbandonBootstrap.1                => test:bootstrap_completion_starts_the_gate exercises=bootstrap
+rule-failure.CompleteBootstrap.1               => test:bootstrap_abandons_on_a_failed_step exercises=bootstrap
+rule-success.AbandonBootstrap                  => test:bootstrap_abandons_on_a_failed_step exercises=bootstrap
+rule-failure.AbandonBootstrap.1                => test:bootstrap_reaches_the_gate_after_an_unperformable_step exercises=bootstrap
 
 # --- Invariants (behavioural) ---
 # The first two are the schema disjointness, discharged by the proof harness. The
@@ -145,13 +145,14 @@ rule-failure.AbandonBootstrap.1                => test:bootstrap_completion_star
 # requirement builder; it is not proved, for the reason recorded in the header.
 invariant.ReceiptWritesOnlyEventFacts          => kani:the_two_artifacts_share_no_fact inputs=src/envhash.rs
 invariant.EnvHashWritesOnlyStateFacts          => kani:the_two_artifacts_share_no_fact inputs=src/envhash.rs
-invariant.OnlyMaterializeWritesReceipt         => test:install_hooks_write_is_envhash_only exercises=LIFECYCLE_RECEIPTS
+invariant.OnlyMaterializeWritesReceipt         => test:install_hooks_copies_script_and_binary_at_pin exercises=software_install_hooks
 invariant.VerifyingOpsWriteNothing             => test:materialize_envhash_write_records_state_facts exercises=verify_setup
-invariant.ReceiptOnlyForRealizedRun            => test:materialize_run_aborts_on_failure exercises=--materialize
+invariant.ReceiptOnlyForRealizedRun            => test:materialize_abort_leaves_no_receipt_for_earlier_components exercises=--materialize
 invariant.CompleteSetupCoversWorktreeHooks     => test:setup_requires_a_hook_on_every_commit_surface exercises=setup_requirements
-invariant.BuildArtifactRequiredOnlyOnBuildHost => test:non_build_host_never_gaps_on_the_artifact exercises=built_here
+invariant.BuildArtifactRequiredOnlyOnBuildHost => test:setup_requires_a_hook_on_every_commit_surface exercises=built_here
+invariant.UnreadableProbeIsAbsent              => test:setup_requires_a_hook_on_every_commit_surface exercises=setup_requirements
 invariant.GapsAreMissingArtifacts              => test:every_gap_is_a_missing_required_artifact exercises=is_gap
-invariant.WorktreeRequirementNamesItsWorktree  => test:setup_requires_a_hook_on_every_commit_surface exercises=WorktreeHookInstalled
+invariant.WorktreeRequirementNamesItsWorktree  => test:setup_requires_a_hook_on_every_commit_surface exercises=setup_requirements
 invariant.UnreadableDimensionNeverMoves        => test:unreadable_dimension_never_marked_moved exercises=envhash_delta
 invariant.DeltasNameObservedMoves              => test:every_delta_names_a_readable_moved_dimension exercises=envhash_delta
 invariant.CannotProceedOnlyWithoutRecord       => test:cannot_proceed_only_without_an_envhash exercises=env_check

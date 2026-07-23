@@ -75,6 +75,35 @@ fn materialize_run_aborts_on_failure() {
     let _ = fs::remove_dir_all(&base);
 }
 
+// The same, with a component that DID realize before the failing one: a receipt
+// records a run that realized what it was asked to, so a run that aborted leaves
+// none — not even for the components it got through first.
+#[test]
+fn materialize_abort_leaves_no_receipt_for_earlier_components() {
+    let base = fixture("abort-partial");
+    let (src, pin) = seed_source(&base);
+    let host = base.join("host");
+    fs::create_dir_all(&host).unwrap();
+    fs::write(
+        host.join(".host-software"),
+        format!(
+            "[software \"good\"]\n\turl = {}\n\tpin = {pin}\n\n[software \"ghost\"]\n\turl = /nonexistent/never/here.git\n\tpin = 0000000000000000000000000000000000000000\n",
+            src.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let (code, text) = run(&["software", "--materialize", &host.to_string_lossy()]);
+    assert_eq!(code, 2, "the run aborts: {text}");
+    assert!(host.join("software").join("good").join("main").is_dir(), "the first component did realize");
+    assert!(
+        !host.join(RECEIPTS).exists(),
+        "and no provenance survives the abort: {}",
+        fs::read_to_string(host.join(RECEIPTS)).unwrap_or_default()
+    );
+    assert!(host.join(ENVHASH).is_file(), "the tree changed, so the fingerprint is refreshed");
+    let _ = fs::remove_dir_all(&base);
+}
+
 // A materialize that realized worktrees records the event once and refreshes the
 // fingerprint at the same call site.
 #[test]
@@ -163,13 +192,46 @@ fn bootstrap_completion_starts_the_gate() {
     let _ = fs::remove_dir_all(&base);
 }
 
+// A step that FAILS ends the run: the orchestrator reports it and never reaches
+// the gate, so nothing speaks for a setup it did not finish. (Distinct from a step
+// it merely cannot perform, below.)
+#[test]
+fn bootstrap_abandons_on_a_failed_step() {
+    let base = fixture("bootabandon");
+    let (src, pin) = seed_source(&base);
+    // The component offers a skill, so the link step has work to do.
+    fs::create_dir_all(src.join("skills").join("tend")).unwrap();
+    fs::write(src.join("skills").join("tend").join("SKILL.md"), "# tend\n").unwrap();
+    git(&src, &["add", "-A"]);
+    git(&src, &["commit", "-qm", "skill"]);
+    let out = Command::new("git").arg("-C").arg(&src).args(["rev-parse", "HEAD"]).output().unwrap();
+    let pin2 = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_ne!(pin, pin2);
+
+    let host = base.join("host");
+    fs::create_dir_all(&host).unwrap();
+    // `.claude` is a FILE, so the link step cannot create its directory.
+    fs::write(host.join(".claude"), "not a directory\n").unwrap();
+    fs::write(
+        host.join(".host-software"),
+        format!("[software \"demo\"]\n\turl = {}\n\tpin = {pin2}\n", src.to_string_lossy()),
+    )
+    .unwrap();
+    let (code, text) = run(&["bootstrap", &host.to_string_lossy()]);
+    assert_eq!(code, 1, "the failed step ends the run: {text}");
+    assert!(text.contains("skill"), "and says which step failed: {text}");
+    assert!(!text.contains("setup complete"), "the gate never speaks for an unfinished run: {text}");
+    assert!(!text.contains("install the commit hooks"), "later steps did not run: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
 // A step the orchestrator cannot perform does not end the run: the artifact it
 // cannot build is reported as owed, the run reaches the gate anyway, and the gate
 // states the verdict. Bootstrap never builds the recorded recipe itself — that
 // recipe is written for the pinned toolchain container, not for whatever rust is
 // on this machine.
 #[test]
-fn bootstrap_abandons_on_step_failure() {
+fn bootstrap_reaches_the_gate_after_an_unperformable_step() {
     let base = fixture("bootfail");
     let (src, pin) = seed_source(&base);
     // The component provides the commit gate but its recorded build cannot run, so

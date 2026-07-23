@@ -20,7 +20,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use crate::{Software, load_software, sha256_file, write_atomic};
@@ -212,7 +212,19 @@ fn worktree_paths(root: &Path, recipe: &[Software]) -> String {
 /// The installed tell-gate binary, if the repo carries one: its hash moves when
 /// a hook is reinstalled or rebuilt, which is the drift #19 was filed for.
 fn hook_binary_hash(root: &Path, recipe: &[Software]) -> Option<String> {
-    let hooks = crate::git_hooks_dir(root)?;
+    // Every gated surface, hashed together: the worktree hooks Bug A added are
+    // commit surfaces too, and a dimension that watched only the host repo stayed
+    // silent when a worktree's gate binary was removed.
+    let mut dirs: Vec<PathBuf> = vec![crate::git_hooks_dir(root)?];
+    for s in recipe {
+        for (_, path) in crate::setup::declared_worktrees(root, s) {
+            if let Some(h) = crate::git_hooks_dir(&path) {
+                if !dirs.contains(&h) {
+                    dirs.push(h);
+                }
+            }
+        }
+    }
     // The binary's name comes from the hooks-declaring component's recorded
     // artifact, exactly as the installer derives it. A literal name here made the
     // dimension permanently unreadable for every adopter whose gate is called
@@ -220,24 +232,60 @@ fn hook_binary_hash(root: &Path, recipe: &[Software]) -> Option<String> {
     let names: Vec<String> = recipe
         .iter()
         .filter(|s| s.hooks.is_some())
-        .filter_map(|s| s.artifact.as_ref())
-        .filter_map(|(p, _)| Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()))
+        .filter_map(|s| {
+            s.builds_view()
+                .into_iter()
+                .find_map(|b| b.artifact.cloned())
+                .map(|(p, _)| Path::new(&p).file_name().unwrap_or_default().to_string_lossy().to_string())
+        })
         .collect();
-    for name in names {
-        for candidate in [name.clone(), format!("{name}.exe")] {
-            let p = hooks.join(candidate);
-            if p.is_file() {
-                return sha256_file(&p);
+    let mut hashes: Vec<String> = Vec::new();
+    for hooks in dirs {
+        for name in &names {
+            for candidate in [name.clone(), format!("{name}.exe")] {
+                if let Some(h) = sha256_file(&hooks.join(candidate)) {
+                    hashes.push(h);
+                }
             }
         }
     }
-    None
+    if hashes.is_empty() {
+        return None;
+    }
+    hashes.sort();
+    sha256_text(&hashes.join("\n"))
 }
 
 /// Read every dimension on this machine. Unreadable dimensions carry `None`.
+///
+/// The name-to-value binding is an exhaustive match rather than two lists zipped
+/// positionally: the pairing is the property this file's correctness rests on,
+/// and a positional zip recorded the repository's path under the submodule stanza
+/// when the fact order changed, with every test and the proof still green.
 pub fn envhash_dimensions(root: &Path, recipe: &[Software]) -> Vec<EnvDimension> {
-    // EVERY declared toolchain, not the first: a recipe with two images would
-    // otherwise record one and report "matches" while the other moved.
+    FACTS
+        .iter()
+        .filter(|f| artifact_of(**f) == Artifact::EnvHash)
+        .map(|fact| EnvDimension {
+            kind: fact_token(*fact).to_string(),
+            value: match fact {
+                RecordedFact::WorktreePresent => sha256_text(&worktree_paths(root, recipe)),
+                RecordedFact::HookBinaryHash => hook_binary_hash(root, recipe),
+                RecordedFact::ImageDigest => pulled_image_digests(recipe),
+                RecordedFact::SubmoduleInitState => submodule_state(root).as_deref().and_then(sha256_text),
+                RecordedFact::RepoAbspath => sha256_text(&root.to_string_lossy()),
+                // The partition assigns every other fact to the receipt; this arm is
+                // unreachable, and saying so keeps the match exhaustive rather than
+                // silently defaulting a new state fact to "unreadable".
+                other => unreachable!("{other:?} is a receipt fact, not a fingerprint dimension"),
+            },
+        })
+        .collect()
+}
+
+/// The digests of EVERY declared toolchain image, hashed together: a recipe with
+/// two images must not report a match while one of them moved.
+fn pulled_image_digests(recipe: &[Software]) -> Option<String> {
     let mut digests: Vec<String> = recipe
         .iter()
         .filter_map(|s| s.toolchain.as_deref())
@@ -245,23 +293,7 @@ pub fn envhash_dimensions(root: &Path, recipe: &[Software]) -> Vec<EnvDimension>
         .collect();
     digests.sort();
     digests.dedup();
-    let image = if digests.is_empty() { None } else { sha256_text(&digests.join("\n")) };
-    let values = [
-        sha256_text(&worktree_paths(root, recipe)),
-        hook_binary_hash(root, recipe),
-        image,
-        submodule_state(root).as_deref().and_then(sha256_text),
-        sha256_text(&root.to_string_lossy()),
-    ];
-    // The dimensions ARE the state facts, read off the declared partition rather
-    // than restated: a fact the partition assigns to the receipt cannot become a
-    // stanza here, and the proof harness is what makes that assignment total.
-    FACTS
-        .iter()
-        .filter(|f| artifact_of(**f) == Artifact::EnvHash)
-        .zip(values)
-        .map(|(fact, value)| EnvDimension { kind: fact_token(*fact).to_string(), value })
-        .collect()
+    if digests.is_empty() { None } else { sha256_text(&digests.join("\n")) }
 }
 
 /// Render the fingerprint: one stanza per dimension, in the recipe's idiom.
@@ -299,34 +331,22 @@ pub fn parse_envhash(text: &str) -> Vec<EnvDimension> {
     out
 }
 
-/// The one dimension whose probe is optional by design: a machine with no
-/// container runtime cannot read an image digest, and that silence is the settled
-/// behaviour rather than a finding.
-fn optional_probe(kind: &str) -> bool {
-    kind == "pulled_image"
-}
-
-/// The dimensions that moved: read now and differing from the record, OR recorded
-/// before and no longer readable at all. The second case matters because the
-/// founding evidence of this work was a commit gate that had gone MISSING: an
-/// absent hook binary makes its dimension unreadable, and a delta that skipped
-/// every unreadable dimension stayed silent about exactly the drift it was built
-/// to notice. Only the optional probe keeps that silence.
+/// The dimensions that moved: read now, and differing from the record. A
+/// dimension unreadable now never moves, whatever the record says.
+///
+/// An earlier shape reported a recorded-then-unreadable dimension as moved, so
+/// that a deleted gate binary would not pass unnoticed. That crossed the line
+/// this whole plan is organized around: ABSENCE is the completeness gate's
+/// question, and its remedy was byte-identical to the gate's. The fingerprint
+/// reports change; the gate reports absence; the unreadable line below routes
+/// the reader to the gate rather than answering for it.
 pub fn envhash_delta(recorded: &[EnvDimension], current: &[EnvDimension]) -> Vec<String> {
     let mut moved = Vec::new();
     for c in current {
+        let Some(now) = &c.value else { continue };
         let was = recorded.iter().find(|r| r.kind == c.kind).and_then(|r| r.value.as_deref());
-        match &c.value {
-            Some(now) => {
-                if was != Some(now.as_str()) {
-                    moved.push(c.kind.clone());
-                }
-            }
-            None => {
-                if was.is_some() && !optional_probe(&c.kind) {
-                    moved.push(c.kind.clone());
-                }
-            }
+        if was != Some(now.as_str()) {
+            moved.push(c.kind.clone());
         }
     }
     moved
@@ -337,9 +357,19 @@ pub fn envhash_delta(recorded: &[EnvDimension], current: &[EnvDimension]) -> Vec
 /// publish local state and make every other clone read a delta that means
 /// nothing. The tool that writes the file is the one that owes the ignore line,
 /// because an adopter who never heard of the file cannot be expected to add it.
-fn ensure_gitignored(root: &Path, entry: &str) {
+pub fn ensure_gitignored(root: &Path, entry: &str) {
     let path = root.join(".gitignore");
-    let cur = fs::read_to_string(&path).unwrap_or_default();
+    // An unreadable .gitignore is NOT an empty one: treating a read error as ""
+    // replaced a tracked file's every rule with this one stanza, silently
+    // un-ignoring whatever it protected.
+    let cur = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            eprintln!("host-lifecycle: cannot read .gitignore ({e}); leaving it untouched — add `{entry}` by hand");
+            return;
+        }
+    };
     if cur.lines().any(|l| l.trim() == entry) {
         return;
     }
@@ -378,7 +408,7 @@ fn dimension_meaning(kind: &str, root: &Path) -> String {
     let dir = root.display();
     match kind {
         "worktree_paths" => format!("a component worktree appeared or disappeared; run `host-lifecycle software --verify-setup {dir}` to see whether the setup is still complete"),
-        "hook_binary" => format!("the installed commit-gate binary changed or is gone; run `host-lifecycle software --install-hooks {dir}` to restore the recorded gate"),
+        "hook_binary" => format!("the installed commit-gate binary changed; run `host-lifecycle software --verify-setup {dir}` to see whether this tree is still gated"),
         "pulled_image" => format!("the locally pulled toolchain image is a different digest; run `host-lifecycle software --verify-build {dir}` to confirm the artifact still reproduces"),
         "submodule_init" => format!("a submodule was initialized or de-initialized; run `git -C {dir} submodule update --init` (idempotent)"),
         "repo_path" => "the repository sits at a different absolute path than when the fingerprint was recorded (a move or a second clone); nothing to fix".to_string(),
@@ -405,7 +435,11 @@ pub fn env_check(root: &Path, recipe: &[Software]) -> i32 {
     }
     for d in &current {
         if d.value.is_none() {
-            println!("unread   {} (not readable on this machine; never reported as moved)", d.kind);
+            println!(
+                "unread   {} (not readable here, so never compared; whether that is a GAP is `host-lifecycle software --verify-setup {}`'s question)",
+                d.kind,
+                root.display()
+            );
         }
     }
     let unread = current.iter().filter(|d| d.value.is_none()).count();
@@ -503,12 +537,12 @@ mod tests {
         let current = vec![dim("pulled_image", None)];
         assert!(envhash_delta(&recorded, &current).is_empty());
 
-        // A recorded gate binary that is now unreadable is GONE, which is the drift
-        // this work was filed for; skipping it stayed silent about the one thing the
-        // fingerprint exists to notice.
+        // The same holds for every dimension, not just the optional probe: a gate
+        // binary that is GONE is an absence, and absence is the completeness gate's
+        // question. The fingerprint stays silent and the unread line routes there.
         let recorded = vec![dim("hook_binary", Some("aaa"))];
         let current = vec![dim("hook_binary", None)];
-        assert_eq!(envhash_delta(&recorded, &current), vec!["hook_binary".to_string()]);
+        assert!(envhash_delta(&recorded, &current).is_empty());
     }
 
     // Every reported delta names a dimension read on this machine (the mirror of
@@ -622,32 +656,75 @@ mod tests {
 mod kani_proofs {
     use super::*;
 
-    /// ReceiptWritesOnlyEventFacts and EnvHashWritesOnlyStateFacts, proved over the
-    /// whole fact set rather than the ones a test happens to name: every fact lands
-    /// in exactly one artifact, so no fact can be recorded by both files. The
-    /// integration test holds the real files against this same partition; the proof
-    /// is what says the partition itself has no overlap and no gap.
+    /// Every `RecordedFact`, reconstructed from an index, so the harness quantifies
+    /// over the TYPE rather than over a hand-maintained array. The earlier harness
+    /// swept `FACTS`, and a variant someone forgot to add there verified clean while
+    /// carrying an event token into the fingerprint.
+    fn fact_of(i: u8) -> RecordedFact {
+        match i {
+            0 => RecordedFact::MaterializationHappened,
+            1 => RecordedFact::Disposition,
+            2 => RecordedFact::Evidence,
+            3 => RecordedFact::RecordedAt,
+            4 => RecordedFact::ComponentNamed,
+            5 => RecordedFact::PinReference,
+            6 => RecordedFact::ImageReference,
+            7 => RecordedFact::WorktreePresent,
+            8 => RecordedFact::HookBinaryHash,
+            9 => RecordedFact::ImageDigest,
+            10 => RecordedFact::SubmoduleInitState,
+            _ => RecordedFact::RepoAbspath,
+        }
+    }
+
+    /// ReceiptWritesOnlyEventFacts and EnvHashWritesOnlyStateFacts: no fact carries
+    /// a token belonging to the other artifact, over every fact the type admits.
+    /// The property is stated in terms of the TOKENS the writers actually emit, so
+    /// it binds the files rather than restating the partition function.
     #[kani::proof]
     fn the_two_artifacts_share_no_fact() {
         let i: u8 = kani::any();
-        kani::assume((i as usize) < FACTS.len());
-        let fact = FACTS[i as usize];
-        let owner = artifact_of(fact);
-        // Exactly one owner: asserting both directions rules out a fact that some
-        // future edit maps to neither or to both.
-        assert!(owner == Artifact::Receipt || owner == Artifact::EnvHash);
-        assert!(!(owner == Artifact::Receipt && owner == Artifact::EnvHash));
-        // And the two sides are the sets the field table declares.
-        let is_event = matches!(
-            fact,
-            RecordedFact::MaterializationHappened
-                | RecordedFact::Disposition
-                | RecordedFact::Evidence
-                | RecordedFact::RecordedAt
-                | RecordedFact::ComponentNamed
-                | RecordedFact::PinReference
-                | RecordedFact::ImageReference
-        );
-        assert!(is_event == (owner == Artifact::Receipt));
+        kani::assume(i < 12);
+        let fact = fact_of(i);
+        let token = fact_token(fact);
+        match artifact_of(fact) {
+            // A fingerprint stanza is one of the five dimension names, and never a
+            // receipt key: no `disposition`, no `evidence`, no `recorded =`.
+            Artifact::EnvHash => assert!(
+                token == "worktree_paths"
+                    || token == "hook_binary"
+                    || token == "pulled_image"
+                    || token == "submodule_init"
+                    || token == "repo_path"
+            ),
+            // A receipt key is one of the seven event keys, and never a dimension.
+            Artifact::Receipt => assert!(
+                token == "materialize"
+                    || token == "disposition"
+                    || token == "evidence"
+                    || token == "recorded ="
+                    || token == "component"
+                    || token == "pin "
+                    || token == "toolchain"
+            ),
+        }
+    }
+
+    /// `FACTS` is the array the fingerprint iterates, so it must hold every fact the
+    /// type admits: a state fact missing from it would simply never be recorded.
+    #[kani::proof]
+    fn facts_covers_every_recorded_fact() {
+        let i: u8 = kani::any();
+        kani::assume(i < 12);
+        let fact = fact_of(i);
+        let mut found = false;
+        let mut j = 0;
+        while j < FACTS.len() {
+            if FACTS[j] == fact {
+                found = true;
+            }
+            j += 1;
+        }
+        assert!(found);
     }
 }

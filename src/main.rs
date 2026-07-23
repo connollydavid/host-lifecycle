@@ -5112,8 +5112,20 @@ fn append_materialize_receipt(root: &Path, s: &Software, items: usize) {
     }
 }
 
+/// Abort a materialize: the tree may already have changed (a store cloned, a
+/// worktree added), so the fingerprint is refreshed before leaving. No receipt is
+/// appended, because the run did not realize what it was asked to.
+fn materialize_abort(root: &Path, recipe: &[Software]) -> ! {
+    envhash::write_envhash(root, recipe);
+    process::exit(2)
+}
+
 fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
     let mut made = 0usize;
+    // Buffered, not appended in the loop: a run that aborts on a later component
+    // must leave no provenance for the earlier ones, because the receipt records a
+    // run that realized what it was asked to.
+    let mut receipts: Vec<(&Software, usize)> = Vec::new();
     for s in recipe {
         // What this component realized in THIS run: a component whose worktrees all
         // existed already is not an event, so it leaves no receipt and a re-run of a
@@ -5125,7 +5137,7 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
         // it must fail closed before touching the filesystem.
         if let Some(esc) = worktree_escapes(s) {
             eprintln!("host-lifecycle: refusing to materialize {}: `{esc}` escapes the host root", s.name);
-            process::exit(2);
+            materialize_abort(root, recipe);
         }
         // One-time migration from the plan/0029 layout (a bare repo named `.git`) to call/0039's
         // `.bare` store: rename the old `.git` bare directory to `.bare` and repair the existing
@@ -5138,11 +5150,11 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
         if old_store.is_dir() {
             if new_store.exists() {
                 eprintln!("host-lifecycle: software/{}: both the old `.git` bare store and a `.bare` store exist; remove the stray one and re-run (the old bare store is the `.git` directory)", s.name);
-                process::exit(2);
+                materialize_abort(root, recipe);
             }
             if let Err(e) = fs::rename(&old_store, &new_store) {
                 eprintln!("host-lifecycle: cannot migrate software/{}/.git to .bare: {e}", s.name);
-                process::exit(2);
+                materialize_abort(root, recipe);
             }
             git_ok(&new_store, &["worktree", "repair"]);
             println!("migrate  software/{}/.git -> .bare (call/0039)", s.name);
@@ -5164,7 +5176,7 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
             clone_args.push(bare_rel.as_str());
             if !git_ok(root, &clone_args) {
                 eprintln!("host-lifecycle: git clone --bare failed for {}", s.name);
-                process::exit(2);
+                materialize_abort(root, recipe);
             }
             git_ok(&bare, &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
             git_ok(&bare, &["fetch", "origin"]);
@@ -5179,7 +5191,7 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
             if fs::read_to_string(&gitlink).ok().as_deref() != Some(STORE_GITLINK_BODY) {
                 if let Err(e) = fs::write(&gitlink, STORE_GITLINK_BODY) {
                     eprintln!("host-lifecycle: cannot write {}: {e}", gitlink.display());
-                    process::exit(2);
+                    materialize_abort(root, recipe);
                 }
             }
         }
@@ -5196,7 +5208,7 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
             println!("skip     {canon_label} (exists)");
         } else if !add_worktree(&bare, &canon, &["worktree", "add", "-B", &s.branch, &canon.to_string_lossy(), &s.pin]) {
             eprintln!("host-lifecycle: worktree add {canon_label} @ {} failed", short(&s.pin));
-            process::exit(2);
+            materialize_abort(root, recipe);
         } else {
             println!("worktree {canon_label} @ {}", short(&s.pin));
             made += 1;
@@ -5219,7 +5231,7 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
             };
             if !add_worktree(&bare, &wtp, &args) {
                 eprintln!("host-lifecycle: worktree add {label} failed");
-                process::exit(2);
+                materialize_abort(root, recipe);
             }
             println!("worktree {label} ({branch})");
             made += 1;
@@ -5238,7 +5250,7 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
                 println!("skip     {target_s} (exists)");
             } else if !add_worktree(&bare, &target, &["worktree", "add", "-B", &w.branch, &target_s, &w.pin]) {
                 eprintln!("host-lifecycle: worktree add {target_s} @ {} failed", short(&w.pin));
-                process::exit(2);
+                materialize_abort(root, recipe);
             } else {
                 println!("worktree {target_s} ({} @ {})", w.branch, short(&w.pin));
                 made += 1;
@@ -5251,15 +5263,18 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
                 }
                 if let Err(e) = make_handle(&handle, &target) {
                     eprintln!("host-lifecycle: handle {label} -> {target_s} failed: {e}");
-                    process::exit(2);
+                    materialize_abort(root, recipe);
                 }
                 println!("handle   {label} -> {target_s}");
                 made += 1;
             }
         }
         if made > before {
-            append_materialize_receipt(root, s, made - before);
+            receipts.push((s, made - before));
         }
+    }
+    for (s, items) in receipts {
+        append_materialize_receipt(root, s, items);
     }
     // The second writer at this call site (plan/0074): the run's event went to the
     // provenance ledger, and the tree's new state goes to the fingerprint. The two
@@ -5557,7 +5572,7 @@ fn software_check_owed(root: &Path, recipe: &[Software], owed: &mut Vec<String>)
     // hazard above cannot see them, yet a dangling one trips a tree-walker (the Site-CI
     // regression). Re-run link-skills.sh after (de)materialization to clear it.
     for link in dangling_generated_links(root) {
-        println!("HAZARD   .claude/skills/{link} dangles (run link-skills.sh after materialize)");
+        println!("HAZARD   .claude/skills/{link} dangles (run: host-lifecycle bootstrap <dir>)");
         bad += 1;
     }
     // Re-check every recorded upgrade claim against the ledger (plan/0022 step 6).
@@ -6028,11 +6043,23 @@ fn rung_rederiver_problem(token: &str) -> Option<String> {
     if !matches!(token, "kani:" | "apalache:" | "tlaps:") {
         return None;
     }
-    // host-prove must spawn to completion (execute), not merely be findable on PATH.
-    if process::Command::new("host-prove").arg("--help").output().is_err() {
-        Some("host-prove, the re-deriver for every rung, does not run — install it on PATH".to_string())
-    } else {
+    // host-prove must RUN, not merely spawn: a stub on PATH spawns fine and told the
+    // gate the re-deriver was runnable. Exit status cannot settle it — the driver
+    // answers a bare invocation, `--help` and `doctor` alike with a non-zero usage
+    // convention — so the probe reads what the binary SAYS: the real driver names
+    // itself and the rungs it drives.
+    let out = match process::Command::new("host-prove").output() {
+        Ok(out) => out,
+        Err(_) => {
+            return Some("host-prove, the re-deriver for every rung, does not run — install it on PATH".to_string());
+        }
+    };
+    let mut said = String::from_utf8_lossy(&out.stdout).to_string();
+    said.push_str(&String::from_utf8_lossy(&out.stderr));
+    if said.contains("host-prove") && ["kani", "apalache", "tlaps"].iter().any(|r| said.contains(r)) {
         None
+    } else {
+        Some("a `host-prove` on PATH does not identify itself as the rung driver — reinstall it".to_string())
     }
 }
 

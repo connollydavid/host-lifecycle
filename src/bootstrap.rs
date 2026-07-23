@@ -61,25 +61,46 @@ impl StepKind {
 fn submodule_paths(root: &Path) -> Vec<PathBuf> {
     let text = fs::read_to_string(root.join(".gitmodules")).unwrap_or_default();
     text.lines()
-        .filter_map(|l| l.trim().strip_prefix("path = ").map(|p| root.join(p.trim())))
+        .filter_map(|l| {
+            let t = l.trim();
+            // `path = x` and `path=x` are both legal git config.
+            t.strip_prefix("path")
+                .map(str::trim_start)
+                .and_then(|r| r.strip_prefix('='))
+                .map(|p| root.join(p.trim()))
+        })
         .collect()
 }
 
-/// Whether the project declares any submodule at all, from git rather than a
-/// `.gitmodules` parse: `path = x` and `path=x` are both legal config, and a
-/// parser that misses one reports "no submodules" over a tree full of them.
-pub fn declares_submodules(root: &Path) -> bool {
-    !submodule_status(root).is_empty()
-}
-
-/// The declared submodules that are not populated here. `git submodule status`
-/// marks an uninitialized one with a leading `-`.
-pub fn uninitialized_submodules(root: &Path) -> Vec<String> {
-    submodule_status(root)
-        .into_iter()
-        .filter(|(init, _)| !init)
-        .map(|(_, path)| path)
-        .collect()
+/// Every declared submodule and whether it is usable here, as (path, ok). Read
+/// from git, which is authoritative: `path = x` and `path=x` are both legal in
+/// `.gitmodules`, and a parser that misses one reports "no submodules" over a
+/// tree full of them. A submodule git calls initialized but whose working tree
+/// was gutted is NOT ok: an empty directory offers nothing and every requirement
+/// sourced from it would otherwise vanish.
+pub fn submodule_states(root: &Path) -> Vec<(String, bool)> {
+    let git = submodule_status(root);
+    let declared = submodule_paths(root);
+    let mut out: Vec<(String, bool)> = git
+        .iter()
+        .map(|(init, path)| {
+            let dir = root.join(path);
+            let populated = dir.read_dir().map(|mut d| d.any(|e| e.map(|e| e.file_name() != ".git").unwrap_or(false))).unwrap_or(false);
+            (path.clone(), *init && populated)
+        })
+        .collect();
+    // `.gitmodules` declares one git does not report (an un-staged gitlink, or no
+    // git at all): the disagreement is itself a gap, never a reason to drop the
+    // class.
+    for p in declared {
+        let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string();
+        if !out.iter().any(|(path, _)| *path == rel) {
+            out.push((rel, false));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn submodule_status(root: &Path) -> Vec<(bool, String)> {
@@ -101,36 +122,50 @@ fn submodule_status(root: &Path) -> Vec<(bool, String)> {
         .collect()
 }
 
-fn submodules_populated(root: &Path) -> bool {
-    uninitialized_submodules(root).is_empty()
-}
-
 /// Every skill a materialized worktree or an initialized submodule offers, as
 /// (name, source dir). This is the generic form of a project's link-skills
 /// script: the sources are what the recipe materialized, not a hardcoded list.
 pub fn skill_sources(root: &Path, recipe: &[Software]) -> Vec<(String, PathBuf)> {
+    skill_sources_checked(root, recipe).0
+}
+
+/// Every skill a materialized worktree or an initialized submodule offers, as
+/// (name, source dir), PLUS the sources that could not be enumerated. An
+/// unreadable source is not "no skills": it is a question this machine cannot
+/// answer, and answering it "none" deleted requirements that existed a moment
+/// earlier.
+pub fn skill_sources_checked(root: &Path, recipe: &[Software]) -> (Vec<(String, PathBuf)>, Vec<PathBuf>) {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
-    let mut dirs: Vec<PathBuf> = recipe
+    let mut unreadable: Vec<PathBuf> = Vec::new();
+    // (component name from the RECIPE, directory): a name derived from the path
+    // leaf reads a non-`main` canonical branch as the component's name.
+    let mut dirs: Vec<(String, PathBuf)> = recipe
         .iter()
-        .map(|s| worktree_dir(root, &s.name, &s.branch))
-        .filter(|d| d.is_dir())
+        .map(|s| (s.name.clone(), worktree_dir(root, &s.name, &s.branch)))
+        .filter(|(_, d)| d.is_dir())
         .collect();
-    dirs.extend(submodule_paths(root).into_iter().filter(|p| p.is_dir()));
-    for dir in dirs {
+    for p in submodule_paths(root).into_iter().filter(|p| p.is_dir()) {
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        dirs.push((name, p));
+    }
+    for (component, dir) in dirs {
         // A component that ships one root SKILL.md is linked under its own name.
         // Missing this form meant the orchestrator produced a strictly smaller set of
         // links than the script it replaces, and the gate could not see the difference.
         if dir.join("SKILL.md").is_file() {
-            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-                let component = if name == "main" {
-                    dir.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or(name)
-                } else {
-                    name
-                };
-                out.push((component.to_string(), dir.clone()));
-            }
+            out.push((component.clone(), dir.clone()));
         }
-        let Ok(rd) = fs::read_dir(dir.join("skills")) else { continue };
+        let skills_dir = dir.join("skills");
+        let rd = match fs::read_dir(&skills_dir) {
+            Ok(rd) => rd,
+            // Absent is legitimate (most components offer no skills); present but
+            // unreadable is a gap the caller must hear about.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unreadable.push(skills_dir);
+                continue;
+            }
+        };
         let mut found: Vec<(String, PathBuf)> = rd
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir())
@@ -141,14 +176,7 @@ pub fn skill_sources(root: &Path, recipe: &[Software]) -> Vec<(String, PathBuf)>
     }
     out.sort();
     out.dedup();
-    out
-}
-
-/// Whether every offered skill resolves under `.claude/skills/`.
-fn skills_linked(root: &Path, recipe: &[Software]) -> bool {
-    skill_sources(root, recipe)
-        .iter()
-        .all(|(name, _)| root.join(".claude").join("skills").join(name).exists())
+    (out, unreadable)
 }
 
 /// The components whose artifact this tree needs locally: the commit gate installs
@@ -166,12 +194,15 @@ fn artifact_owed(root: &Path, recipe: &[Software]) -> Vec<(String, String, PathB
         // `build` field, and reading only the flat fields made the orchestrator and
         // the gate disagree about whether there was anything to build.
         for b in s.builds_view() {
-            let (Some((path, _)), Some(build)) = (b.artifact, b.build) else { continue };
+            let Some((path, _)) = b.artifact else { continue };
             if b.attest_host.is_some_and(|h| h != std::env::consts::OS) {
                 continue;
             }
             if !worktree.join(path).is_file() {
-                out.push((s.name.clone(), build.to_string(), worktree.clone()));
+                // A recipe with no `build` line cannot say how to produce it, which
+                // is worth reporting rather than skipping.
+                let how = b.build.unwrap_or("no `build =` recorded: the recipe cannot say how to produce it");
+                out.push((s.name.clone(), how.to_string(), worktree.clone()));
             }
         }
     }
@@ -222,30 +253,46 @@ pub const SEQUENCE: [StepKind; 7] = [
 /// earlier steps created (materializing a worktree is what makes its skills
 /// visible to link).
 pub fn read_step(root: &Path, recipe: &[Software], kind: StepKind) -> Step {
+    // Satisfaction is the GATE's judgement, read fresh. The orchestrator used to
+    // carry its own copy of each predicate, and the two drifted: a component with
+    // an artifact and no build line made the gate hazard while the step read
+    // satisfied, so re-running never converged.
+    let unmet = |kinds: &[crate::setup::RequirementKind]| -> usize {
+        crate::setup::setup_requirements(root, recipe)
+            .iter()
+            .filter(|r| kinds.contains(&r.kind) && r.is_gap())
+            .count()
+    };
     let (detail, satisfied) = match kind {
-        StepKind::InitSubmodules => (
-            format!("{} declared", submodule_paths(root).len()),
-            submodules_populated(root),
-        ),
-        StepKind::Materialize => (
-            format!("{} component(s)", recipe.len()),
-            recipe.iter().all(|s| worktree_dir(root, &s.name, &s.branch).is_dir()),
-        ),
-        StepKind::LinkSkills => (
-            format!("{} skill(s) offered", skill_sources(root, recipe).len()),
-            skills_linked(root, recipe),
-        ),
+        StepKind::InitSubmodules => {
+            let n = unmet(&[crate::setup::RequirementKind::SubmodulesInitialized]);
+            (format!("{n} uninitialized"), n == 0)
+        }
+        StepKind::Materialize => {
+            let n = unmet(&[
+                crate::setup::RequirementKind::WorktreeMaterialized,
+                crate::setup::RequirementKind::SkillSourceReadable,
+            ]);
+            (format!("{} component(s), {n} worktree(s) missing", recipe.len()), n == 0)
+        }
+        StepKind::LinkSkills => {
+            let n = unmet(&[crate::setup::RequirementKind::SkillLinked]);
+            (format!("{} skill(s) offered, {n} unlinked", skill_sources(root, recipe).len()), n == 0)
+        }
         StepKind::BuildArtifact => {
             let owed = artifact_owed(root, recipe);
             (
                 owed.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>().join(", "),
-                owed.is_empty(),
+                unmet(&[crate::setup::RequirementKind::BuildArtifactPresent]) == 0,
             )
         }
         // The hook install is a copy: idempotent by construction and cheap, so it runs
         // every time rather than being predicted. The gate is what says it landed.
         StepKind::InstallHooks => ("host repository and every materialized worktree".to_string(), false),
-        StepKind::InstallRederiver => ("host-prove".to_string(), rederiver_owed(root, recipe).is_none()),
+        StepKind::InstallRederiver => (
+            "the shared re-deriver".to_string(),
+            unmet(&[crate::setup::RequirementKind::RederiverOnPath]) == 0,
+        ),
         StepKind::VerifySetup => ("the completeness gate".to_string(), false),
     };
     Step { kind, detail, satisfied }
@@ -278,14 +325,34 @@ fn link_skills(root: &Path, recipe: &[Software]) -> bool {
         eprintln!("host-lifecycle: cannot create {}: {e}", dest_root.display());
         return false;
     }
+    let sources = skill_sources(root, recipe);
+    // Prune first: a component dropped from the recipe leaves a link into nothing,
+    // and a dangling link trips every tree walker. The project script this
+    // replaces cleared them the same way.
+    if let Ok(rd) = fs::read_dir(&dest_root) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_link = fs::symlink_metadata(e.path()).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+            if is_link && (!e.path().exists() || !sources.iter().any(|(n, _)| *n == name)) {
+                let _ = fs::remove_file(e.path());
+                println!("prune    .claude/skills/{name} (no longer offered, or dangling)");
+            }
+        }
+    }
+    // Generated, never tracked (call/0005): the tool that makes them owes the
+    // ignore line, exactly as the fingerprint's writer does.
+    crate::envhash::ensure_gitignored(root, "/.claude/skills/*");
     let mut ok = true;
-    for (name, src) in skill_sources(root, recipe) {
+    for (name, src) in sources {
         let dest = dest_root.join(&name);
         if dest.exists() {
             // Something is there; whether it is the RIGHT thing is the question. A
             // link resolving into another checkout (a copied tree) or an operator's
             // own directory would otherwise read as satisfied forever.
-            let same = fs::canonicalize(&dest).ok() == fs::canonicalize(&src).ok();
+            let same = matches!(
+                (fs::canonicalize(&dest), fs::canonicalize(&src)),
+                (Ok(ref d), Ok(ref s)) if d == s
+            );
             if !same {
                 println!("conflict .claude/skills/{name} exists and does not resolve to {}", src.display());
                 ok = false;
@@ -368,14 +435,26 @@ pub fn bootstrap(args: &[String]) {
                 // report nothing about the rest of the tree.
                 let (installed, failed) = crate::install_hooks(&root, &recipe);
                 println!("hooks    {installed} target(s) gated, {failed} could not be");
+                // The op this step stands in for refreshes the fingerprint, because
+                // the gate binary's hash just moved. Skipping it left every freshly
+                // bootstrapped tree reporting a false drift on the one dimension this
+                // work was founded on.
+                crate::envhash::write_envhash(&root, &recipe);
             }
             StepKind::InstallRederiver => {
-                if let Some(worktree) = rederiver_owed(&root, &recipe) {
+                let owed = rederiver_owed(&root, &recipe);
+                if owed.is_none() {
+                    println!("         no component in the recipe carries the re-deriver; the gate names how to install it");
+                }
+                if let Some(worktree) = owed {
                     println!("install  host-prove from {}", worktree.display());
+                    // cargo's own root, which is on PATH for anyone who has cargo —
+                    // and bootstrap already needs cargo to run this step at all. A
+                    // `--root ~/.local` install lands somewhere the gate then reports
+                    // as missing on every run.
                     let ok = process::Command::new("cargo")
                         .args(["install", "--path"])
                         .arg(&worktree)
-                        .args(["--root", &home_local(&root)])
                         .status()
                         .map(|s| s.success())
                         .unwrap_or(false);
@@ -408,15 +487,6 @@ fn pathdiff(from: &Path, src: &Path) -> PathBuf {
             }
             None => return src,
         }
-    }
-}
-
-/// Where a PATH tool is installed: `~/.local`, the location the spine documents,
-/// falling back to the project root when there is no home directory to speak of.
-fn home_local(root: &Path) -> String {
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => format!("{h}/.local"),
-        _ => root.join(".local").to_string_lossy().to_string(),
     }
 }
 
@@ -457,9 +527,10 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    // Idempotence: over a tree whose state already holds, every predicted step reads
-    // satisfied, so a second run performs nothing. The two unconditional steps are
-    // the hook copy (idempotent by construction) and the gate (a read).
+    // Idempotence: the steps a run performs are the ones the GATE reports unmet, so
+    // over a tree the gate calls complete only the two unconditional steps run (the
+    // hook copy, idempotent by construction, and the gate itself). A bare directory
+    // is not a materialized worktree, so this fixture still owes materialize.
     #[test]
     fn bootstrap_completes_after_hooks() {
         let base = std::env::temp_dir().join(format!("hl-boot-idem-{}", process::id()));
@@ -467,7 +538,12 @@ mod tests {
         fs::create_dir_all(base.join("software").join("demo").join("main")).unwrap();
         let steps = plan_steps(&base, &[comp("demo")]);
         let performed: Vec<&StepKind> = steps.iter().filter(|s| !s.satisfied).map(|s| &s.kind).collect();
-        assert_eq!(performed, vec![&StepKind::InstallHooks, &StepKind::VerifySetup]);
+        assert!(
+            performed.contains(&&StepKind::Materialize),
+            "a directory that is not a git worktree is not materialized"
+        );
+        assert!(performed.contains(&&StepKind::InstallHooks) && performed.contains(&&StepKind::VerifySetup));
+        assert!(!performed.contains(&&StepKind::InitSubmodules), "a tree with no submodules owes none");
         let _ = fs::remove_dir_all(&base);
     }
 

@@ -86,11 +86,15 @@ enum Dimension {
 -- These are the completeness run's whole vocabulary: each is an artifact that is
 -- present or absent, never a value that moved (GapsAreMissingArtifacts).
 enum RequirementKind {
+    submodules_initialized
     worktree_materialized
+    gate_artifact_recorded
     host_hook_installed
     worktree_hook_installed
+    hook_binary_current
     build_artifact_present
     rederiver_on_path
+    skill_source_readable
     skill_linked
 }
 
@@ -140,13 +144,15 @@ entity MaterializeRun {
     }
 }
 
--- The appended provenance line (#18): one per realized materialize run, in the
+-- The appended provenance line (#18): one per component the run realized, in the
 -- same append-only shape as the `embed` receipt. It has no lifecycle field
 -- because it has no lifecycle: once written it is never rewritten, and a
--- correction to a receipt is another receipt.
+-- correction to a receipt is another receipt. Per component rather than per run,
+-- because the ledger is keyed by phase and component; and only for components
+-- that realized something, because a run that made nothing is not an event.
 entity Receipt {
     run: MaterializeRun
-    components: Set<String>
+    component: String
 }
 
 -- The recorded local STATE (#19): the gitignored `.host-envhash`. `recorded` is
@@ -187,14 +193,20 @@ entity EnvCheck {
     }
 }
 
--- One required local artifact, as the recipe implies it for this host.
+-- One required local artifact, as the recipe implies it for this host. The
+-- requirement SET comes from the recipe; the tree only answers present-or-absent.
 -- `required` is host-role-aware (BuildArtifactRequiredOnlyOnBuildHost);
--- `present` is the live tree. `worktree` names the worktree a per-worktree
--- requirement concerns, so a hook gap says which worktree is ungated.
+-- `probe_readable` is false when this machine cannot answer the question at all
+-- (an unresolvable hooks directory, an unreadable skill source), and such a
+-- requirement is absent rather than dropped (UnreadableProbeIsAbsent): a
+-- requirement that is never built can never be a gap, which is how a half-made
+-- tree read complete. `worktree` names the worktree a per-worktree requirement
+-- concerns, so a hook gap says which worktree is ungated.
 entity Requirement {
     kind: RequirementKind
     required: Boolean
     present: Boolean
+    probe_readable: Boolean
     worktree: Worktree?
 }
 
@@ -217,13 +229,13 @@ entity CompletenessRun {
     }
 }
 
--- One `host-lifecycle bootstrap <dir>` run: the orchestrator. `hooks_installed`
--- latches the install-hooks step, which is what makes worktree-hook coverage
--- provable at completion. Bootstrap's final act is to start the completeness
--- run, so the orchestrator never certifies itself.
+-- One `host-lifecycle bootstrap <dir>` run: the orchestrator. It carries no latch
+-- of its own: worktree-hook coverage is the completeness run's judgement, not a
+-- flag the orchestrator sets about itself, and a run whose step fails is
+-- abandoned before the gate speaks. Bootstrap's final act is to start the
+-- completeness run, so it never certifies its own work.
 entity BootstrapRun {
     status: bootstrapping | bootstrapped | abandoned
-    hooks_installed: Boolean
     transitions status {
         bootstrapping -> bootstrapped
         bootstrapping -> abandoned
@@ -305,7 +317,9 @@ rule AbortMaterialize {
 -- none.
 rule AppendMaterializeReceipt {
     when: run: MaterializeRun.status transitions_to realized
-    ensures: Receipt.created(run: run, components: run.components)
+    ensures:
+        for c in run.components:
+            Receipt.created(run: run, component: c)
     ensures: Write.created(
         writer: materialize,
         artifact: receipt,
@@ -369,10 +383,14 @@ rule RefreshEnvHashOnInstallHooks {
     )
 }
 
+-- Installing the hooks is a step of the run, and it refreshes the fingerprint
+-- exactly as the standalone op does: the gate binary's hash just moved, and a
+-- bootstrap that skipped the refresh left every fresh tree reporting a drift it
+-- had itself caused.
 rule RecordBootstrapHooks {
     when: HooksInstalled(project)
     requires: bootstrap_run.status = bootstrapping
-    ensures: bootstrap_run.hooks_installed = true
+    ensures: envhash.recorded = true
 }
 
 rule RefreshEnvHashOnBuildVerified {
@@ -472,14 +490,13 @@ rule VerdictSetupComplete {
 rule StartBootstrap {
     when: BootstrapStarts(project)
     ensures: bootstrap_run.status = bootstrapping
-    ensures: bootstrap_run.hooks_installed = false
 }
 
 -- Completion is guarded on the hooks step having run, and its last act hands the
 -- verdict to the gate: the orchestrator never certifies itself.
 rule CompleteBootstrap {
     when: BootstrapStepsDone(project)
-    requires: bootstrap_run.status = bootstrapping and bootstrap_run.hooks_installed
+    requires: bootstrap_run.status = bootstrapping
     ensures: bootstrap_run.status = bootstrapped
     ensures: VerifySetupStarts(project: project)
 }
@@ -565,6 +582,16 @@ invariant BuildArtifactRequiredOnlyOnBuildHost {
 invariant GapsAreMissingArtifacts {
     for g in Gaps:
         g.requirement.required and not g.requirement.present
+}
+
+-- The structural rule the gate is built on: a question this machine cannot answer
+-- is answered "absent", never dropped. Every fail-open this surface had was the
+-- same shape — an unreadable probe or an unlistable directory removed the
+-- requirement instead of failing it, and a requirement that does not exist can
+-- never be a gap.
+invariant UnreadableProbeIsAbsent {
+    for r in Requirements where not r.probe_readable:
+        not r.present
 }
 
 -- A per-worktree requirement names the worktree it concerns, so a hook gap can
