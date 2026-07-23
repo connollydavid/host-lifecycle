@@ -4220,19 +4220,50 @@ fn software_install_hooks(root: &Path, recipe: &[Software]) {
     }
 }
 
-/// The install loop, factored out to return `(installed, failed)` counts instead
-/// of exiting — keeps it testable.
-fn install_hooks(root: &Path, recipe: &[Software]) -> (usize, usize) {
-    let hooks_dir = match git_hooks_dir(root) {
-        Some(d) => d,
-        None => {
-            eprintln!("host-lifecycle: not a git repository: {}", root.display());
-            return (0, 1);
+/// Every hooks directory this install must cover: the host repository's, plus one
+/// per materialized worktree. A worktree is a real commit surface — commits land in
+/// it directly — so leaving it ungated let a tell through the one door the host
+/// repo's hook never watches (plan/0074, Bug A). Deduplicated by resolved path,
+/// because git shares one hooks directory across a store's worktrees, and skipping
+/// worktrees that are absent, so a host that materialized less is not a failure.
+fn hook_targets(root: &Path, recipe: &[Software]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let add = |out: &mut Vec<PathBuf>, d: Option<PathBuf>| {
+        if let Some(d) = d {
+            if !out.contains(&d) {
+                out.push(d);
+            }
         }
     };
-    if let Err(e) = fs::create_dir_all(&hooks_dir) {
-        eprintln!("host-lifecycle: cannot create {}: {e}", hooks_dir.display());
+    add(&mut out, git_hooks_dir(root));
+    for s in recipe {
+        let mut branches: Vec<String> = vec![s.branch.clone()];
+        branches.extend(s.worktrees.iter().cloned());
+        branches.extend(s.lines.iter().map(|w| w.branch.clone()));
+        for b in branches {
+            let wt = worktree_dir(root, &s.name, &b);
+            if wt.is_dir() {
+                add(&mut out, git_hooks_dir(&wt));
+            }
+        }
+    }
+    out
+}
+
+/// The install loop, factored out to return `(installed, failed)` counts instead
+/// of exiting — keeps it testable. `installed` counts gated targets, so one
+/// component installing into the host repo and two worktrees counts three.
+fn install_hooks(root: &Path, recipe: &[Software]) -> (usize, usize) {
+    let targets = hook_targets(root, recipe);
+    if targets.is_empty() {
+        eprintln!("host-lifecycle: not a git repository: {}", root.display());
         return (0, 1);
+    }
+    for t in &targets {
+        if let Err(e) = fs::create_dir_all(t) {
+            eprintln!("host-lifecycle: cannot create {}: {e}", t.display());
+            return (0, 1);
+        }
     }
     let mut installed = 0;
     let mut failed = 0;
@@ -4274,25 +4305,26 @@ fn install_hooks(root: &Path, recipe: &[Software]) -> (usize, usize) {
             "local build (differs from the canonical hash)"
         };
         let bin_name = Path::new(art_path).file_name().unwrap_or_default();
-        let dst_bin = hooks_dir.join(bin_name);
-        let installs = [
-            (script.as_path(), hooks_dir.join("pre-commit")),
-            (script.as_path(), hooks_dir.join("commit-msg")),
-            (bin.as_path(), dst_bin),
-        ];
-        let mut ok = true;
-        for (src, dst) in installs {
-            if let Err(e) = copy_executable(src, &dst) {
-                println!("FAIL     {} -> {}: {e}", src.display(), dst.display());
-                ok = false;
+        for hooks_dir in &targets {
+            let installs = [
+                (script.as_path(), hooks_dir.join("pre-commit")),
+                (script.as_path(), hooks_dir.join("commit-msg")),
+                (bin.as_path(), hooks_dir.join(bin_name)),
+            ];
+            let mut ok = true;
+            for (src, dst) in installs {
+                if let Err(e) = copy_executable(src, &dst) {
+                    println!("FAIL     {} -> {}: {e}", src.display(), dst.display());
+                    ok = false;
+                }
             }
-        }
-        if ok {
-            println!("OK       {} hooks installed (pre-commit, commit-msg, {}) — {provenance}", s.name,
-                bin_name.to_string_lossy());
-            installed += 1;
-        } else {
-            failed += 1;
+            if ok {
+                println!("OK       {} hooks installed in {} (pre-commit, commit-msg, {}) — {provenance}",
+                    s.name, hooks_dir.display(), bin_name.to_string_lossy());
+                installed += 1;
+            } else {
+                failed += 1;
+            }
         }
     }
     (installed, failed)
@@ -10638,12 +10670,18 @@ mod software_tests {
             artifact: Some(("target/release/host-lint".into(), art.into())),
             repro_exempt: None, hooks: Some("pre-commit".into()), deps_bundle: None, builds: vec![],
         };
-        // worktree at pin + binary present → installs all three files
-        assert_eq!(install_hooks(&base, &[mk(&pin, "deadbeef")]), (1, 0));
+        // worktree at pin + binary present → installs all three files, into the host
+        // repo AND the materialized worktree: a worktree is a real commit surface, so
+        // it carries its own local gate (plan/0074, Bug A).
+        assert_eq!(install_hooks(&base, &[mk(&pin, "deadbeef")]), (2, 0));
         let hooks = base.join(".git/hooks");
         assert!(hooks.join("pre-commit").is_file());
         assert!(hooks.join("commit-msg").is_file());
         assert!(hooks.join("host-lint").is_file());
+        let wt_hooks = wt.join(".git/hooks");
+        for f in ["pre-commit", "commit-msg", "host-lint"] {
+            assert!(wt_hooks.join(f).is_file(), "the worktree is gated too: {f} missing");
+        }
         // worktree off its pin → blocked
         assert_eq!(install_hooks(&base, &[mk("0000000000000000000000000000000000000000", "x")]), (0, 1));
 
