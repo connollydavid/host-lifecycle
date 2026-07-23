@@ -572,6 +572,18 @@ pub fn resolve(args: &[String]) {
     }
 }
 
+/// The first bare issue reference in the tree, as (file, `#N`), so a refusal can
+/// name a real one instead of a placeholder.
+fn first_bare_reference(root: &Path) -> Option<(String, String)> {
+    for doc in crate::authored_docs(root) {
+        let Ok(text) = fs::read_to_string(root.join(&doc)) else { continue };
+        if let Some(f) = scan_document(&text, &doc, root).into_iter().find(|f| f.weight == Weight::Unrendered) {
+            return Some((f.file, f.text));
+        }
+    }
+    None
+}
+
 /// `host-lifecycle refs --check <dir>`.
 pub fn refs(args: &[String]) {
     let mut check = false;
@@ -589,12 +601,19 @@ pub fn refs(args: &[String]) {
     // that said no flag fixes this; a usage error would have taught it nothing, so
     // the flag answers the question it was really asking.
     if fix {
+        let root = pos.first().map(|d| PathBuf::from(d.as_str())).unwrap_or_else(|| PathBuf::from("."));
         eprintln!(
             "host-lifecycle: there is no --fix for references. A bare `#N` names no repository, and only the author knows which tracker it meant: rewriting it would be guessing."
         );
-        eprintln!(
-            "  Do this instead: pick one reference, run `host-lifecycle resolve owner/repo#N --markdown <dir>`, and paste the link it prints."
-        );
+        // Named from this tree, not written as a placeholder: the weak-agent probe
+        // pasted `owner/repo#N` verbatim when the refusal spelled it that way.
+        match first_bare_reference(&root) {
+            Some((file, text)) => {
+                eprintln!("  Start with the first one, in {file}:");
+                eprintln!("  host-lifecycle resolve connollydavid/host-lifecycle{text} --markdown {}", root.display());
+            }
+            None => eprintln!("  This tree has no bare issue reference to rewrite."),
+        }
         process::exit(2);
     }
     if !check {

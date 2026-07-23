@@ -410,6 +410,7 @@ fn refs_fix_refuses_with_the_reason() {
     let (code, text) = run(&["refs", "--fix", &base.to_string_lossy()]);
     assert_eq!(code, 2);
     assert!(text.contains("no --fix"), "{text}");
-    assert!(text.contains("resolve owner/repo#N --markdown"), "and names what does work: {text}");
+    assert!(text.contains("--markdown"), "and names what does work: {text}");
+    assert!(text.contains("#17"), "naming a real reference from this tree, never a placeholder: {text}");
     let _ = fs::remove_dir_all(&base);
 }
