@@ -181,8 +181,10 @@ pub fn read_step(root: &Path, recipe: &[Software], kind: StepKind) -> Step {
     Step { kind, detail, satisfied }
 }
 
-/// The whole sequence read against the tree as it stands. Reporting and tests use
-/// this; the runner re-reads each step as it reaches it.
+/// The whole sequence read against the tree as it stands. The runner re-reads each
+/// step as it reaches it, so this exists for the tests that pin the derivation:
+/// which steps a given tree implies, and which of them a complete tree skips.
+#[cfg(test)]
 pub fn plan_steps(root: &Path, recipe: &[Software]) -> Vec<Step> {
     SEQUENCE.iter().map(|k| read_step(root, recipe, k.clone())).collect()
 }

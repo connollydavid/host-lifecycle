@@ -10253,11 +10253,13 @@ mod software_tests {
         assert!(keys(&receipt).contains(&"disposition".to_string()), "the receipt records the event");
         assert!(fingerprint.contains("[envhash \"repo_path\"]"), "the fingerprint records the machine");
 
-        // The verifying concerns read: the gate changes neither file, and planning the
-        // bootstrap sequence changes nothing at all.
+        // The verifying concerns read: the gate changes neither file, and reading the
+        // bootstrap sequence against the tree changes nothing at all.
         let before = (receipt.clone(), fingerprint.clone());
         let _ = setup::verify_setup(&host, &recipe);
-        let _ = bootstrap::plan_steps(&host, &recipe);
+        for kind in bootstrap::SEQUENCE {
+            let _ = bootstrap::read_step(&host, &recipe, kind);
+        }
         assert_eq!(
             (fs::read_to_string(host.join(LIFECYCLE_RECEIPTS)).unwrap(), fs::read_to_string(host.join(envhash::ENVHASH)).unwrap()),
             before,
