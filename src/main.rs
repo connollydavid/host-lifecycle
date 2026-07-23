@@ -25,6 +25,7 @@ mod memory;
 // `dream` is wired below; the MCP memory_consolidate tool (#extend-mcp)
 // reuses the engine.
 mod dream;
+mod bootstrap;
 mod envhash;
 mod setup;
 
@@ -129,6 +130,7 @@ fn main() {
         Some("tasks") => tasks(&args[2..]),
         Some("dream") => dream::dream(&args[2..]),
         Some("env") => envhash::env(&args[2..]),
+        Some("bootstrap") => bootstrap::bootstrap(&args[2..]),
         _ => {
             eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|tasks> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
@@ -159,6 +161,7 @@ fn main() {
             eprintln!("  receipt --record <phase> ...  — append a phase receipt (done|skip); --list prints the current set");
             eprintln!("  release <component> ...       — the gated, tool-carried release sequence (verify -> build -> tag -> receipt)");
             eprintln!("  env --check <dir>             — which local-environment dimensions moved since the fingerprint was recorded (advisory)");
+            eprintln!("  bootstrap <dir>               — run the fresh-clone setup sequence (submodules, materialize, skills, build, hooks, re-deriver), then the completeness gate");
             process::exit(2);
         }
     }
