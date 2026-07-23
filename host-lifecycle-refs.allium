@@ -1,0 +1,329 @@
+-- allium: 3
+-- host-lifecycle refs: resolving a register reference, and sweeping a tree for
+-- the references its published site cannot render (plan/0077,
+-- host-lifecycle#17).
+--
+-- The methodology makes a number an identity: a bare number at the plan root
+-- names a milestone, a numbered file under `call/` names a decision, and an
+-- issue number names work in a repository. Every room and every document refers
+-- to those numbers, and until now nothing resolved them, so a reference read
+-- like a link and behaved like text.
+--
+-- Two surfaces, one capability. `resolve` takes ONE reference and emits where it
+-- points, in the form the caller asks for. `refs --check` sweeps the authored
+-- markdown and reports the references a reader cannot follow: a register
+-- reference that points at nothing, and an issue number written bare.
+--
+-- Scope: which references resolve, what a resolution emits, which findings the
+-- sweep reports, and the exit split. Excludes (implementation): the glob that
+-- matches a numbered entry, the git remote parse, the markdown walk, the
+-- fenced-code skip, and exact output strings.
+--
+-- The record layer is excluded from the sweep by the project's existing
+-- exclusion list, and that exclusion is load-bearing rather than convenient: an
+-- append-only log is never rewritten to satisfy a checker, so a checker that
+-- reported it would be pressing the operator to break the record (call/0009).
+
+-- The kinds of reference a document carries. `register` is a `plan/NNNN` or
+-- `call/NNNN` pointing at a numbered entry in one of this project's rooms;
+-- `issue` is a `#N` naming work in a repository.
+enum RefKind {
+    register
+    issue
+}
+
+-- What resolving a reference established. `resolved` found the entry;
+-- `unresolved_here` searched the right room and found nothing, which in a
+-- software repository is the ordinary case (the number belongs to its governing
+-- host and the reference carries no repository); `malformed` is not a reference
+-- at all.
+enum Resolution {
+    resolved
+    unresolved_here
+    malformed
+}
+
+-- What a resolution emits. The path is the default; the markdown link and the
+-- full URL are asked for. A repository with no origin remote can emit the first
+-- two and says plainly that it cannot build the third.
+enum Emission {
+    path
+    markdown_link
+    full_url
+}
+
+-- A finding's weight, and the exit it drives. `dead_pointer` is mechanically
+-- evidenced: a register reference resolving to nothing is a pointer to a record
+-- that does not exist. `unrendered` is legibility debt: a bare issue number is a
+-- real reference that the site cannot render and a reader outside the forge
+-- cannot follow.
+enum Weight {
+    dead_pointer
+    unrendered
+}
+
+-- === Project: shared with the wider host-lifecycle spec ===
+
+entity Project {
+    name: String
+}
+
+-- The repository's forge coordinates, read from the origin remote. Absent in a
+-- repository with no remote, which is why the URL emission can fail while the
+-- other two cannot.
+entity Origin {
+    known: Boolean
+}
+
+-- One reference as written, with the facts the resolver reads: which room it
+-- names, whether a numbered entry matches, and whether it carries an anchor.
+-- `in_link` and `in_fence` are the document facts the sweep needs: a reference
+-- already inside a markdown link renders, and one inside fenced code is an
+-- example rather than a reference.
+entity Reference {
+    kind: RefKind
+    room: String
+    entry_matched: Boolean
+    has_anchor: Boolean
+    in_link: Boolean
+    in_fence: Boolean
+    excluded: Boolean
+}
+
+-- One resolution of one reference, and what it emitted.
+entity Resolved {
+    reference: Reference
+    outcome: Resolution
+    emission: Emission
+    -- The anchor survives every emission: a task node resolves to its heading,
+    -- not to the top of its milestone.
+    anchor_preserved: Boolean
+}
+
+-- One reported reference: what is wrong and how much it weighs.
+entity Finding {
+    reference: Reference
+    weight: Weight
+}
+
+-- One `refs --check` run. The verdict splits the way the memory audit's does
+-- (call/0045): a dead pointer gates, legibility debt advises, and a tree with
+-- neither is clean.
+entity Sweep {
+    status: sweeping | clean | advisory | dead | error
+    saw_finding: Boolean
+    saw_dead_pointer: Boolean
+    transitions status {
+        sweeping -> clean
+        sweeping -> advisory
+        sweeping -> dead
+        sweeping -> error
+        terminal: clean, advisory, dead, error
+    }
+}
+
+given {
+    origin: Origin
+    sweep: Sweep
+}
+
+surface ResolveOp {
+    facing project: Project
+    provides:
+        ResolveRequested(project)
+}
+
+surface RefsSweep {
+    facing project: Project
+    provides:
+        SweepStarts(project)
+        SweepCompletes(project)
+        SweepFails(project)
+}
+
+-- === Resolving one reference ===
+
+-- A register reference whose room holds a matching numbered entry resolves, and
+-- the anchor rides along.
+rule ResolveRegister {
+    when: reference: Reference.created
+    requires: reference.kind = register and reference.entry_matched
+    ensures: Resolved.created(
+        reference: reference,
+        outcome: resolved,
+        emission: path,
+        anchor_preserved: reference.has_anchor
+    )
+}
+
+-- The room was searched and holds no such entry. In a software repository this
+-- is the ordinary case rather than a defect: the number belongs to the governing
+-- host, and the reference carries no repository to look in. Reported as
+-- unresolved-here, never guessed.
+rule ResolveUnresolvedHere {
+    when: reference: Reference.created
+    requires: reference.kind = register and not reference.entry_matched
+    ensures: Resolved.created(
+        reference: reference,
+        outcome: unresolved_here,
+        emission: path,
+        anchor_preserved: reference.has_anchor
+    )
+}
+
+-- An issue number resolves only to a forge URL, and only where the origin remote
+-- says which forge and which repository. Nothing else can be built from `#17`.
+rule ResolveIssue {
+    when: reference: Reference.created
+    requires: reference.kind = issue and origin.known
+    ensures: Resolved.created(
+        reference: reference,
+        outcome: resolved,
+        emission: full_url,
+        anchor_preserved: false
+    )
+}
+
+-- No origin, no URL: the emission cannot be built, and saying so is the honest
+-- answer where inventing a repository name is not.
+rule ResolveIssueWithoutOrigin {
+    when: reference: Reference.created
+    requires: reference.kind = issue and not origin.known
+    ensures: Resolved.created(
+        reference: reference,
+        outcome: unresolved_here,
+        emission: full_url,
+        anchor_preserved: false
+    )
+}
+
+-- === The sweep ===
+
+-- A register reference that resolves to nothing is a dead pointer: a record the
+-- document claims exists and does not. Mechanically evidenced, so it gates.
+rule DetectDeadPointer {
+    when: reference: Reference.created
+    requires: reference.kind = register and not reference.entry_matched
+              and not reference.in_fence and not reference.excluded
+    ensures: Finding.created(reference: reference, weight: dead_pointer)
+}
+
+-- A bare issue number renders as nothing in the published site and names no
+-- repository to a reader outside the forge. Real, and legibility debt rather
+-- than a broken record, so it advises.
+rule DetectUnrenderedIssue {
+    when: reference: Reference.created
+    requires: reference.kind = issue and not reference.in_link
+              and not reference.in_fence and not reference.excluded
+    ensures: Finding.created(reference: reference, weight: unrendered)
+}
+
+-- === Verdict lifecycle ===
+
+rule StartSweep {
+    when: SweepStarts(project)
+    ensures: sweep.status = sweeping
+    ensures: sweep.saw_finding = false
+    ensures: sweep.saw_dead_pointer = false
+}
+
+rule RecordFinding {
+    when: finding: Finding.created
+    requires: sweep.status = sweeping
+    ensures: sweep.saw_finding = true
+}
+
+rule RecordDeadPointer {
+    when: finding: Finding.created
+    requires: sweep.status = sweeping and finding.weight = dead_pointer
+    ensures: sweep.saw_dead_pointer = true
+}
+
+rule VerdictDead {
+    when: SweepCompletes(project)
+    requires: sweep.status = sweeping and sweep.saw_dead_pointer
+    ensures: sweep.status = dead
+}
+
+rule VerdictAdvisory {
+    when: SweepCompletes(project)
+    requires: sweep.status = sweeping and sweep.saw_finding and not sweep.saw_dead_pointer
+    ensures: sweep.status = advisory
+}
+
+rule VerdictClean {
+    when: SweepCompletes(project)
+    requires: sweep.status = sweeping and not sweep.saw_finding
+    ensures: sweep.status = clean
+}
+
+rule VerdictError {
+    when: SweepFails(project)
+    requires: sweep.status = sweeping
+    ensures: sweep.status = error
+}
+
+-- === Invariants ===
+
+-- The record layer is never reported. An append-only log and a dated review
+-- artifact are records, and a checker that pressed the operator to rewrite one
+-- would be breaking the thing it audits (call/0009).
+invariant ExcludedIsNeverReported {
+    for f in Findings:
+        not f.reference.excluded
+}
+
+-- A fenced reference is an example. The tell gate reads its own fixtures the
+-- same way, and a checker that reported them would make every document that
+-- teaches the rule fail it.
+invariant FencedIsNeverReported {
+    for f in Findings:
+        not f.reference.in_fence
+}
+
+-- Only a register reference can be a dead pointer: an issue number names work in
+-- a forge, and this tool cannot know whether that work exists.
+invariant DeadPointerIsAlwaysRegister {
+    for f in Findings where f.weight = dead_pointer:
+        f.reference.kind = register
+}
+
+-- An issue number already inside a link renders, so it is never reported.
+invariant LinkedIssueIsNeverReported {
+    for f in Findings where f.weight = unrendered:
+        not f.reference.in_link
+}
+
+-- An anchor survives resolution: a task node resolves to its heading rather than
+-- to the top of its milestone, whichever emission was asked for.
+invariant AnchorSurvivesResolution {
+    for r in Resolveds where r.reference.kind = register and r.reference.has_anchor:
+        r.anchor_preserved
+}
+
+-- A URL cannot be built without an origin, and claiming otherwise would invent a
+-- repository name.
+invariant UrlNeedsOrigin {
+    for r in Resolveds where r.emission = full_url and r.outcome = resolved:
+        origin.known
+}
+
+-- A clean verdict implies nothing was reported; the dreaming-guard on the latch
+-- and the init at StartSweep are what make this provable.
+invariant CleanVerdictSawNothing {
+    for s in Sweeps where s.status = clean:
+        not s.saw_finding
+}
+
+-- Advisory never hides a dead pointer: legibility debt alone cannot gate, and a
+-- dead pointer alone cannot be filed as debt.
+invariant AdvisoryNeverSawDeadPointer {
+    for s in Sweeps where s.status = advisory:
+        not s.saw_dead_pointer
+}
+
+-- The gating verdict always rests on a dead pointer.
+invariant DeadVerdictSawDeadPointer {
+    for s in Sweeps where s.status = dead:
+        s.saw_dead_pointer
+}

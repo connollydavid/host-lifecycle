@@ -84,6 +84,13 @@ jobs:
         run: allium analyse host-lifecycle-materialize.allium
       - name: allium plan (materialize surface)
         run: allium plan host-lifecycle-materialize.allium
+      # The reference surface (plan/0077): same three lanes, same reason.
+      - name: allium check (reference surface)
+        run: allium check host-lifecycle-refs.allium
+      - name: allium analyse (reference surface)
+        run: allium analyse host-lifecycle-refs.allium
+      - name: allium plan (reference surface)
+        run: allium plan host-lifecycle-refs.allium
       - name: Build host-lifecycle (drives its own obligations check, no self-install)
         run: cargo build --release --locked
       - name: Discharge obligations (every obligation dispositioned, test refs exist)
