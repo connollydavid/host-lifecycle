@@ -545,7 +545,17 @@ mod tests {
         assert!(linked.iter().any(|(r, in_link, _)| r.number == "18" && *in_link));
         assert!(found.iter().all(|f| f.line != 6), "fenced references are examples, never findings");
 
-        // A repository that does not own the room is not the reference's host: its
+        // Quoted in backticks is shown rather than referred, for either kind; a
+        // register reference inside a LINK is still checked, because a dead
+        // pointer wrapped in a link is still dead.
+        let quoted = scan_document("an example: `plan/0098` and `#21`\n", "doc.md", &base);
+        assert!(quoted.is_empty(), "inline code quotes rather than refers: {quoted:?}");
+        let linked_dead = scan_document("[plan/0097](plan/0097-x/README.md)\n", "doc.md", &base);
+        assert_eq!(linked_dead.len(), 1, "a dead pointer inside a link is still dead");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A repository that does not own the room is not the reference's host: its
     // documents cite the numbers that govern it, and a sweep that called those
     // dead would redden every software repository for doing so.
     #[test]
@@ -557,16 +567,6 @@ mod tests {
         assert!(!owns_room(&base, &reference), "no room here, so this repository owns no such pointer");
         let found = scan_document("governed by call/0045 and plan/0074\n", "README.md", &base);
         assert!(found.is_empty(), "so nothing is reported: {found:?}");
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    // Quoted in backticks is shown rather than referred, for either kind; a
-        // register reference inside a LINK is still checked, because a dead
-        // pointer wrapped in a link is still dead.
-        let quoted = scan_document("an example: `plan/0098` and `#21`\n", "doc.md", &base);
-        assert!(quoted.is_empty(), "inline code quotes rather than refers: {quoted:?}");
-        let linked_dead = scan_document("[plan/0097](plan/0097-x/README.md)\n", "doc.md", &base);
-        assert_eq!(linked_dead.len(), 1, "a dead pointer inside a link is still dead");
         let _ = fs::remove_dir_all(&base);
     }
 
