@@ -500,6 +500,9 @@ mod tests {
         assert_eq!(link, "[plan/0074#write-spec](plan/0074-materialize/README.md#write-spec)");
         let decision = parse_reference("call/0045").unwrap();
         assert_eq!(emit(&base, &decision, Emission::Path).unwrap(), "call/0045-store-model.md");
+        // The path the resolution rests on, and the absence that is not one.
+        assert!(entry_path(&base, &decision).is_some());
+        assert!(entry_path(&base, &parse_reference("call/0099").unwrap()).is_none());
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -535,9 +538,29 @@ mod tests {
         assert_eq!(dead[0].text, "plan/0099");
         assert_eq!(debt.len(), 1, "one bare issue number: {found:?}");
         assert_eq!(debt[0].text, "#17");
+        // The linked issue on line 4 is not debt: `enclosing_link` reports it as
+        // in_link, and a reference that renders is not reported.
+        assert!(found.iter().all(|f| f.text != "#18"), "a linked issue renders: {found:?}");
+        let linked: Vec<(Reference, bool, bool)> = scan_line("[#18](https://github.com/o/r/issues/18)");
+        assert!(linked.iter().any(|(r, in_link, _)| r.number == "18" && *in_link));
         assert!(found.iter().all(|f| f.line != 6), "fenced references are examples, never findings");
 
-        // Quoted in backticks is shown rather than referred, for either kind; a
+        // A repository that does not own the room is not the reference's host: its
+    // documents cite the numbers that govern it, and a sweep that called those
+    // dead would redden every software repository for doing so.
+    #[test]
+    fn a_repository_without_the_room_owns_no_dead_pointer() {
+        let base = std::env::temp_dir().join(format!("hl-refs-noroom-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let reference = parse_reference("call/0045").unwrap();
+        assert!(!owns_room(&base, &reference), "no room here, so this repository owns no such pointer");
+        let found = scan_document("governed by call/0045 and plan/0074\n", "README.md", &base);
+        assert!(found.is_empty(), "so nothing is reported: {found:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // Quoted in backticks is shown rather than referred, for either kind; a
         // register reference inside a LINK is still checked, because a dead
         // pointer wrapped in a link is still dead.
         let quoted = scan_document("an example: `plan/0098` and `#21`\n", "doc.md", &base);
@@ -553,6 +576,8 @@ mod tests {
     fn reports_the_three_resolution_outcomes() {
         let base = fixture("outcomes");
         assert_eq!(resolution(&base, "plan/0074"), Resolution::Resolved);
+        assert_eq!(resolution_of(&base, &parse_reference("plan/0074").unwrap()), Resolution::Resolved);
+        assert_eq!(resolution_of(&base, &parse_reference("plan/0099").unwrap()), Resolution::UnresolvedHere);
         assert_eq!(resolution(&base, "plan/0099"), Resolution::UnresolvedHere);
         assert_eq!(resolution(&base, "plan/74"), Resolution::Malformed);
         assert_eq!(resolution(&base, "not a reference"), Resolution::Malformed);
@@ -568,7 +593,9 @@ mod tests {
         for emission in [Emission::Path, Emission::MarkdownLink] {
             assert!(emit(&base, &anchored, emission).unwrap().contains("#write-spec"));
         }
-        // The fixture is not a git repository, so no origin can be read.
+        // The fixture is not a git repository, so no origin can be read, and a URL
+        // is the one emission that needs one.
+        assert!(origin_slug(&base).is_none());
         let err = emit(&base, &anchored, Emission::FullUrl).unwrap_err();
         assert!(err.contains("origin"), "{err}");
         let issue = parse_reference("#17").unwrap();

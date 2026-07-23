@@ -265,3 +265,85 @@ fn bootstrap_reaches_the_gate_after_an_unperformable_step() {
     assert!(!text.contains("setup complete"), "and never reports a setup it did not finish");
     let _ = fs::remove_dir_all(&base);
 }
+
+/// A host fixture with the two rooms and a git repository, so the sweep's walk
+/// (`git ls-files`) sees its documents.
+fn host_fixture(name: &str) -> std::path::PathBuf {
+    let base = fixture(name);
+    git(&base, &["init", "-q", "-b", "main"]);
+    git(&base, &["config", "user.email", "t@t"]);
+    git(&base, &["config", "user.name", "t"]);
+    fs::create_dir_all(base.join("plan").join("0074-materialize")).unwrap();
+    fs::write(base.join("plan").join("0074-materialize").join("README.md"), "# m\n").unwrap();
+    fs::create_dir_all(base.join("call")).unwrap();
+    fs::write(base.join("call").join("0045-store-model.md"), "# d\n").unwrap();
+    base
+}
+
+fn commit_all(dir: &Path) {
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "docs"]);
+}
+
+// The sweep's exit split, end to end: a tree whose references all resolve and
+// render is clean; bare issue numbers advise; a dead register pointer gates.
+#[test]
+fn refs_check_splits_clean_advisory_and_dead() {
+    let base = host_fixture("refs-split");
+    let dir = base.to_string_lossy().to_string();
+
+    fs::write(base.join("README.md"), "governed by [plan/0074](plan/0074-materialize/README.md)\n").unwrap();
+    commit_all(&base);
+    let (code, text) = run(&["refs", "--check", &dir]);
+    assert_eq!(code, 0, "every reference resolves and renders: {text}");
+
+    fs::write(base.join("README.md"), "see #17 for the reason\n").unwrap();
+    commit_all(&base);
+    let (code, text) = run(&["refs", "--check", &dir]);
+    assert_eq!(code, 3, "a bare issue number advises: {text}");
+    assert!(text.contains("Advisory"), "and says so: {text}");
+    assert!(text.contains("--markdown"), "and names the remedy: {text}");
+
+    fs::write(base.join("README.md"), "see plan/0099 and #17\n").unwrap();
+    commit_all(&base);
+    let (code, text) = run(&["refs", "--check", &dir]);
+    assert_eq!(code, 1, "a dead pointer gates: {text}");
+    assert!(text.contains("DEAD") && text.contains("plan/0099"), "naming it: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// The record layer is never reported. An append-only log is not rewritten to
+// satisfy a checker, so the exclusion list the prose gate honours is the same one
+// the sweep reads.
+#[test]
+fn refs_check_never_reports_the_record_layer() {
+    let base = host_fixture("refs-record");
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join("MEMORY.md"), "the append-only log cites #17 and #18 and plan/0099\n").unwrap();
+    fs::write(base.join(".host-lintignore"), "MEMORY.md\n").unwrap();
+    commit_all(&base);
+    let (code, text) = run(&["refs", "--check", &dir]);
+    assert_eq!(code, 0, "an excluded record is not swept, dead pointer or not: {text}");
+    assert!(!text.contains("MEMORY.md"), "and is not named: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// Resolving one reference, through the real binary: the emission the caller asked
+// for, and a usage exit for text that is not a reference.
+#[test]
+fn resolve_emits_the_form_asked_for() {
+    let base = host_fixture("refs-resolve");
+    let dir = base.to_string_lossy().to_string();
+    let (code, text) = run(&["resolve", "plan/0074#write-spec", &dir]);
+    assert_eq!(code, 0);
+    assert!(text.trim().ends_with("README.md#write-spec"), "the anchor survives: {text}");
+    let (code, text) = run(&["resolve", "call/0045", "--markdown", &dir]);
+    assert_eq!(code, 0);
+    assert!(text.contains("[call/0045](call/0045-store-model.md)"), "{text}");
+    let (code, _) = run(&["resolve", "plan/74", &dir]);
+    assert_eq!(code, 2, "text that is not a reference is a usage error");
+    let (code, text) = run(&["resolve", "plan/0099", &dir]);
+    assert_eq!(code, 1, "a reference this room cannot resolve fails: {text}");
+    assert!(text.contains("unresolved here"), "{text}");
+    let _ = fs::remove_dir_all(&base);
+}

@@ -97,6 +97,7 @@ jobs:
         run: |
           ./target/release/host-lifecycle obligations host-lifecycle.allium --tests src
           ./target/release/host-lifecycle obligations host-lifecycle-materialize.allium --tests src --tests tests --strict-discharge
+          ./target/release/host-lifecycle obligations host-lifecycle-refs.allium --tests src --tests tests --strict-discharge
 
   kani:
     # The materialize surface declares a `kani:` rung (the two artifacts' schema

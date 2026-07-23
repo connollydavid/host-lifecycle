@@ -1,0 +1,90 @@
+# host-lifecycle-refs.obligations — disposition for every `allium plan` obligation.
+# `host-lifecycle obligations host-lifecycle-refs.allium --tests src --tests tests --strict-discharge`
+# checks this is complete (no obligation undispositioned, no stale entry, every
+# test: name real, every exercises= symbol referenced).
+#   <id> => test:<name> [exercises=<symbol>] | structural | waived: <reason>
+# structural = the spec's own `allium check`/`analyse` lane discharges it (field
+# presence, enum comparability, surface shape, declared transition graph).
+#
+# Every behavioural entry names a test that RUNS the rule's surface, not a helper
+# beside it. plan/0074's adversarial round proved by mutation that a test of a
+# helper discharges nothing: deleting the rule's code left its obligation green.
+# The rule of thumb applied here: if breaking the rule would not fail the named
+# test, the disposition is wrong.
+#
+# The outcomes that end a process (the sweep's exit split, a resolve that cannot
+# resolve) run the built binary from tests/exit_paths.rs, because a unit test
+# cannot observe an exit and a spawned stale binary would silently pass.
+
+# --- Spec-integrity (covered by the check/analyse lane) ---
+enum-comparable.RefKind                        => structural
+enum-comparable.Resolution                     => structural
+enum-comparable.Emission                       => structural
+enum-comparable.Weight                         => structural
+entity-fields.Project                          => structural
+entity-fields.Origin                           => structural
+entity-fields.Reference                        => structural
+entity-fields.Resolved                         => structural
+entity-fields.Finding                          => structural
+entity-fields.Sweep                            => structural
+transition-rejected.Sweep.status               => structural
+transition-terminal.Sweep.status               => structural
+surface-actor.ResolveOp                        => structural
+surface-provides.ResolveOp                     => structural
+surface-actor.RefsSweep                        => structural
+surface-provides.RefsSweep                     => structural
+
+# --- The verdict's declared edges, each witnessed by a real run ---
+transition-edge.Sweep.sweeping.clean           => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+transition-edge.Sweep.sweeping.advisory        => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+transition-edge.Sweep.sweeping.dead            => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+transition-edge.Sweep.sweeping.error           => test:resolve_emits_the_form_asked_for exercises=resolve
+
+# --- Resolving one reference ---
+rule-success.ResolveRegister                   => test:resolves_a_register_reference_to_its_entry exercises=emit
+rule-failure.ResolveRegister.1                 => test:reports_unresolved_here_rather_than_guessing exercises=emit
+rule-entity-creation.ResolveRegister.1         => test:reports_the_three_resolution_outcomes exercises=resolution
+rule-success.ResolveUnresolvedHere             => test:reports_unresolved_here_rather_than_guessing exercises=emit
+rule-failure.ResolveUnresolvedHere.1           => test:resolves_a_register_reference_to_its_entry exercises=entry_path
+rule-entity-creation.ResolveUnresolvedHere.1   => test:reports_the_three_resolution_outcomes exercises=resolution_of
+rule-success.ResolveIssue                      => test:resolve_emits_the_form_asked_for exercises=resolve
+rule-failure.ResolveIssue.1                    => test:url_needs_an_origin_and_the_anchor_survives exercises=origin_slug
+rule-entity-creation.ResolveIssue.1            => test:parses_the_reference_shapes exercises=parse_reference
+rule-success.ResolveIssueWithoutOrigin         => test:url_needs_an_origin_and_the_anchor_survives exercises=emit
+rule-failure.ResolveIssueWithoutOrigin.1       => test:resolve_emits_the_form_asked_for exercises=resolve
+rule-entity-creation.ResolveIssueWithoutOrigin.1 => test:url_needs_an_origin_and_the_anchor_survives exercises=Emission
+
+# --- The sweep's two detectors ---
+rule-success.DetectDeadPointer                 => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=scan_document
+rule-failure.DetectDeadPointer.1               => test:a_repository_without_the_room_owns_no_dead_pointer exercises=scan_document
+rule-entity-creation.DetectDeadPointer.1       => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=DeadPointer
+rule-success.DetectUnrenderedIssue             => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=Unrendered
+rule-failure.DetectUnrenderedIssue.1           => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=in_link
+rule-entity-creation.DetectUnrenderedIssue.1   => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+
+# --- The verdict lifecycle ---
+rule-success.StartSweep                        => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+rule-success.RecordFinding                     => test:refs_check_splits_clean_advisory_and_dead exercises=Advisory
+rule-failure.RecordFinding.1                   => test:refs_check_never_reports_the_record_layer exercises=host-lintignore
+rule-success.RecordDeadPointer                 => test:refs_check_splits_clean_advisory_and_dead exercises=DEAD
+rule-failure.RecordDeadPointer.1               => test:a_repository_without_the_room_owns_no_dead_pointer exercises=scan_document
+rule-success.VerdictDead                       => test:refs_check_splits_clean_advisory_and_dead exercises=DEAD
+rule-failure.VerdictDead.1                     => test:refs_check_never_reports_the_record_layer exercises=refs
+rule-success.VerdictAdvisory                   => test:refs_check_splits_clean_advisory_and_dead exercises=Advisory
+rule-failure.VerdictAdvisory.1                 => test:refs_check_never_reports_the_record_layer exercises=refs
+rule-success.VerdictClean                      => test:refs_check_never_reports_the_record_layer exercises=refs
+rule-failure.VerdictClean.1                    => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+rule-success.VerdictError                      => test:resolve_emits_the_form_asked_for exercises=resolve
+rule-failure.VerdictError.1                    => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+
+# --- Invariants ---
+invariant.ExcludedIsNeverReported              => test:refs_check_never_reports_the_record_layer exercises=host-lintignore
+invariant.QuotedIsNeverReported                => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=scan_document
+invariant.DeadPointerNeedsTheRoom              => test:a_repository_without_the_room_owns_no_dead_pointer exercises=scan_document
+invariant.DeadPointerIsAlwaysRegister          => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=DeadPointer
+invariant.LinkedIssueIsNeverReported           => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=in_link
+invariant.AnchorSurvivesResolution             => test:url_needs_an_origin_and_the_anchor_survives exercises=emit
+invariant.UrlNeedsOrigin                       => test:url_needs_an_origin_and_the_anchor_survives exercises=origin_slug
+invariant.CleanVerdictSawNothing               => test:refs_check_never_reports_the_record_layer exercises=refs
+invariant.AdvisoryNeverSawDeadPointer          => test:refs_check_splits_clean_advisory_and_dead exercises=Advisory
+invariant.DeadVerdictSawDeadPointer            => test:refs_check_splits_clean_advisory_and_dead exercises=DEAD
