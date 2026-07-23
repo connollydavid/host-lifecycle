@@ -1,0 +1,152 @@
+# host-lifecycle-materialize.obligations — disposition for every `allium plan` obligation.
+# `host-lifecycle obligations host-lifecycle-materialize.allium --tests src --strict-discharge`
+# checks this is complete (no obligation undispositioned, no stale entry, every
+# test: name real, every exercises= symbol referenced).
+#   <id> => test:<name> [exercises=<symbol>] | structural | waived: <reason>
+# structural = the spec's own `allium check`/`analyse` lane discharges it (field
+# presence, enum comparability, surface shape, declared transition graph).
+# The behavioural tests live inline in src (#[cfg(test)] mod tests), alongside
+# the existing host-lifecycle suite.
+#
+# Plan/0074 build sequence: every behavioural entry below is a forward ref that
+# lands with its node — the receipt writer at #implement-receipt, the fingerprint
+# and its reader at #implement-envhash, the worktree gate at #fix-worktree-hooks,
+# the completeness gate at #implement-completeness-gate, the orchestrator at
+# #implement-bootstrap, and the whole matrix at #write-tests. Non-strict
+# completeness passes today (`--tests src` rc=0); `--strict-discharge` catches up
+# at #write-tests, when the test names and the exercises= entrypoints exist.
+#
+# Two obligations are owed a machine proof as well as a test (plan/0074's
+# verification section): the schema disjointness of the two artifacts
+# (ReceiptWritesOnlyEventFacts, EnvHashWritesOnlyStateFacts) and worktree-hook
+# coverage (CompleteSetupCoversWorktreeHooks). They carry test dispositions here
+# and are promoted to `kani:<harness>` at #write-tests, when the harness and the
+# `cargo kani` CI lane land together — a declared rung whose verifier no workflow
+# runs HAZARDs the software gate (plan/0048).
+
+# --- Spec-integrity (covered by the check/analyse lane) ---
+enum-comparable.Artifact                       => structural
+enum-comparable.Writer                         => structural
+enum-comparable.RecordedFact                   => structural
+enum-comparable.Dimension                      => structural
+enum-comparable.RequirementKind                => structural
+entity-fields.Project                          => structural
+entity-fields.Host                             => structural
+entity-fields.Worktree                         => structural
+entity-fields.Write                            => structural
+entity-fields.MaterializeRun                   => structural
+entity-fields.Receipt                          => structural
+entity-fields.EnvHash                          => structural
+entity-fields.EnvDimension                     => structural
+entity-fields.Delta                            => structural
+entity-fields.EnvCheck                         => structural
+entity-fields.Requirement                      => structural
+entity-optional.Requirement.worktree           => structural
+entity-fields.Gap                              => structural
+entity-fields.CompletenessRun                  => structural
+entity-fields.BootstrapRun                     => structural
+transition-rejected.MaterializeRun.status      => structural
+transition-terminal.MaterializeRun.status      => structural
+transition-rejected.EnvCheck.status            => structural
+transition-terminal.EnvCheck.status            => structural
+transition-rejected.CompletenessRun.status     => structural
+transition-terminal.CompletenessRun.status     => structural
+transition-rejected.BootstrapRun.status        => structural
+transition-terminal.BootstrapRun.status        => structural
+surface-actor.MaterializeOp                    => structural
+surface-provides.MaterializeOp                 => structural
+surface-actor.StateChangingOps                 => structural
+surface-provides.StateChangingOps              => structural
+surface-actor.EnvCheckOp                       => structural
+surface-provides.EnvCheckOp                    => structural
+surface-actor.VerifySetupOp                    => structural
+surface-provides.VerifySetupOp                 => structural
+surface-actor.BootstrapOp                      => structural
+surface-provides.BootstrapOp                   => structural
+
+# --- Declared transitions (behavioural: each edge is witnessed by a run) ---
+transition-edge.MaterializeRun.materializing.realized => test:materialize_run_reaches_realized exercises=software_materialize
+transition-edge.MaterializeRun.materializing.aborted  => test:materialize_run_aborts_on_failure exercises=software_materialize
+transition-edge.EnvCheck.checking.clean               => test:env_check_clean_verdict exercises=env_check
+transition-edge.EnvCheck.checking.drifted             => test:env_check_drifted_verdict exercises=env_check
+transition-edge.EnvCheck.checking.cannot_proceed      => test:env_check_cannot_proceed_without_record exercises=env_check
+transition-edge.CompletenessRun.verifying.complete    => test:verify_setup_complete_verdict exercises=software_verify_setup
+transition-edge.CompletenessRun.verifying.hazarded    => test:verify_setup_hazarded_verdict exercises=software_verify_setup
+transition-edge.BootstrapRun.bootstrapping.bootstrapped => test:bootstrap_completes_after_hooks exercises=bootstrap
+transition-edge.BootstrapRun.bootstrapping.abandoned    => test:bootstrap_abandons_on_step_failure exercises=bootstrap
+
+# --- The materialize event and its two orthogonal writers (#18) ---
+rule-success.StartMaterialize                  => test:materialize_start_sets_running exercises=software_materialize
+rule-success.RealizeMaterialize                => test:materialize_completes_realized exercises=software_materialize
+rule-failure.RealizeMaterialize.1              => test:materialize_realize_guarded_on_running exercises=software_materialize
+rule-success.AbortMaterialize                  => test:materialize_failure_aborts exercises=software_materialize
+rule-failure.AbortMaterialize.1                => test:materialize_abort_guarded_on_running exercises=software_materialize
+rule-success.AppendMaterializeReceipt          => test:realized_run_appends_one_receipt exercises=append_materialize_receipt
+rule-entity-creation.AppendMaterializeReceipt.1 => test:materialize_receipt_names_its_components exercises=append_materialize_receipt
+rule-entity-creation.AppendMaterializeReceipt.2 => test:materialize_receipt_write_records_event_facts exercises=append_materialize_receipt
+rule-success.RefreshEnvHashOnMaterialize       => test:materialize_refreshes_the_envhash exercises=write_envhash
+rule-entity-creation.RefreshEnvHashOnMaterialize.1 => test:materialize_envhash_write_records_state_facts exercises=write_envhash
+
+# --- The remaining state-changing ops: fingerprint only, never provenance (#19) ---
+# InstallHooksCoversWorktrees is Bug A: every materialized worktree is a commit
+# surface, so the op gates each one, not the host repo alone.
+rule-success.InstallHooksCoversWorktrees       => test:install_hooks_gates_every_materialized_worktree exercises=software_install_hooks
+rule-success.RefreshEnvHashOnInstallHooks      => test:install_hooks_refreshes_the_envhash exercises=write_envhash
+rule-entity-creation.RefreshEnvHashOnInstallHooks.1 => test:install_hooks_write_is_envhash_only exercises=write_envhash
+rule-success.RecordBootstrapHooks              => test:bootstrap_latches_its_hooks_step exercises=bootstrap
+rule-failure.RecordBootstrapHooks.1            => test:hooks_latch_guarded_on_a_running_bootstrap exercises=bootstrap
+rule-success.RefreshEnvHashOnBuildVerified     => test:verify_build_refreshes_the_envhash exercises=write_envhash
+rule-entity-creation.RefreshEnvHashOnBuildVerified.1 => test:verify_build_write_is_envhash_only exercises=write_envhash
+rule-success.RefreshEnvHashOnImagePull         => test:image_pull_refreshes_the_envhash exercises=write_envhash
+rule-entity-creation.RefreshEnvHashOnImagePull.1 => test:image_pull_write_is_envhash_only exercises=write_envhash
+
+# --- env --check: advisory drift, never a gate ---
+rule-success.StartEnvCheck                     => test:env_check_start_inits_its_latch exercises=env_check
+rule-success.ReportMovedDimension              => test:moved_readable_dimension_reports_a_delta exercises=env_check
+rule-failure.ReportMovedDimension.1            => test:unreadable_dimension_reports_no_delta exercises=env_check
+rule-entity-creation.ReportMovedDimension.1    => test:delta_names_its_dimension exercises=env_check
+rule-success.RecordDelta                       => test:delta_sets_the_env_check_latch exercises=env_check
+rule-failure.RecordDelta.1                     => test:delta_latch_guarded_on_checking exercises=env_check
+rule-success.VerdictCannotProceed              => test:env_check_exits_two_without_a_record exercises=env_check
+rule-failure.VerdictCannotProceed.1            => test:env_check_no_false_cannot_proceed exercises=env_check
+rule-success.VerdictDrifted                    => test:env_check_exits_zero_with_a_delta exercises=env_check
+rule-failure.VerdictDrifted.1                  => test:env_check_no_false_drifted_verdict exercises=env_check
+rule-success.VerdictEnvClean                   => test:env_check_exits_zero_when_clean exercises=env_check
+rule-failure.VerdictEnvClean.1                 => test:env_check_no_false_clean_verdict exercises=env_check
+
+# --- The completeness gate: recipe versus live tree ---
+rule-success.StartVerifySetup                  => test:verify_setup_start_inits_its_latch exercises=software_verify_setup
+rule-success.DetectMissingArtifact             => test:missing_required_artifact_gaps exercises=setup_gaps
+rule-failure.DetectMissingArtifact.1           => test:present_or_unrequired_artifact_never_gaps exercises=setup_gaps
+rule-entity-creation.DetectMissingArtifact.1   => test:gap_names_its_requirement exercises=setup_gaps
+rule-success.RecordGap                         => test:gap_sets_the_setup_latch exercises=software_verify_setup
+rule-failure.RecordGap.1                       => test:gap_latch_guarded_on_verifying exercises=software_verify_setup
+rule-success.VerdictSetupHazarded              => test:verify_setup_hazards_on_a_gap exercises=software_verify_setup
+rule-failure.VerdictSetupHazarded.1            => test:verify_setup_no_false_hazard exercises=software_verify_setup
+rule-success.VerdictSetupComplete              => test:verify_setup_complete_without_a_gap exercises=software_verify_setup
+rule-failure.VerdictSetupComplete.1            => test:verify_setup_no_false_complete exercises=software_verify_setup
+
+# --- The orchestrator: makes the state, verifies none of it ---
+rule-success.StartBootstrap                    => test:bootstrap_start_inits_its_latch exercises=bootstrap
+rule-success.CompleteBootstrap                 => test:bootstrap_completion_starts_the_gate exercises=bootstrap
+rule-failure.CompleteBootstrap.1               => test:bootstrap_completion_guarded_on_hooks exercises=bootstrap
+rule-success.AbandonBootstrap                  => test:bootstrap_failure_abandons_the_run exercises=bootstrap
+rule-failure.AbandonBootstrap.1                => test:bootstrap_abandon_guarded_on_running exercises=bootstrap
+
+# --- Invariants (behavioural) ---
+# The first two are the schema disjointness the plan owes a Kani harness; the
+# sixth is worktree-hook coverage, the other owed harness. Both promote to
+# `kani:` at #write-tests with their CI lane.
+invariant.ReceiptWritesOnlyEventFacts          => test:receipt_records_only_event_facts exercises=append_materialize_receipt
+invariant.EnvHashWritesOnlyStateFacts          => test:envhash_records_only_state_facts exercises=write_envhash
+invariant.OnlyMaterializeWritesReceipt         => test:only_materialize_appends_a_receipt exercises=append_materialize_receipt
+invariant.VerifyingOpsWriteNothing             => test:bootstrap_and_gate_write_no_file exercises=software_verify_setup
+invariant.ReceiptOnlyForRealizedRun            => test:aborted_materialize_appends_no_receipt exercises=append_materialize_receipt
+invariant.CompleteSetupCoversWorktreeHooks     => test:complete_setup_implies_every_worktree_hooked exercises=setup_gaps
+invariant.BuildArtifactRequiredOnlyOnBuildHost => test:non_build_host_never_gaps_on_the_artifact exercises=setup_gaps
+invariant.GapsAreMissingArtifacts              => test:every_gap_is_a_missing_required_artifact exercises=setup_gaps
+invariant.WorktreeRequirementNamesItsWorktree  => test:worktree_hook_gap_names_the_worktree exercises=setup_gaps
+invariant.UnreadableDimensionNeverMoves        => test:unreadable_dimension_never_marked_moved exercises=env_check
+invariant.DeltasNameObservedMoves              => test:every_delta_names_a_readable_moved_dimension exercises=env_check
+invariant.CannotProceedOnlyWithoutRecord       => test:cannot_proceed_only_without_an_envhash exercises=env_check
+invariant.GapBlocksComplete                    => test:one_gap_blocks_a_complete_verdict exercises=software_verify_setup
