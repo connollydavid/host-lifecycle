@@ -583,6 +583,14 @@ mod tests {
     // These drive the MCP server over stdio JSON-RPC with a real per-user
     // memory store fixture. HOME is set to a tmp dir so the store opens there.
 
+    // `set_var` writes a process global, and these tests run on parallel
+    // threads: one test's HOME landed between another's list and read, so the
+    // read resolved into the wrong fixture and reported ENOENT. Every test that
+    // points HOME at a fixture holds this for its whole body, cleanup included.
+    // A tokio mutex because the guard is held across `.await`, and one that does
+    // not poison, so a failing test does not turn its neighbours red as well.
+    static HOME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn memory_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
         let n = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -599,6 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_write_then_list_then_read_round_trips() {
+        let _home = HOME.lock().await;
         let (home, project) = memory_fixture();
         std::env::set_var("HOME", home.as_os_str());
         let input = concat!(
@@ -626,6 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_consolidate_reports_findings() {
+        let _home = HOME.lock().await;
         let (home, project) = memory_fixture();
         std::env::set_var("HOME", home.as_os_str());
         // Write a repo MEMORY.md with a room reference so consolidate finds it.
@@ -655,6 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_write_delete_round_trips() {
+        let _home = HOME.lock().await;
         let (home, project) = memory_fixture();
         std::env::set_var("HOME", home.as_os_str());
         let input = concat!(
