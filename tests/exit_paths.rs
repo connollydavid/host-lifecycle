@@ -446,3 +446,198 @@ fn migrate_recipe_is_tool_carried_and_idempotent() {
     let _ = fs::remove_dir_all(&base);
     let _ = fs::remove_dir_all(&empty);
 }
+
+/// A markdown tree with one milestone, for the sweep to read.
+fn refs_fixture(name: &str) -> std::path::PathBuf {
+    let base = fixture(name);
+    git(&base, &["init", "-q", "-b", "main"]);
+    git(&base, &["config", "user.email", "t@t"]);
+    git(&base, &["config", "user.name", "t"]);
+    fs::create_dir_all(base.join("plan").join("0074-materialize")).unwrap();
+    fs::write(base.join("plan").join("0074-materialize").join("README.md"), "# m\n").unwrap();
+    base
+}
+
+// A document the walk listed and could not open is a hole in the corpus, never a
+// silent skip. Both causes reproduce the same way: git C-quotes a path holding a
+// non-ASCII byte, and a permission or encoding failure closes the file. Counting
+// either as swept let a dead pointer inside it ship as a clean verdict.
+#[test]
+fn an_unreadable_document_gates_rather_than_being_counted_as_swept() {
+    let base = refs_fixture("refs-unread");
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join("README.md"), "ok [plan/0074](plan/0074-materialize/README.md)\n").unwrap();
+
+    // A path git will C-quote, holding a dead pointer. It must be read.
+    fs::write(base.join("naïve.md"), "a dead one: plan/0099\n").unwrap();
+    let (code, text) = run(&["refs", "--check", &dir]);
+    assert_eq!(code, 1, "the quoted path is read, and gates: {text}");
+    assert!(text.contains("naïve.md"), "and is named: {text}");
+    fs::remove_file(base.join("naïve.md")).unwrap();
+
+    // A document that cannot be opened at all is reported and gates.
+    let locked = base.join("locked.md");
+    fs::write(&locked, "a dead one: plan/0098\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let (code, text) = run(&["refs", "--check", &dir]);
+        assert_eq!(code, 1, "an unread document gates: {text}");
+        assert!(text.contains("UNREAD") && text.contains("locked.md"), "{text}");
+        assert!(text.contains("2 doc(s) read of 3 listed"), "and the count is honest: {text}");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let _ = fs::remove_dir_all(&base);
+}
+
+// The exclusion list is the concrete form of the append-only rule, so the
+// spellings an operator naturally writes have to work: three of five were silent
+// no-ops, and a declared record was then swept and told to rewrite itself.
+#[test]
+fn every_exclusion_spelling_excludes_the_record_it_names() {
+    let base = refs_fixture("refs-ignore");
+    let dir = base.to_string_lossy().to_string();
+    fs::create_dir_all(base.join("archive")).unwrap();
+    fs::write(base.join("README.md"), "ok\n").unwrap();
+    fs::write(base.join("archive").join("journal.md"), "the log records plan/0099\n").unwrap();
+
+    for spelling in ["/archive/journal.md", "archive", "./archive/journal.md", "archive/**", "archive/"] {
+        fs::write(base.join(".host-lintignore"), format!("{spelling}\n")).unwrap();
+        let (code, text) = run(&["refs", "--check", &dir]);
+        assert_eq!(code, 0, "`{spelling}` must exclude the record, not gate on it: {text}");
+        assert!(text.contains("1 document(s) were excluded"), "and say it withheld one: {text}");
+    }
+
+    // A re-inclusion silently withdrew a live document from coverage instead of
+    // restoring it, so the list says plainly what it cannot do.
+    fs::write(base.join(".host-lintignore"), "*.md\n!README.md\n").unwrap();
+    let (code, text) = run(&["refs", "--check", &dir]);
+    assert_eq!(code, 2, "an unsupported pattern fails closed: {text}");
+    assert!(text.contains("re-inclusion is not supported"), "{text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// The list is read from the repository root while the listing is relative to the
+// directory swept, so an invocation below the root lost every exclusion and told
+// the operator to rewrite files their own list calls the immutable record.
+#[test]
+fn a_subdirectory_sweep_still_honours_the_root_exclusion_list() {
+    let base = refs_fixture("refs-subdir");
+    fs::create_dir_all(base.join("notes")).unwrap();
+    fs::write(base.join("README.md"), "ok\n").unwrap();
+    fs::write(base.join(".host-lintignore"), "notes/journal.md\n").unwrap();
+    fs::write(base.join("notes").join("journal.md"), "the log records plan/0099\n").unwrap();
+    fs::write(base.join("notes").join("live.md"), "governed by plan/0074\n").unwrap();
+
+    let (code, text) = run(&["refs", "--check", &base.join("notes").to_string_lossy()]);
+    assert_eq!(code, 0, "the declared record is excluded from below the root too: {text}");
+    assert!(!text.contains("journal.md"), "and is never named: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// Whatever the sweep did not check, the verdict says so — on every verdict it can
+// reach. Printing the disclosure on the clean branch alone meant it never printed
+// in a software repository, which is the one case it exists for.
+#[test]
+fn the_verdict_discloses_what_it_did_not_check_on_every_exit() {
+    let base = fixture("refs-disclose");
+    git(&base, &["init", "-q", "-b", "main"]);
+    git(&base, &["config", "user.email", "t@t"]);
+    git(&base, &["config", "user.name", "t"]);
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join(".host-lintignore"), "MEMORY-ARCHIVE.md\n").unwrap();
+    fs::write(base.join("MEMORY-ARCHIVE.md"), "a record\n").unwrap();
+    // A repository holding no room, citing its governing host's registers, plus
+    // one bare issue number to push the verdict onto the advisory branch.
+    fs::write(base.join("README.md"), "governed by plan/0074 and call/0045; see #17\n").unwrap();
+
+    let (code, text) = run(&["refs", "--check", &dir]);
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("1 document(s) were excluded"), "the withheld record is disclosed: {text}");
+    assert!(text.contains("2 register reference(s)"), "and the unchecked registers too: {text}");
+    assert!(text.contains("no plan/ or call/ room here"), "and that no room was found: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// The remedy names THIS repository. A hardcoded slug handed every adopter a
+// command that rewrote their own reference into a link to another project's
+// tracker, and the weak-agent acceptance is the evidence the command gets run.
+#[test]
+fn the_remedy_names_the_repository_it_was_run_in() {
+    let base = refs_fixture("refs-remedy");
+    let dir = base.to_string_lossy().to_string();
+    git(&base, &["remote", "add", "origin", "https://github.com/acme/widget.git"]);
+    fs::write(base.join("README.md"), "closing #7 today\n").unwrap();
+
+    for args in [vec!["refs", "--check", &dir], vec!["refs", "--fix", &dir]] {
+        let (_, text) = run(&args);
+        assert!(text.contains("acme/widget#7"), "the remedy names this repository: {text}");
+        assert!(!text.contains("connollydavid"), "and never another one: {text}");
+    }
+    let _ = fs::remove_dir_all(&base);
+}
+
+// An unrecognised flag became the directory, so `resolve plan/0077 --md .` was
+// reported as a reference that does not resolve, and `migrate-recipe --dry-run`
+// rewrote the recipe it was asked to preview.
+#[test]
+fn an_unknown_flag_is_a_usage_error_rather_than_a_verdict() {
+    let base = refs_fixture("refs-flags");
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join("README.md"), "ok\n").unwrap();
+
+    let (code, text) = run(&["resolve", "plan/0074", "--md", &dir]);
+    assert_eq!(code, 2, "a mistyped flag is a usage error: {text}");
+    assert!(text.contains("unknown flag"), "{text}");
+    let (code, _) = run(&["resolve", "plan/0074", &dir]);
+    assert_eq!(code, 0, "and the reference itself resolves fine");
+
+    let (code, text) = run(&["resolve", "plan/0074", "/no/such/directory"]);
+    assert_eq!(code, 2, "an unread root is a usage error, not an unresolved reference: {text}");
+    assert!(text.contains("not a directory"), "{text}");
+
+    fs::write(base.join(".host-software"), "[software \"c\"]\n\trepro-exempt = call/0031\n").unwrap();
+    let (code, text) = run(&["migrate-recipe", "--dry-run", &dir]);
+    assert_eq!(code, 2, "a flag the verb does not have never writes: {text}");
+    let after = fs::read_to_string(base.join(".host-software")).unwrap();
+    assert!(after.contains("repro-exempt"), "and the recipe is untouched: {after}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// The migration rewrites the reproducibility anchor, so what it does NOT change
+// matters as much as what it does: a Windows recipe kept its line terminators, a
+// symlinked recipe is written through rather than replaced.
+#[test]
+fn the_migration_preserves_everything_it_did_not_rename() {
+    let base = fixture("migrate-shape");
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join(".host-software"), "[software \"c\"]\r\n\turl = u\r\n\trepro-exempt = call/0031\r\n").unwrap();
+    let (code, text) = run(&["migrate-recipe", &dir]);
+    assert_eq!(code, 0, "{text}");
+    let after = fs::read_to_string(base.join(".host-software")).unwrap();
+    assert_eq!(
+        after, "[software \"c\"]\r\n\turl = u\r\n\trepro-waiver = call/0031\r\n",
+        "every line terminator survives the rename"
+    );
+
+    #[cfg(unix)]
+    {
+        let linked = fixture("migrate-symlink");
+        fs::create_dir_all(linked.join("real")).unwrap();
+        fs::write(linked.join("real").join("recipe"), "[software \"c\"]\n\trepro-exempt = call/0031\n").unwrap();
+        std::os::unix::fs::symlink("real/recipe", linked.join(".host-software")).unwrap();
+        let (code, text) = run(&["migrate-recipe", &linked.to_string_lossy()]);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            fs::symlink_metadata(linked.join(".host-software")).unwrap().file_type().is_symlink(),
+            "the link survives"
+        );
+        assert!(
+            fs::read_to_string(linked.join("real").join("recipe")).unwrap().contains("repro-waiver"),
+            "and the real recipe is the one that migrated"
+        );
+        let _ = fs::remove_dir_all(&linked);
+    }
+    let _ = fs::remove_dir_all(&base);
+}

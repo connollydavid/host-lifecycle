@@ -1897,16 +1897,48 @@ fn filter_item(recipe: Vec<Software>, spec: &str) -> Vec<Software> {
 /// `.host-lintignore` patterns (gitignore-lite: one per line, `#`/blank skipped) — the
 /// same exclusion file host-lint's `--docs`/`--all` walk honors (e.g. the append-only
 /// `MEMORY.md`).
-fn load_lintignore(root: &Path) -> Vec<String> {
-    match fs::read_to_string(root.join(".host-lintignore")) {
-        Ok(c) => c
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(String::from)
-            .collect(),
-        Err(_) => Vec::new(),
+/// Patterns are normalised to the one shape the matcher understands, because the
+/// spellings an operator naturally reaches for were silent no-ops: a leading `/`
+/// or `./` made the segment count disagree, and a bare directory name matched
+/// nothing without its trailing slash. A list that quietly excluded nothing left
+/// a declared append-only record swept and gating, which is the one thing this
+/// list exists to prevent (plan/0077 adversarial-review.md).
+fn load_lintignore(root: &Path) -> Result<Vec<String>, String> {
+    let text = match fs::read_to_string(root.join(".host-lintignore")) {
+        Ok(c) => c,
+        // Absent is the ordinary case and excludes nothing. Present-but-unreadable
+        // is a hole: reading on would sweep the records it names.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!(".host-lintignore cannot be read: {e}")),
+    };
+    let mut out = Vec::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('!') {
+            // Silently ignoring a negation withdrew a live document from coverage
+            // instead of restoring it, so the list says what it cannot do.
+            return Err(format!(
+                ".host-lintignore:{}: `!` re-inclusion is not supported; remove the line and narrow the pattern it was undoing (it was excluding `{rest}` rather than restoring it)",
+                n + 1
+            ));
+        }
+        let pattern = line.trim_start_matches("./").trim_start_matches('/');
+        if pattern.is_empty() {
+            continue;
+        }
+        // A bare directory name is the spelling an operator writes; the matcher
+        // needs the trailing slash to read it as a prefix rather than a path.
+        let normalised = if !pattern.ends_with('/') && !pattern.contains('*') && root.join(pattern).is_dir() {
+            format!("{pattern}/")
+        } else {
+            pattern.to_string()
+        };
+        out.push(normalised);
     }
+    Ok(out)
 }
 
 /// The authored markdown of a project: every tracked `.md` the exclusion list does
@@ -1914,27 +1946,59 @@ fn load_lintignore(root: &Path) -> Vec<String> {
 /// record should not have to say so once per checker, and the record layer is
 /// exactly what a reference sweep must never press to be rewritten.
 pub fn authored_docs(root: &Path) -> Vec<String> {
-    let ignore = load_lintignore(root);
-    // Tracked AND untracked-but-not-ignored: an agent that authors a document,
-    // runs a checker and sees clean before committing has verified nothing.
-    let Some(out) = git_out(root, &["ls-files", "--cached", "--others", "--exclude-standard", "*.md"]) else {
-        return Vec::new();
+    authored_corpus(root).map(|c| c.docs).unwrap_or_default()
+}
+
+/// The corpus a sweep speaks for: the documents it will read, and how many were
+/// withheld from it. The count is carried out rather than dropped because a
+/// verdict that excluded 19 documents and said nothing about them claimed a
+/// coverage it did not have (plan/0077 adversarial-review.md).
+pub struct Corpus {
+    pub docs: Vec<String>,
+    pub excluded: usize,
+}
+
+/// The exclusion list is anchored at the repository root while the listing is
+/// relative to it, so an invocation from a subdirectory no longer loses every
+/// exclusion — which had the sweep telling an operator to rewrite two files their
+/// own list calls the immutable record.
+pub fn authored_corpus(root: &Path) -> Result<Corpus, String> {
+    let top = git_out(root, &["rev-parse", "--show-toplevel"])
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| root.to_path_buf());
+    let ignore = load_lintignore(&top)?;
+    // Paths arrive NUL-delimited: git C-quotes any path holding a non-ASCII byte
+    // under its default `core.quotepath`, and a quoted name was counted as swept
+    // and then failed to open, so a dead pointer inside it shipped as clean.
+    let Some(out) = git_out_z(root, &["ls-files", "-z", "--cached", "--others", "--exclude-standard", "*.md"]) else {
+        return Ok(Corpus { docs: Vec::new(), excluded: 0 });
     };
-    let mut docs: Vec<String> = out
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .filter(|rel| !host_lint::path_ignored(rel, &ignore))
+    // The listing is relative to `root`; the list is relative to the repository
+    // root, so one is rebased onto the other before matching.
+    let prefix = root
+        .canonicalize()
+        .ok()
+        .zip(top.canonicalize().ok())
+        .and_then(|(r, t)| r.strip_prefix(&t).ok().map(|p| p.to_string_lossy().replace('\\', "/")))
+        .unwrap_or_default();
+    let mut docs: Vec<String> = Vec::new();
+    let mut excluded = 0usize;
+    for rel in out.into_iter().filter(|l| !l.is_empty()) {
+        let from_top = if prefix.is_empty() { rel.clone() } else { format!("{prefix}/{rel}") };
         // The record layer, excluded whether or not the project has authored its
         // exclusion list: a fresh scaffold writes no list, and a checker that
         // pressed a new adopter to rewrite their append-only log would be breaking
         // the record on day one (call/0009).
-        .filter(|rel| !is_record_layer(rel))
-        .map(String::from)
-        .collect();
+        if host_lint::path_ignored(&from_top, &ignore) || is_record_layer(&rel) {
+            excluded += 1;
+            continue;
+        }
+        docs.push(rel);
+    }
     docs.sort();
     docs.dedup();
-    docs
+    Ok(Corpus { docs, excluded })
 }
 
 /// The append-only records every checker excludes by construction.
@@ -1954,7 +2018,7 @@ fn is_record_layer(rel: &str) -> bool {
 /// accumulated matches, or an error if the repo cannot be walked.
 fn prose_audit(root: &Path) -> Result<Vec<Match>, String> {
     let allow = host_lint::load_lexicon(root).phrases_lc;
-    let ignore = load_lintignore(root);
+    let ignore = load_lintignore(root)?;
     host_lint::run_docs(root, &allow, &ignore)
 }
 
@@ -2266,7 +2330,7 @@ const CONCEPT_IDS: [&str; 4] = ["components", "verifiers", "software-root", "spe
 /// `.host-lintignore`, skipping symlinks and non-markdown. The one walk the reconcile
 /// checks share.
 fn tracked_markdown(root: &Path) -> Result<Vec<(String, String)>, String> {
-    let ignore = load_lintignore(root);
+    let ignore = load_lintignore(root)?;
     let out = process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -4828,10 +4892,16 @@ fn parse_software(text: &str) -> Vec<Software> {
                 "repro-waiver" => b.repro_exempt = Some(unq(val, i)),
                 // The retired spelling, still read so an adopter's recipe keeps
                 // working across the rename, and reported so it does not stay
-                // (call/0047, deprecate-then-retire).
+                // (call/0047, deprecate-then-retire). It never overwrites the
+                // current spelling: a recipe carrying both had the retired line
+                // win by falling later, so the wrong decision governed the gate.
                 "repro-exempt" => {
                     eprintln!("warn     `repro-exempt` is retired; rename it to `repro-waiver` (agentic-host call/0047)");
-                    b.repro_exempt = Some(unq(val, i));
+                    if b.repro_exempt.is_none() {
+                        b.repro_exempt = Some(unq(val, i));
+                    } else {
+                        eprintln!("warn     both spellings are present; the `repro-waiver` line governs and the retired one is ignored");
+                    }
                 }
                 "attest-host" => b.attest_host = Some(unq(val, i)),
                 _ => {}
@@ -4890,7 +4960,11 @@ fn parse_software(text: &str) -> Vec<Software> {
             "repro-waiver" => cur.repro_exempt = Some(unq(val, i)),
             "repro-exempt" => {
                 eprintln!("warn     `repro-exempt` is retired; rename it to `repro-waiver` (agentic-host call/0047)");
-                cur.repro_exempt = Some(unq(val, i));
+                if cur.repro_exempt.is_none() {
+                    cur.repro_exempt = Some(unq(val, i));
+                } else {
+                    eprintln!("warn     both spellings are present; the `repro-waiver` line governs and the retired one is ignored");
+                }
             }
             "hooks" => cur.hooks = Some(unq(val, i)),
             "deps-bundle" => {
@@ -5802,6 +5876,22 @@ fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
     o.status
         .success()
         .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// `git -C <cwd> <args>` capturing NUL-delimited stdout as one entry per record.
+/// The delimited form is the only honest way to read a path listing: git's default
+/// `core.quotepath` C-quotes any path holding a non-ASCII byte, and a caller that
+/// split on newlines took the quoted spelling as a filename and then failed to
+/// open it.
+fn git_out_z(cwd: &Path, args: &[&str]) -> Option<Vec<String>> {
+    let o = process::Command::new("git").arg("-C").arg(cwd).args(args).output().ok()?;
+    o.status.success().then(|| {
+        String::from_utf8_lossy(&o.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    })
 }
 
 /// First 12 chars of a SHA for display (ASCII hex, so byte-slicing is safe).
@@ -6928,10 +7018,20 @@ fn run_verify(root: &Path, cmd: &str) -> bool {
 /// Write `content` to `path` atomically (temp file + rename), so a crash or full
 /// disk during a stamp update can never leave a truncated/empty `.host`.
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("stamp");
-    let tmp = path.with_file_name(format!("{name}.tmp"));
+    // Through a symlink rather than over it: renaming onto the link replaced it
+    // with a regular file and left the real target untouched (plan/0077).
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("stamp");
+    // A distinctive suffix, because `<name>.tmp` is a filename an operator may
+    // hold their own backup under, and this silently destroyed it.
+    let tmp = target.with_file_name(format!(".{name}.host-lifecycle-tmp"));
     fs::write(&tmp, content)?;
-    fs::rename(&tmp, path)
+    // The original mode carries over: a fresh temp file is created at the
+    // umask default, so writing widened a recipe from 600 to 644.
+    if let Ok(meta) = fs::metadata(&target) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+    }
+    fs::rename(&tmp, &target)
 }
 
 fn upgrade(args: &[String]) {
@@ -8644,7 +8744,10 @@ const RETIRED_RECIPE_KEYS: [(&str, Option<&str>); 2] =
 fn migrate_recipe_text(text: &str) -> (String, Vec<String>) {
     let mut out: Vec<String> = Vec::new();
     let mut changes: Vec<String> = Vec::new();
-    for (n, line) in text.lines().enumerate() {
+    // Split and join on the newline alone, which is exactly inverse: `lines()`
+    // strips a carriage return, so a recipe written on Windows came back as a
+    // whole-file diff reported as one change.
+    for (n, line) in text.split('\n').enumerate() {
         let trimmed = line.trim_start();
         let mut done = false;
         for (retired, replacement) in RETIRED_RECIPE_KEYS {
@@ -8675,11 +8778,7 @@ fn migrate_recipe_text(text: &str) -> (String, Vec<String>) {
             out.push(line.to_string());
         }
     }
-    let mut text_out = out.join("\n");
-    if text.ends_with('\n') {
-        text_out.push('\n');
-    }
-    (text_out, changes)
+    (out.join("\n"), changes)
 }
 
 /// `migrate-recipe <dir>`: the tool-carried form of a recipe key rename, the
@@ -8687,7 +8786,16 @@ fn migrate_recipe_text(text: &str) -> (String, Vec<String>) {
 /// file the tool can rewrite: the hand edit is where a weak agent renames the
 /// wrong line, and where a busy operator renames none of them.
 fn migrate_recipe(args: &[String]) {
-    let dir = args.iter().find(|a| !a.starts_with("--")).map(String::as_str).unwrap_or(".");
+    // Every flag was discarded and the first remaining argument became the
+    // target, so `--dry-run` rewrote the recipe it was asked to preview and
+    // `--help` rewrote the working directory. On the one verb that edits the
+    // reproducibility anchor, an unrecognised flag stops the run.
+    if let Some(flag) = args.iter().find(|a| a.starts_with("--")) {
+        eprintln!("host-lifecycle: unknown flag `{flag}` — migrate-recipe takes a directory and rewrites it in place");
+        eprintln!("  to preview, copy the recipe elsewhere and run it there, or read the change lines it prints before committing");
+        process::exit(2);
+    }
+    let dir = args.first().map(String::as_str).unwrap_or(".");
     let root = match fs::canonicalize(Path::new(dir)) {
         Ok(p) => p,
         Err(_) => {
@@ -8695,10 +8803,22 @@ fn migrate_recipe(args: &[String]) {
             process::exit(2);
         }
     };
-    let path = root.join(SOFTWARE);
-    let Ok(text) = fs::read_to_string(&path) else {
-        eprintln!("host-lifecycle: no {SOFTWARE} in {} — nothing to migrate", root.display());
-        process::exit(2);
+    // Canonicalised, so a symlinked recipe is written THROUGH rather than
+    // replaced: the rename swapped the link for a regular file, left the real
+    // recipe unmigrated, and reported success.
+    let path = fs::canonicalize(root.join(SOFTWARE)).unwrap_or_else(|_| root.join(SOFTWARE));
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("host-lifecycle: no {SOFTWARE} in {} — nothing to migrate", root.display());
+            process::exit(2);
+        }
+        // An unreadable or non-UTF-8 recipe was reported as an absent one, so a
+        // smart quote in a comment read as "you have no recipe".
+        Err(e) => {
+            eprintln!("host-lifecycle: {SOFTWARE} in {} cannot be read: {e}", root.display());
+            process::exit(2);
+        }
     };
     let (migrated, changes) = migrate_recipe_text(&text);
     if changes.is_empty() {
@@ -9218,7 +9338,7 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     // toolchain, so its release is a cited skip — the tool prints the LITERAL command
     // with the real citation, so Fen copies an exact `call/NNNN` (fold-back #3).
     if let Some(cite) = repro_exempt_cite(s) {
-        println!("release {component} is repro-exempt ({cite}) — record the migrated skip:");
+        println!("release {component} carries a repro-waiver ({cite}) — record the migrated skip:");
         println!("    host-lifecycle release --record {component} --skip {cite}");
         return;
     }
@@ -9494,7 +9614,7 @@ fn release_record_skip(args: &[String]) {
     let recipe = load_software(root);
     let s = release_context(root, &recipe, &component);
     if repro_exempt_cite(s).is_none() {
-        eprintln!("host-lifecycle: {component} is not repro-exempt — a release skip is only for migrated/foreign provenance, never a greenfield component (R3)");
+        eprintln!("host-lifecycle: {component} carries no repro-waiver — a release skip is only for migrated/foreign provenance, never a greenfield component (R3)");
         process::exit(2);
     }
     if !cited_decision_exists(root, &cite) {

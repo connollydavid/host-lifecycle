@@ -118,15 +118,17 @@ pub fn parse_reference(text: &str) -> Option<Reference> {
     })
 }
 
-/// The path a register reference names: a milestone directory's README, or a
-/// decision file. `None` when the room holds no entry with that number.
-pub fn entry_path(root: &Path, reference: &Reference) -> Option<PathBuf> {
+/// Every entry in the room carrying this number. More than one is an ambiguity
+/// the caller must refuse rather than resolve: taking the alphabetically first
+/// handed out a confident path to an abandoned draft.
+pub fn entry_matches(root: &Path, reference: &Reference) -> Vec<PathBuf> {
     if reference.kind != RefKind::Register {
-        return None;
+        return Vec::new();
     }
-    let room = root.join(&reference.room);
-    let mut matches: Vec<PathBuf> = fs::read_dir(&room)
-        .ok()?
+    let Ok(dir) = fs::read_dir(root.join(&reference.room)) else {
+        return Vec::new();
+    };
+    let mut matches: Vec<PathBuf> = dir
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
@@ -136,10 +138,27 @@ pub fn entry_path(root: &Path, reference: &Reference) -> Option<PathBuf> {
         })
         .collect();
     matches.sort();
+    matches
+}
+
+pub fn entry_path(root: &Path, reference: &Reference) -> Option<PathBuf> {
+    let matches = entry_matches(root, reference);
+    if matches.len() != 1 {
+        return None;
+    }
     let hit = matches.into_iter().next()?;
-    // A milestone is a directory whose README is the page; a decision is a file.
-    let path = if hit.is_dir() { hit.join("README.md") } else { hit };
-    path.exists().then_some(path)
+    if !hit.is_dir() {
+        return hit.exists().then_some(hit);
+    }
+    // A milestone is a directory whose README is the page. Where there is no
+    // README the directory itself IS the record, and reporting it as naming no
+    // entry was a gating verdict about a milestone that is plainly there.
+    let readme = hit.join("README.md");
+    if readme.exists() {
+        Some(readme)
+    } else {
+        hit.is_dir().then_some(hit)
+    }
 }
 
 /// The repository's forge coordinates, from the origin remote: `owner/repo`.
@@ -157,11 +176,81 @@ pub fn default_branch(root: &Path) -> String {
 
 pub fn origin_slug(root: &Path) -> Option<String> {
     let url = crate::git_out(root, &["remote", "get-url", "origin"])?;
-    let url = url.trim().trim_end_matches(".git");
-    let rest = url
-        .rsplit_once("github.com")
-        .map(|(_, r)| r.trim_start_matches([':', '/']))?;
+    let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    // Matched case-insensitively: `https://GitHub.com/o/r` is the same forge, and
+    // refusing it reported "no github origin remote" about a GitHub repository.
+    let lower = url.to_ascii_lowercase();
+    let at = lower.rfind("github.com")?;
+    let rest = url[at + "github.com".len()..].trim_start_matches([':', '/']);
     (rest.matches('/').count() == 1).then(|| rest.to_string())
+}
+
+/// The owner this tree RECORDS for a component, from the software recipe or the
+/// submodule list. A component's owner was guessed from the local origin, so
+/// `allium#12` resolved to this project's namespace while `.gitmodules` recorded
+/// another, and every URL in a fork retargeted to the contributor.
+fn recorded_owner(root: &Path, component: &str) -> Option<String> {
+    let mut sources = Vec::new();
+    if let Ok(text) = fs::read_to_string(root.join(".host-software")) {
+        sources.push(text);
+    }
+    if let Ok(text) = fs::read_to_string(root.join(".gitmodules")) {
+        sources.push(text);
+    }
+    for text in sources {
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            if key.trim() != "url" {
+                continue;
+            }
+            let url = value.trim().trim_end_matches('/').trim_end_matches(".git");
+            let Some((owner, repo)) = url.rsplit_once('/').and_then(|(o, r)| {
+                o.rsplit_once(['/', ':']).map(|(_, owner)| (owner.to_string(), r.to_string()))
+            }) else {
+                continue;
+            };
+            if repo.eq_ignore_ascii_case(component) {
+                return Some(owner);
+            }
+        }
+    }
+    None
+}
+
+/// The forge host the origin names, for a reference that already carries its
+/// repository. A qualified `o/r#17` in a GitLab-hosted project meant GitLab, and
+/// building a github.com URL for it produced a link to an unrelated repository.
+fn origin_host(root: &Path) -> Option<String> {
+    let url = crate::git_out(root, &["remote", "get-url", "origin"])?;
+    let url = url.trim();
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let after_user = after_scheme.rsplit_once('@').map(|(_, r)| r).unwrap_or(after_scheme);
+    let host = after_user.split([':', '/']).next()?;
+    (!host.is_empty() && host.contains('.')).then(|| host.to_ascii_lowercase())
+}
+
+/// The anchor GitHub actually generates for a heading carrying an explicit
+/// `{#id}`. The site renders the braces as literal text and slugifies the whole
+/// line, so emitting the explicit id produced a fragment matching no element and
+/// dropped the reader at the top of a long document.
+fn github_anchor(entry: &Path, anchor: &str) -> Option<String> {
+    let text = fs::read_to_string(entry).ok()?;
+    let marker = format!("{{#{anchor}}}");
+    let heading = text
+        .lines()
+        .find(|l| l.trim_start().starts_with('#') && l.contains(&marker))?;
+    let title = heading.trim_start().trim_start_matches('#').trim();
+    let slug: String = title
+        .to_ascii_lowercase()
+        .chars()
+        .filter_map(|c| match c {
+            c if c.is_alphanumeric() => Some(c),
+            ' ' | '-' | '_' => Some('-'),
+            _ => None,
+        })
+        .collect();
+    let slug = slug.trim_matches('-').to_string();
+    (!slug.is_empty()).then_some(slug)
 }
 
 /// Whether this repository owns the room a register reference names. A software
@@ -229,35 +318,36 @@ pub fn emit(root: &Path, reference: &Reference, emission: Emission) -> Result<St
             let slug = if reference.repo.contains('/') {
                 reference.repo.clone()
             } else {
-                // A bare component name takes the origin's owner: `host-lint#25`
-                // beside an origin of `connollydavid/agentic-host` is
-                // `connollydavid/host-lint`.
-                let owner = origin_slug(root)
-                    .and_then(|s| s.split_once('/').map(|(o, _)| o.to_string()))
+                // A bare component name takes the owner this tree RECORDS for it,
+                // and only falls back to the origin's owner when nothing records
+                // one. The recipe and the submodule list already name the owner,
+                // so guessing from origin retargeted a component held elsewhere
+                // and retargeted everything in a fork.
+                let owner = recorded_owner(root, &reference.repo)
+                    .or_else(|| origin_slug(root).and_then(|s| s.split_once('/').map(|(o, _)| o.to_string())))
                     .ok_or_else(|| {
                         format!(
-                            "no github origin remote, so `{}#{}` cannot be given an owner; write owner/repo#{}",
-                            reference.repo, reference.number, reference.number
+                            "nothing here records an owner for `{}`, and there is no github origin to take one from; write owner/repo#{}",
+                            reference.repo, reference.number
                         )
                     })?;
                 format!("{owner}/{}", reference.repo)
             };
+            // The forge follows the origin. A qualified reference in a project
+            // hosted elsewhere means that forge, and a github.com URL for it
+            // pointed at an unrelated repository that may well exist.
+            let host = origin_host(root).unwrap_or_else(|| "github.com".to_string());
             match emission {
-                Emission::FullUrl => Ok(format!("https://github.com/{slug}/issues/{}", reference.number)),
+                Emission::FullUrl => Ok(format!("https://{host}/{slug}/issues/{}", reference.number)),
                 Emission::MarkdownLink => Ok(format!(
-                    "[{slug}#{}](https://github.com/{slug}/issues/{})",
+                    "[{slug}#{}](https://{host}/{slug}/issues/{})",
                     reference.number, reference.number
                 )),
                 Emission::Path => unreachable!("answered above, before the remote is read"),
             }
         }
         RefKind::Register => {
-            let rel = entry_path(root, reference).ok_or_else(|| {
-                format!(
-                    "unresolved here: {}/{} names no entry in {}/ (in a software repository the number belongs to its governing host)",
-                    reference.room, reference.number, reference.room
-                )
-            })?;
+            let rel = entry_path(root, reference).ok_or_else(|| unresolved_reason(root, reference))?;
             let rel = rel.strip_prefix(root).unwrap_or(&rel).to_string_lossy().replace('\\', "/");
             match emission {
                 Emission::Path => Ok(format!("{rel}{anchor}")),
@@ -268,11 +358,58 @@ pub fn emit(root: &Path, reference: &Reference, emission: Emission) -> Result<St
                 Emission::FullUrl => {
                     let slug = origin_slug(root)
                         .ok_or_else(|| "no github origin remote, so a URL cannot be built".to_string())?;
-                    Ok(format!("https://github.com/{slug}/blob/{}/{rel}{anchor}", default_branch(root)))
+                    // The forge slugifies the whole heading line, braces and all,
+                    // so the explicit id is carried into the fragment only after
+                    // it has been translated into the anchor the forge holds.
+                    let fragment = match (&reference.anchor, entry_path(root, reference)) {
+                        (Some(a), Some(entry)) => match github_anchor(&entry, a) {
+                            Some(slugged) => format!("#{slugged}"),
+                            // Better to land at the top of the right document than
+                            // at a fragment the forge does not have.
+                            None => String::new(),
+                        },
+                        _ => String::new(),
+                    };
+                    Ok(format!(
+                        "https://github.com/{slug}/blob/{}/{rel}{fragment}",
+                        default_branch(root)
+                    ))
                 }
             }
         }
     }
+}
+
+/// Why a register reference did not resolve, in the terms of what the tree
+/// actually holds. One sentence for three different situations was a diagnosis
+/// that was wrong twice: a repository owning the room was told the number
+/// belonged to its governing host, and an ambiguity was reported as an absence.
+fn unresolved_reason(root: &Path, reference: &Reference) -> String {
+    let matches = entry_matches(root, reference);
+    if matches.len() > 1 {
+        let names: Vec<String> = matches
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+            .collect();
+        return format!(
+            "ambiguous: {}/{} names {} entries in {}/ ({}). Rename or remove one; a reference that resolves two ways resolves to neither",
+            reference.room,
+            reference.number,
+            names.len(),
+            reference.room,
+            names.join(", ")
+        );
+    }
+    if !root.join(&reference.room).is_dir() {
+        return format!(
+            "unresolved here: this repository holds no {}/ room, so {}/{} names a register of its governing host and cannot be resolved from here",
+            reference.room, reference.room, reference.number
+        );
+    }
+    format!(
+        "unresolved here: {}/ exists and holds no entry numbered {}",
+        reference.room, reference.number
+    )
 }
 
 /// One reported reference.
@@ -287,7 +424,7 @@ pub struct Finding {
 /// The references a line carries, with the document facts the sweep needs. A
 /// reference already inside a markdown link renders; one inside fenced code is an
 /// example rather than a reference.
-fn scan_line(line: &str) -> Vec<(Reference, bool, bool)> {
+fn scan_line(line: &str) -> Vec<(Reference, bool)> {
     let mut out = Vec::new();
     let bytes: Vec<char> = line.chars().collect();
     let mut i = 0;
@@ -324,7 +461,6 @@ fn scan_line(line: &str) -> Vec<(Reference, bool, bool)> {
                             anchor,
                         },
                         enclosing_link(&bytes, i, end),
-                        in_inline_code(&bytes, i),
                     ));
                     i = end;
                 }
@@ -349,7 +485,17 @@ fn scan_line(line: &str) -> Vec<(Reference, bool, bool)> {
             let hex_tail = bytes
                 .get(i + 1 + digits.chars().count())
                 .is_some_and(|c| c.is_ascii_hexdigit() && !c.is_ascii_digit());
-            if !digits.is_empty() && digits.len() <= 6 && !hex_tail && !(digits.len() == 6 && written.is_empty()) {
+            // A URL fragment is not an issue: what precedes the `#` in
+            // `https://example.com/spec/page#2024` is a path, and the same shape
+            // check `parse_reference` applies keeps it out of the corpus. A bare
+            // shorthand colour (`#123`, `#1234`) is not one either.
+            // A bare six-digit number is a colour rather than an issue; three and
+            // four digit shorthand colours are left in, because `#123` outside
+            // code is far likelier to be issue 123, and dropping it would lose
+            // real references to catch a shape this corpus does not contain.
+            let repo_shaped = written.is_empty()
+                || (written.matches('/').count() <= 1 && written.starts_with(|c: char| c.is_alphanumeric()));
+            if !digits.is_empty() && digits.len() <= 6 && !hex_tail && repo_shaped && !(digits.len() == 6 && written.is_empty()) {
                 let end = i + 1 + digits.chars().count();
                 out.push((
                     Reference {
@@ -360,7 +506,6 @@ fn scan_line(line: &str) -> Vec<(Reference, bool, bool)> {
                         anchor: None,
                     },
                     enclosing_link(&bytes, i, end),
-                    in_inline_code(&bytes, i),
                 ));
                 i = end;
                 continue;
@@ -371,11 +516,140 @@ fn scan_line(line: &str) -> Vec<(Reference, bool, bool)> {
     out
 }
 
-/// Whether the span sits inside inline code. Backticks quote: a reference written
-/// there is being SHOWN, not made, which is why a document that teaches the rule
-/// does not fail it. The same reading the tell gate gives its own fixtures.
-fn in_inline_code(line: &[char], start: usize) -> bool {
-    line[..start].iter().filter(|c| **c == '`').count() % 2 == 1
+/// The document's prose, with everything that quotes rather than refers removed:
+/// fenced blocks (including one inside a blockquote), indented code blocks, HTML
+/// comments, and inline code spans. Each entry is `(line number, prose)`, and a
+/// skipped line simply does not appear.
+///
+/// Backtick parity per line was the earlier reading, and it was wrong in both
+/// directions: a code span wrapped across a line break left odd parity and hid
+/// every reference after it, while a nested double-backtick span reported one it
+/// should have quoted. Runs are matched here the way a markdown reader matches
+/// them, so an unmatched backtick is literal and quotes nothing.
+fn prose_of(text: &str) -> Vec<(usize, String)> {
+    let mut kept: Vec<(usize, String)> = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_comment = false;
+    let mut in_indented = false;
+    let mut prev_blank = true;
+    for (n, raw) in text.lines().enumerate() {
+        // A blockquote marker is presentation: `> ```` opens a fence exactly as a
+        // bare one does, and reading the quoted block as prose produced a dead
+        // pointer finding about an example. Only the markers come off — the
+        // indentation has to survive, because four spaces after a blank line is
+        // what makes the next line code.
+        let mut body = raw;
+        while let Some(rest) = body.trim_start_matches(' ').strip_prefix('>') {
+            body = rest.strip_prefix(' ').unwrap_or(rest);
+        }
+        let t = body.trim_start();
+        if in_comment {
+            if let Some(p) = t.find("-->") {
+                in_comment = false;
+                kept.push((n + 1, t[p + 3..].to_string()));
+            }
+            continue;
+        }
+        if let Some((marker, len)) = fence {
+            let run = t.chars().take_while(|c| *c == marker).count();
+            if run >= len && t[run..].trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        let run = t.chars().take_while(|c| *c == '`').count();
+        let tilde = t.chars().take_while(|c| *c == '~').count();
+        if run >= 3 {
+            fence = Some(('`', run));
+            continue;
+        }
+        if tilde >= 3 {
+            fence = Some(('~', tilde));
+            continue;
+        }
+        let blank = t.is_empty();
+        // An indented code block: four spaces (or a tab) opening after a blank
+        // line, and every indented line after it. The blank-line condition is
+        // what keeps an indented continuation inside a list from being read as
+        // code and dropped from coverage.
+        let indented = body.starts_with("    ") || body.starts_with('\t');
+        if !blank && indented && (prev_blank || in_indented) {
+            in_indented = true;
+            prev_blank = false;
+            continue;
+        }
+        if !blank && !indented {
+            in_indented = false;
+        }
+        prev_blank = blank;
+        if let Some(p) = t.find("<!--") {
+            match t[p..].find("-->") {
+                Some(e) => kept.push((n + 1, format!("{}{}", &t[..p], &t[p + e + 3..]))),
+                None => {
+                    in_comment = true;
+                    kept.push((n + 1, t[..p].to_string()));
+                }
+            }
+            continue;
+        }
+        kept.push((n + 1, body.to_string()));
+    }
+    // Code spans are matched across the joined prose, because a span may wrap a
+    // line break. Masking with spaces keeps every other column where it was.
+    let joined: String = kept.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+    let masked = mask_code_spans(&joined);
+    kept.iter()
+        .map(|(n, _)| *n)
+        .zip(masked.split('\n').map(String::from))
+        .collect()
+}
+
+/// Blank out every inline code span, matching a run of backticks with the next
+/// run of the SAME length, exactly as a markdown reader does. An opening run with
+/// no match is literal text and masks nothing.
+fn mask_code_spans(buf: &str) -> String {
+    let chars: Vec<char> = buf.chars().collect();
+    let mut out = chars.clone();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut open = 0usize;
+        while i < chars.len() && chars[i] == '`' {
+            open += 1;
+            i += 1;
+        }
+        let mut j = i;
+        let mut close = None;
+        while j < chars.len() {
+            if chars[j] == '`' {
+                let run_start = j;
+                let mut run = 0usize;
+                while j < chars.len() && chars[j] == '`' {
+                    run += 1;
+                    j += 1;
+                }
+                if run == open {
+                    close = Some((run_start, j));
+                    break;
+                }
+            } else {
+                j += 1;
+            }
+        }
+        if let Some((_, end)) = close {
+            for c in out.iter_mut().take(end).skip(start) {
+                if *c != '\n' {
+                    *c = ' ';
+                }
+            }
+            i = end;
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Whether the span sits inside a markdown link: either the label or the target
@@ -396,25 +670,13 @@ fn enclosing_link(line: &[char], start: usize, end: usize) -> bool {
 /// is how the tell gate reads its own fixtures.
 pub fn scan_document(text: &str, file: &str, root: &Path) -> Vec<Finding> {
     let mut out = Vec::new();
-    let mut fenced = false;
     // One reference per line per text: a markdown link writes the same reference
-    // twice (its label and its target), and a reader sees one link.
+    // twice (its label and its target), and a reader sees one link. The text is
+    // the reference AS WRITTEN, so two repositories citing the same number on one
+    // line stay two findings.
     let mut seen: Vec<(usize, String)> = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let t = line.trim_start();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
-            continue;
-        }
-        for (reference, in_link, in_code) in scan_line(line) {
-            // Quoted is shown, not referred: a reference in inline code is an
-            // example, whichever kind it is.
-            if in_code {
-                continue;
-            }
+    for (n, line) in prose_of(text) {
+        for (reference, in_link) in scan_line(&line) {
             let (text, weight) = match reference.kind {
                 RefKind::Register
                     if owns_room(root, &reference)
@@ -422,14 +684,21 @@ pub fn scan_document(text: &str, file: &str, root: &Path) -> Vec<Finding> {
                 {
                     (format!("{}/{}", reference.room, reference.number), Weight::DeadPointer)
                 }
-                RefKind::Issue if !in_link => (format!("#{}", reference.number), Weight::Unrendered),
+                // Written outside a link, so the site renders it as text whether
+                // or not it names its repository. Calling a qualified reference
+                // bare was false about what had been counted, and told an author
+                // to rewrite text already in the recommended form.
+                RefKind::Issue if !in_link => (
+                    format!("{}#{}", reference.repo, reference.number),
+                    Weight::Unrendered,
+                ),
                 _ => continue,
             };
             if seen.contains(&(n, text.clone())) {
                 continue;
             }
             seen.push((n, text.clone()));
-            out.push(Finding { file: file.to_string(), line: n + 1, text, weight });
+            out.push(Finding { file: file.to_string(), line: n, text, weight });
         }
     }
     out
@@ -439,23 +708,49 @@ pub fn scan_document(text: &str, file: &str, root: &Path) -> Vec<Finding> {
 /// follow, and settle the verdict. `0` clean, `3` advisory, `1` on any dead
 /// pointer, `2` on a usage error.
 pub fn refs_check(root: &Path) -> i32 {
-    let docs = crate::authored_docs(root);
+    if !root.is_dir() {
+        eprintln!("host-lifecycle: {} is not a directory", root.display());
+        return 2;
+    }
+    let corpus = match crate::authored_corpus(root) {
+        Ok(c) => c,
+        Err(why) => {
+            eprintln!("host-lifecycle: {why}");
+            return 2;
+        }
+    };
+    let docs = corpus.docs;
     if docs.is_empty() {
         // A clean verdict over nothing is the fail-unsafe shape: a cold reader
         // cannot tell it from a real pass.
         eprintln!(
-            "host-lifecycle: no authored markdown found under {} (not a git repository, or nothing tracked?)",
-            root.display()
+            "host-lifecycle: no authored markdown to sweep under {}{}",
+            root.display(),
+            if corpus.excluded > 0 {
+                format!(" ({} document(s) excluded by .host-lintignore or the record layer)", corpus.excluded)
+            } else {
+                " (not a git repository, or nothing tracked?)".to_string()
+            }
         );
         return 2;
     }
     let rooms_here: Vec<&str> = ROOMS.iter().copied().filter(|r| root.join(r).is_dir()).collect();
     let mut findings: Vec<Finding> = Vec::new();
     let mut unchecked_registers = 0usize;
+    let mut unread: Vec<String> = Vec::new();
     for doc in &docs {
-        let Ok(text) = fs::read_to_string(root.join(doc)) else { continue };
+        // A listed document that will not open is a hole in the corpus, never a
+        // silent skip: the run cannot say what was in it, and a dead pointer
+        // inside one shipped as a clean verdict at exit zero.
+        let Ok(text) = fs::read_to_string(root.join(doc)) else {
+            unread.push(doc.clone());
+            continue;
+        };
         unchecked_registers += count_unowned_registers(&text, root);
         findings.extend(scan_document(&text, doc, root));
+    }
+    for doc in &unread {
+        println!("UNREAD   {doc}: listed by the walk and could not be read");
     }
     let dead: Vec<&Finding> = findings.iter().filter(|f| f.weight == Weight::DeadPointer).collect();
     for f in &dead {
@@ -478,40 +773,92 @@ pub fn refs_check(root: &Path) -> i32 {
     if by_file.len() > 10 {
         println!("bare     … and {} more file(s)", by_file.len() - 10);
     }
-    if !dead.is_empty() {
-        println!(
-            "-- {} dead pointer(s): a reference naming a record that does not exist. Fix the number or the reference; run `host-lifecycle resolve <ref> {}` to see where one points.",
-            dead.len(),
-            root.display()
-        );
+    let swept = docs.len() - unread.len();
+    if !dead.is_empty() || !unread.is_empty() {
+        println!("-- {swept} doc(s) read of {} listed.", docs.len());
+        if let Some(first) = dead.first() {
+            println!(
+                "   {} dead pointer(s): a reference naming a record that does not exist. Run `host-lifecycle resolve {} {}` to see where one points.",
+                dead.len(),
+                first.text,
+                root.display()
+            );
+        }
+        if !unread.is_empty() {
+            println!(
+                "   {} document(s) could not be read, so nothing here vouches for what is in them. Fix the permissions or the encoding and sweep again.",
+                unread.len()
+            );
+        }
+        disclose_uncovered(corpus.excluded, unchecked_registers, &rooms_here);
         return 1;
     }
     if !debt.is_empty() {
         println!(
-            "-- {} doc(s) swept. {} bare issue reference(s) in {} file(s): they name no repository, so the site cannot render them and a reader cannot tell whose tracker they mean.",
-            docs.len(),
+            "-- {} doc(s) swept. {} issue reference(s) in {} file(s) written outside a link, so the site renders them as text rather than as links.",
+            swept,
             debt.len(),
             by_file.len()
         );
+        let unqualified = debt.iter().filter(|f| f.text.starts_with('#')).count();
+        if unqualified > 0 {
+            println!("   {unqualified} of them name no repository, so a reader cannot tell whose tracker they mean.");
+        }
         println!("   Advisory: nothing is blocked. No flag fixes this; each reference is an edit.");
+        // The remedy names THIS repository. Hardcoding a slug handed every
+        // adopter a command that rewrote their reference to point at another
+        // project's tracker, and the weak-agent acceptance is the evidence that
+        // the printed command gets run verbatim.
         println!(
-            "   Write each as owner/repo#N inside a link. For one of them: host-lifecycle resolve connollydavid/host-lifecycle{} --markdown {}",
-            debt[0].text,
+            "   Write each as owner/repo#N inside a link. For one of them: host-lifecycle resolve {} --markdown {}",
+            remedy_reference(root, &debt[0].text),
             root.display()
         );
+        disclose_uncovered(corpus.excluded, unchecked_registers, &rooms_here);
         return 3;
     }
-    println!(
-        "-- {} doc(s) swept; every reference in them resolves and renders",
-        docs.len()
-    );
-    if unchecked_registers > 0 {
+    println!("-- {swept} doc(s) swept; every reference in them resolves and renders");
+    disclose_uncovered(corpus.excluded, unchecked_registers, &rooms_here);
+    0
+}
+
+/// What the sweep did not check, printed on every verdict it can reach. Printing
+/// it on the clean branch alone meant it never printed in a software repository,
+/// which carries legibility debt almost always and is the case it exists for.
+fn disclose_uncovered(excluded: usize, unchecked_registers: usize, rooms_here: &[&str]) {
+    if excluded > 0 {
         println!(
-            "   {unchecked_registers} register reference(s) name a room this repository does not hold ({}); they belong to its governing host and were not checked",
-            if rooms_here.is_empty() { "no plan/ or call/ room here".to_string() } else { format!("rooms here: {}", rooms_here.join(", ")) }
+            "   {excluded} document(s) were excluded and not swept (the record layer, and whatever .host-lintignore names); they are records, so nothing here asks for them to be rewritten"
         );
     }
-    0
+    // The room names are the ones this methodology fixes. A project that renamed
+    // its rooms, or nests them under a subdirectory, had every register reference
+    // pass through unseen, and the verdict then read as a clean bill over a
+    // corpus the grammar never recognised.
+    if rooms_here.is_empty() {
+        println!(
+            "   no {} room here, so no register reference was checked against anything; this is ordinary in a software repository and a defect in a host whose rooms are named or nested differently",
+            ROOMS.map(|r| format!("{r}/")).join(" or ")
+        );
+    }
+    if unchecked_registers > 0 {
+        println!(
+            "   {unchecked_registers} register reference(s) name a room this repository does not hold (rooms here: {}); they belong to its governing host and were not checked",
+            if rooms_here.is_empty() { "none".to_string() } else { rooms_here.join(", ") }
+        );
+    }
+}
+
+/// A reference the remedy can name, qualified against THIS repository. Falls back
+/// to the placeholder form only where no origin says who owns the tree.
+fn remedy_reference(root: &Path, written: &str) -> String {
+    if !written.starts_with('#') {
+        return written.to_string();
+    }
+    match origin_slug(root) {
+        Some(slug) => format!("{slug}{written}"),
+        None => format!("owner/repo{written}"),
+    }
 }
 
 /// References this repository cannot check, because it does not own their room.
@@ -519,18 +866,9 @@ pub fn refs_check(root: &Path) -> i32 {
 /// line that did not mention them would claim coverage it does not have.
 fn count_unowned_registers(text: &str, root: &Path) -> usize {
     let mut n = 0;
-    let mut fenced = false;
-    for line in text.lines() {
-        let t = line.trim_start();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
-            continue;
-        }
-        for (reference, _, in_code) in scan_line(line) {
-            if !in_code && reference.kind == RefKind::Register && !owns_room(root, &reference) {
+    for (_, line) in prose_of(text) {
+        for (reference, _) in scan_line(&line) {
+            if reference.kind == RefKind::Register && !owns_room(root, &reference) {
                 n += 1;
             }
         }
@@ -547,6 +885,13 @@ pub fn resolve(args: &[String]) {
             "--markdown" => emission = Emission::MarkdownLink,
             "--url" => emission = Emission::FullUrl,
             "--path" => emission = Emission::Path,
+            // An unrecognised flag became the directory, so a mistyped `--md` was
+            // reported as a reference that does not resolve — a false verdict
+            // wearing the governing-host explanation.
+            _ if a.starts_with("--") => {
+                eprintln!("host-lifecycle: unknown flag `{a}` (expected --markdown, --url or --path)");
+                process::exit(2);
+            }
             _ => pos.push(a),
         }
     }
@@ -558,6 +903,13 @@ pub fn resolve(args: &[String]) {
         Some(d) => PathBuf::from(d.as_str()),
         None => PathBuf::from("."),
     };
+    // A root that cannot be read is a usage error. Reporting it as a resolution
+    // outcome told the caller the reference was unresolvable when the directory
+    // was simply not there.
+    if !root.is_dir() {
+        eprintln!("host-lifecycle: {} is not a directory", root.display());
+        process::exit(2);
+    }
     if resolution(&root, reference_text) == Resolution::Malformed {
         eprintln!("host-lifecycle: `{reference_text}` is not a reference (expected plan/NNNN, call/NNNN or #N)");
         process::exit(2);
@@ -593,6 +945,10 @@ pub fn refs(args: &[String]) {
         match a.as_str() {
             "--check" => check = true,
             "--fix" => fix = true,
+            _ if a.starts_with("--") => {
+                eprintln!("host-lifecycle: unknown flag `{a}` (expected --check)");
+                process::exit(2);
+            }
             _ => pos.push(a),
         }
     }
@@ -610,7 +966,11 @@ pub fn refs(args: &[String]) {
         match first_bare_reference(&root) {
             Some((file, text)) => {
                 eprintln!("  Start with the first one, in {file}:");
-                eprintln!("  host-lifecycle resolve connollydavid/host-lifecycle{text} --markdown {}", root.display());
+                eprintln!(
+                    "  host-lifecycle resolve {} --markdown {}",
+                    remedy_reference(&root, &text),
+                    root.display()
+                );
             }
             None => eprintln!("  This tree has no bare issue reference to rewrite."),
         }
@@ -670,16 +1030,52 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    // A number the room does not hold is unresolved HERE: the message says which
-    // room was searched and why a software repository sees this normally, rather
-    // than guessing at another repository's registers.
+    // A number the room does not hold is unresolved HERE, and the message says
+    // which of the three situations it is. One sentence for all three diagnosed a
+    // repository that OWNS the room as one that does not, so a wrong working
+    // directory read as a wrong repository.
     #[test]
-    fn reports_unresolved_here_rather_than_guessing() {
+    fn names_which_unresolved_case_this_is() {
         let base = fixture("unresolved");
+        // The room is here and holds no such number.
         let absent = parse_reference("plan/0099").unwrap();
         let err = emit(&base, &absent, Emission::Path).unwrap_err();
         assert!(err.contains("unresolved here"), "{err}");
-        assert!(err.contains("governing host"), "and says why a software repo sees it: {err}");
+        assert!(err.contains("plan/ exists"), "the room is here, so say so: {err}");
+        assert!(!err.contains("governing host"), "and do not blame a governing host: {err}");
+
+        // No room at all: this IS the governing-host case, and the only one.
+        let bare = base.join("software");
+        fs::create_dir_all(&bare).unwrap();
+        let err = emit(&bare, &absent, Emission::Path).unwrap_err();
+        assert!(err.contains("governing host"), "{err}");
+        assert!(err.contains("no plan/ room"), "{err}");
+
+        // Two entries share a number: an ambiguity, never a silent first match.
+        fs::create_dir_all(base.join("plan").join("0074-abandoned-draft")).unwrap();
+        fs::write(base.join("plan").join("0074-abandoned-draft").join("README.md"), "# d\n").unwrap();
+        let doubled = parse_reference("plan/0074").unwrap();
+        let err = emit(&base, &doubled, Emission::Path).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("0074-abandoned-draft") && err.contains("0074-materialize"), "names both: {err}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A milestone whose record is the directory resolves to the directory. The
+    // README existence gate reported a milestone that is plainly there as a dead
+    // pointer, and it gated.
+    #[test]
+    fn a_milestone_without_a_readme_is_still_the_entry() {
+        let base = fixture("noreadme");
+        fs::create_dir_all(base.join("plan").join("0080-directory-is-the-record")).unwrap();
+        fs::write(base.join("plan").join("0080-directory-is-the-record").join("design.md"), "# d\n").unwrap();
+        let reference = parse_reference("plan/0080").unwrap();
+        assert_eq!(
+            emit(&base, &reference, Emission::Path).unwrap(),
+            "plan/0080-directory-is-the-record"
+        );
+        let found = scan_document("governed by plan/0080\n", "README.md", &base);
+        assert!(found.is_empty(), "the entry is there, so it is not a dead pointer: {found:?}");
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -705,8 +1101,8 @@ mod tests {
         // The linked issue on line 4 is not debt: `enclosing_link` reports it as
         // in_link, and a reference that renders is not reported.
         assert!(found.iter().all(|f| f.text != "#18"), "a linked issue renders: {found:?}");
-        let linked: Vec<(Reference, bool, bool)> = scan_line("[#18](https://github.com/o/r/issues/18)");
-        assert!(linked.iter().any(|(r, in_link, _)| r.number == "18" && *in_link));
+        let linked: Vec<(Reference, bool)> = scan_line("[#18](https://github.com/o/r/issues/18)");
+        assert!(linked.iter().any(|(r, in_link)| r.number == "18" && *in_link));
         assert!(found.iter().all(|f| f.line != 6), "fenced references are examples, never findings");
 
         // Quoted in backticks is shown rather than referred, for either kind; a
@@ -745,6 +1141,77 @@ mod tests {
         assert_eq!(resolution(&base, "plan/0099"), Resolution::UnresolvedHere);
         assert_eq!(resolution(&base, "plan/74"), Resolution::Malformed);
         assert_eq!(resolution(&base, "not a reference"), Resolution::Malformed);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A document is read the way a markdown reader reads it. Each of these was a
+    // false verdict: the first three gated correct documents, and the last two
+    // lost a dead pointer the gate exists to catch.
+    #[test]
+    fn quoting_is_read_the_way_a_markdown_reader_reads_it() {
+        let base = fixture("blocks");
+        let cases: [(&str, usize, &str); 6] = [
+            ("> ```\n> an example: #19 and plan/0097\n> ```\n", 0, "a fence inside a blockquote is still a fence"),
+            ("prose\n\n    host-lifecycle resolve plan/0097 .\n", 0, "an indented code block is code"),
+            ("<!-- TODO: renumber plan/0097 -->\n", 0, "an HTML comment is not prose"),
+            ("The gate would force a `cargo fmt\n--check` run, so plan/0097 stayed dead.\n", 1, "a code span wrapping a line break quotes only itself"),
+            ("Don't write ` there, and note plan/0097 is dead.\n", 1, "an unmatched backtick is literal and quotes nothing"),
+            ("``an example: #19 inside a double span``\n", 0, "a nested span quotes what it holds"),
+        ];
+        for (doc, expected, why) in cases {
+            let found = scan_document(doc, "doc.md", &base);
+            assert_eq!(found.len(), expected, "{why}: {found:?}");
+        }
+        // An indented continuation under a bullet is prose, not a code block, so
+        // reading it as code would have lost coverage rather than gained it.
+        let listed = scan_document("- a bullet\n    continued, and plan/0097 is dead\n", "doc.md", &base);
+        assert_eq!(listed.len(), 1, "a list continuation is prose: {listed:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The sweep counted a fully-qualified reference as bare and said it named no
+    // repository, which was false about what it had counted and told an author to
+    // rewrite text already in the recommended form.
+    #[test]
+    fn a_qualified_reference_is_not_called_bare() {
+        let base = fixture("qualified");
+        let found = scan_document("compare host-lint#17 with host-prove#17 on one line\n", "doc.md", &base);
+        assert_eq!(found.len(), 2, "two repositories are two references: {found:?}");
+        assert_eq!(found[0].text, "host-lint#17");
+        assert_eq!(found[1].text, "host-prove#17");
+        // A URL fragment is not an issue number at all.
+        let fragment = scan_document("see https://example.com/spec/page#2024 for the shape\n", "doc.md", &base);
+        assert!(fragment.is_empty(), "a URL fragment names no issue: {fragment:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A component's owner comes from what the tree RECORDS, never from a guess at
+    // the local origin: `.gitmodules` here names another owner, and guessing sent
+    // the reader to a repository that does not exist.
+    #[test]
+    fn a_component_takes_the_owner_this_tree_records() {
+        let base = fixture("owner");
+        fs::write(base.join(".gitmodules"), "[submodule \"tools/allium\"]\n\turl = https://github.com/juxt/allium.git\n").unwrap();
+        assert_eq!(recorded_owner(&base, "allium").as_deref(), Some("juxt"));
+        assert_eq!(recorded_owner(&base, "not-a-component"), None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The forge slugifies a whole heading line, braces and all, so the explicit
+    // id is translated rather than pasted: emitting `#write-spec` produced a
+    // fragment the forge does not have and dropped the reader at the top.
+    #[test]
+    fn the_url_anchor_is_the_one_the_forge_actually_holds() {
+        let base = fixture("anchor");
+        let entry = base.join("plan").join("0074-materialize").join("README.md");
+        fs::write(&entry, "# m\n\n### The reference surface {#write-spec}\n").unwrap();
+        assert_eq!(
+            github_anchor(&entry, "write-spec").as_deref(),
+            Some("the-reference-surface-write-spec")
+        );
+        // A heading the document does not carry yields no fragment, rather than a
+        // confident one that matches nothing.
+        assert_eq!(github_anchor(&entry, "no-such-node"), None);
         let _ = fs::remove_dir_all(&base);
     }
 
