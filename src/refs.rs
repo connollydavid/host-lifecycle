@@ -493,8 +493,16 @@ fn scan_line(line: &str) -> Vec<(Reference, bool)> {
             // four digit shorthand colours are left in, because `#123` outside
             // code is far likelier to be issue 123, and dropping it would lose
             // real references to catch a shape this corpus does not contain.
+            // A repository name is `owner/repo` or a bare component, and both
+            // halves have to be there: `#41/#50` walked back over the slash and
+            // read `41/` as a repository, so a pair of review-finding codes was
+            // counted as an issue reference.
             let repo_shaped = written.is_empty()
-                || (written.matches('/').count() <= 1 && written.starts_with(|c: char| c.is_alphanumeric()));
+                || (written.starts_with(|c: char| c.is_alphanumeric())
+                    && match written.split_once('/') {
+                        Some((owner, repo)) => !owner.is_empty() && !repo.is_empty() && !repo.contains('/'),
+                        None => true,
+                    });
             if !digits.is_empty() && digits.len() <= 6 && !hex_tail && repo_shaped && !(digits.len() == 6 && written.is_empty()) {
                 let end = i + 1 + digits.chars().count();
                 out.push((
@@ -1207,6 +1215,12 @@ mod tests {
         // A URL fragment is not an issue number at all.
         let fragment = scan_document("see https://example.com/spec/page#2024 for the shape\n", "doc.md", &base);
         assert!(fragment.is_empty(), "a URL fragment names no issue: {fragment:?}");
+        // A pair of review-finding codes is not a repository and a number: the
+        // walk-back crossed the slash and read `41/` as one, so `#50` was
+        // counted as an issue in somebody's tracker.
+        let codes = scan_document("the deferred #41/#50 dogfood\n", "doc.md", &base);
+        assert_eq!(codes.len(), 1, "one bare number, not a repository reference: {codes:?}");
+        assert_eq!(codes[0].text, "#41");
         let _ = fs::remove_dir_all(&base);
     }
 
