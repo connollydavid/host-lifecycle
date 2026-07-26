@@ -911,7 +911,14 @@ pub fn resolve(args: &[String]) {
         process::exit(2);
     }
     if resolution(&root, reference_text) == Resolution::Malformed {
-        eprintln!("host-lifecycle: `{reference_text}` is not a reference (expected plan/NNNN, call/NNNN or #N)");
+        eprintln!("host-lifecycle: `{reference_text}` is not a reference (expected plan/NNNN, call/NNNN or owner/repo#N)");
+        // Named from this tree rather than left as a shape to fill in. The
+        // weak-agent probe truncated a long remedy to `resolve --markdown .`,
+        // dropping the reference; a usage error alone teaches nothing, and the
+        // `--fix` refusal already proved that naming a real one gets it run.
+        if let Some(real) = first_register_reference(&root) {
+            eprintln!("  A reference from this tree: host-lifecycle resolve {real} --markdown {}", root.display());
+        }
         process::exit(2);
     }
     let reference = parse_reference(reference_text).expect("malformed was answered above");
@@ -922,6 +929,24 @@ pub fn resolve(args: &[String]) {
             process::exit(1);
         }
     }
+}
+
+/// A register reference this tree actually holds, so a usage error can name one
+/// rather than describe its shape.
+fn first_register_reference(root: &Path) -> Option<String> {
+    for room in ROOMS {
+        let mut entries: Vec<String> = fs::read_dir(root.join(room))
+            .ok()?
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .filter(|n| n.len() > 4 && n[..4].chars().all(|c| c.is_ascii_digit()) && n[4..].starts_with('-'))
+            .collect();
+        entries.sort();
+        if let Some(first) = entries.first() {
+            return Some(format!("{room}/{}", &first[..4]));
+        }
+    }
+    None
 }
 
 /// The first bare issue reference in the tree, as (file, `#N`), so a refusal can
