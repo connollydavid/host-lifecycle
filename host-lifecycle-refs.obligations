@@ -29,9 +29,11 @@ enum-comparable.Emission                       => structural
 enum-comparable.Weight                         => structural
 entity-fields.Project                          => structural
 entity-fields.Origin                           => structural
+entity-fields.Document                         => structural
 entity-fields.Reference                        => structural
 entity-fields.Resolved                         => structural
 entity-fields.Finding                          => structural
+entity-fields.UnreadDocument                   => structural
 entity-fields.Sweep                            => structural
 transition-rejected.Sweep.status               => structural
 transition-terminal.Sweep.status               => structural
@@ -48,9 +50,9 @@ transition-edge.Sweep.sweeping.error           => test:refs_check_fails_closed_o
 
 # --- Resolving one reference ---
 rule-success.ResolveRegister                   => test:resolves_a_register_reference_to_its_entry exercises=emit
-rule-failure.ResolveRegister.1                 => test:reports_unresolved_here_rather_than_guessing exercises=emit
+rule-failure.ResolveRegister.1                 => test:names_which_unresolved_case_this_is exercises=emit
 rule-entity-creation.ResolveRegister.1         => test:reports_the_three_resolution_outcomes exercises=resolution
-rule-success.ResolveUnresolvedHere             => test:reports_unresolved_here_rather_than_guessing exercises=emit
+rule-success.ResolveUnresolvedHere             => test:names_which_unresolved_case_this_is exercises=emit
 rule-failure.ResolveUnresolvedHere.1           => test:resolves_a_register_reference_to_its_entry exercises=entry_path
 rule-entity-creation.ResolveUnresolvedHere.1   => test:reports_the_three_resolution_outcomes exercises=resolution_of
 rule-success.ResolveIssue                      => test:resolve_builds_forge_urls_from_the_named_repository exercises=resolve
@@ -94,3 +96,27 @@ invariant.UrlNeedsOrigin                       => test:resolve_builds_forge_urls
 invariant.CleanVerdictSawNothing               => test:refs_check_fails_closed_on_an_empty_corpus exercises=refs
 invariant.AdvisoryNeverSawDeadPointer          => test:refs_check_splits_clean_advisory_and_dead exercises=refs
 invariant.DeadVerdictSawDeadPointer            => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+
+# --- The corpus (plan/0077 adversarial round) ---
+# The specification began where a reference already existed, so a verdict could
+# claim coverage of documents the run never opened and nothing could bite on it.
+# Each entry below names a test that runs the BINARY over a corpus with a known
+# hole in it: a unit test cannot observe the exit code that carries the verdict.
+rule-success.DetectUnreadDocument              => test:an_unreadable_document_gates_rather_than_being_counted_as_swept exercises=UNREAD
+rule-failure.DetectUnreadDocument.1            => test:every_exclusion_spelling_excludes_the_record_it_names exercises=.host-lintignore
+rule-entity-creation.DetectUnreadDocument.1    => test:an_unreadable_document_gates_rather_than_being_counted_as_swept exercises=UNREAD
+rule-success.RecordUnread                      => test:an_unreadable_document_gates_rather_than_being_counted_as_swept exercises=UNREAD
+rule-failure.RecordUnread.1                    => test:sweeps_dead_pointers_and_bare_issue_numbers exercises=scan_document
+rule-success.RecordWithheldDocument            => test:the_verdict_discloses_what_it_did_not_check_on_every_exit exercises=excluded
+rule-failure.RecordWithheldDocument.1          => test:a_subdirectory_sweep_still_honours_the_root_exclusion_list exercises=.host-lintignore
+rule-success.RecordUncheckedRegister           => test:the_verdict_discloses_what_it_did_not_check_on_every_exit exercises=register
+rule-failure.RecordUncheckedRegister.1         => test:a_repository_without_the_room_owns_no_dead_pointer exercises=owns_room
+rule-success.DiscloseUncovered                 => test:the_verdict_discloses_what_it_did_not_check_on_every_exit exercises=excluded
+rule-failure.DiscloseUncovered.1               => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+
+# The three invariants the coverage class needed. `CleanVerdictSawNothing` proved
+# only that a clean verdict reported nothing, which a run that opened no document
+# satisfies trivially; these bite on the corpus instead.
+invariant.CleanVerdictReadEveryDocument        => test:an_unreadable_document_gates_rather_than_being_counted_as_swept exercises=UNREAD
+invariant.AdvisoryNeverHidAnUnreadDocument     => test:an_unreadable_document_gates_rather_than_being_counted_as_swept exercises=UNREAD
+invariant.UncoveredIsAlwaysDisclosed           => test:the_verdict_discloses_what_it_did_not_check_on_every_exit exercises=excluded

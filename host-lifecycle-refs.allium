@@ -75,6 +75,21 @@ entity Origin {
     known: Boolean
 }
 
+-- One authored document the walk listed: the corpus the sweep speaks for. This
+-- specification began where a reference already existed, so a verdict could
+-- claim coverage of documents the run never opened and no obligation could bite
+-- on it. That hole let the coverage class recur three times (plan/0077
+-- adversarial-review.md), which is why the corpus is modelled here.
+entity Document {
+    -- Withheld from the sweep: the record layer by construction, or a path the
+    -- operator's exclusion list names. A withheld document yields no reference,
+    -- and the verdict discloses it rather than counting it as read.
+    excluded: Boolean
+    -- Whether the walk could open it. A listed document the run cannot read is a
+    -- hole rather than a clean line: a dead pointer may sit inside it.
+    readable: Boolean
+}
+
 -- One reference as written, with the facts the resolver reads: which room it
 -- names, whether a numbered entry matches, and whether it carries an anchor.
 -- `in_link` and `quoted` are the document facts the sweep needs: a reference
@@ -96,7 +111,10 @@ entity Reference {
     -- document that teaches the rule shows references, and showing is not
     -- referring.
     quoted: Boolean
-    excluded: Boolean
+    -- The document it was read from. Exclusion is decided per document rather
+    -- than per reference, so the record-layer invariant has to reach through
+    -- here to say anything true.
+    document: Document
 }
 
 -- One resolution of one reference, and what it emitted.
@@ -115,6 +133,14 @@ entity Finding {
     weight: Weight
 }
 
+-- A listed document the walk could not open. Its own entity rather than a
+-- weight on a finding, because there is no reference to name, and that absence
+-- is precisely what is wrong: the sweep cannot say what the document held, so a
+-- dead pointer may be sitting in it. It gates for the same reason.
+entity UnreadDocument {
+    document: Document
+}
+
 -- One `refs --check` run. The verdict splits the way the memory audit's does
 -- (call/0045): a dead pointer gates, legibility debt advises, and a tree with
 -- neither is clean.
@@ -122,6 +148,16 @@ entity Sweep {
     status: sweeping | clean | advisory | dead | error
     saw_finding: Boolean
     saw_dead_pointer: Boolean
+    -- A listed document went unread. Gates alongside the dead pointer, because
+    -- a verdict over a corpus with a hole in it is a claim the run cannot make.
+    saw_unread: Boolean
+    -- Something in the tree was not checked: a withheld document, or a register
+    -- reference naming a room this repository does not hold.
+    uncovered: Boolean
+    -- The verdict said so. Every terminal verdict rather than the clean one
+    -- alone: a software repository almost always carries legibility debt, so a
+    -- disclosure that printed only on the clean branch never printed at all.
+    disclosed_uncovered: Boolean
     transitions status {
         sweeping -> clean
         sweeping -> advisory
@@ -214,7 +250,7 @@ rule DetectDeadPointer {
     when: reference: Reference.created
     requires: reference.kind = register and reference.room_present
               and not reference.entry_matched
-              and not reference.quoted and not reference.excluded
+              and not reference.quoted and not reference.document.excluded
     ensures: Finding.created(reference: reference, weight: dead_pointer)
 }
 
@@ -224,8 +260,17 @@ rule DetectDeadPointer {
 rule DetectUnrenderedIssue {
     when: reference: Reference.created
     requires: reference.kind = issue and not reference.in_link
-              and not reference.quoted and not reference.excluded
+              and not reference.quoted and not reference.document.excluded
     ensures: Finding.created(reference: reference, weight: unrendered)
+}
+
+-- A listed document the walk could not open. Reported and gating, because the
+-- alternative is the coverage claim this review found for the third time: the
+-- document is counted as swept and its contents are asserted to be sound.
+rule DetectUnreadDocument {
+    when: document: Document.created
+    requires: not document.excluded and not document.readable
+    ensures: UnreadDocument.created(document: document)
 }
 
 -- === Verdict lifecycle ===
@@ -235,6 +280,9 @@ rule StartSweep {
     ensures: sweep.status = sweeping
     ensures: sweep.saw_finding = false
     ensures: sweep.saw_dead_pointer = false
+    ensures: sweep.saw_unread = false
+    ensures: sweep.uncovered = false
+    ensures: sweep.disclosed_uncovered = false
 }
 
 rule RecordFinding {
@@ -249,21 +297,51 @@ rule RecordDeadPointer {
     ensures: sweep.saw_dead_pointer = true
 }
 
+rule RecordUnread {
+    when: hole: UnreadDocument.created
+    requires: sweep.status = sweeping
+    ensures: sweep.saw_unread = true
+}
+
+-- A withheld document is coverage the sweep does not have. Latched here so the
+-- verdict can disclose it, rather than counting it among the documents swept.
+rule RecordWithheldDocument {
+    when: document: Document.created
+    requires: sweep.status = sweeping and document.excluded
+    ensures: sweep.uncovered = true
+}
+
+-- A register reference naming a room this repository does not hold was not
+-- checked against anything. The governing host holds the number.
+rule RecordUncheckedRegister {
+    when: reference: Reference.created
+    requires: sweep.status = sweeping and reference.kind = register
+              and not reference.room_present
+    ensures: sweep.uncovered = true
+}
+
+rule DiscloseUncovered {
+    when: SweepCompletes(project)
+    requires: sweep.status = sweeping and sweep.uncovered
+    ensures: sweep.disclosed_uncovered = true
+}
+
 rule VerdictDead {
     when: SweepCompletes(project)
-    requires: sweep.status = sweeping and sweep.saw_dead_pointer
+    requires: sweep.status = sweeping and (sweep.saw_dead_pointer or sweep.saw_unread)
     ensures: sweep.status = dead
 }
 
 rule VerdictAdvisory {
     when: SweepCompletes(project)
-    requires: sweep.status = sweeping and sweep.saw_finding and not sweep.saw_dead_pointer
+    requires: sweep.status = sweeping and sweep.saw_finding
+              and not sweep.saw_dead_pointer and not sweep.saw_unread
     ensures: sweep.status = advisory
 }
 
 rule VerdictClean {
     when: SweepCompletes(project)
-    requires: sweep.status = sweeping and not sweep.saw_finding
+    requires: sweep.status = sweeping and not sweep.saw_finding and not sweep.saw_unread
     ensures: sweep.status = clean
 }
 
@@ -280,7 +358,7 @@ rule VerdictError {
 -- would be breaking the thing it audits (call/0009).
 invariant ExcludedIsNeverReported {
     for f in Findings:
-        not f.reference.excluded
+        not f.reference.document.excluded
 }
 
 -- A quoted reference is an example, whether it sits in a fence or in inline
@@ -331,6 +409,31 @@ invariant UrlNeedsOrigin {
 invariant CleanVerdictSawNothing {
     for s in Sweeps where s.status = clean:
         not s.saw_finding
+}
+
+-- A clean verdict implies every listed document was read. The old form proved
+-- only that a clean verdict reported nothing, which a run that opened no
+-- document satisfies trivially; that gap is how a dead pointer inside an
+-- unreadable document shipped as clean at exit zero.
+invariant CleanVerdictReadEveryDocument {
+    for s in Sweeps where s.status = clean:
+        not s.saw_unread
+}
+
+-- A hole in the corpus can never land as legibility debt. Together with the
+-- clean invariant this says an unread document reaches the gating verdict or
+-- the error verdict, and nowhere else.
+invariant AdvisoryNeverHidAnUnreadDocument {
+    for s in Sweeps where s.status = advisory:
+        not s.saw_unread
+}
+
+-- Whatever the sweep did not check, the verdict says so, on every verdict it
+-- can reach. A disclosure that printed on the clean branch alone never printed
+-- in a software repository, which is the one case it exists for.
+invariant UncoveredIsAlwaysDisclosed {
+    for s in Sweeps where s.uncovered and s.status in {clean, advisory, dead}:
+        s.disclosed_uncovered
 }
 
 -- Advisory never hides a dead pointer: legibility debt alone cannot gate, and a
