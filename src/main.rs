@@ -2020,7 +2020,21 @@ fn is_record_layer(rel: &str) -> bool {
 fn prose_audit(root: &Path) -> Result<Vec<Match>, String> {
     let allow = host_lint::load_lexicon(root).phrases_lc;
     let ignore = load_lintignore(root)?;
-    host_lint::run_docs(root, &allow, &ignore)
+    // The record, not the working tree. This runs inside the `verify` phase's recheck,
+    // so reddening over an uncommitted note would assert something about a tree no
+    // clone contains, and block a release over a file the release does not ship. The
+    // hook keeps the wider corpus, because catching a document before it is staged is
+    // its job (call/0048).
+    let scan = host_lint::run_docs(root, &allow, &ignore, host_lint::Corpus::Record)?;
+    // A document listed and not read is a hole in the corpus, never a skip: reporting
+    // the rest as clean would claim coverage this run cannot support.
+    if let Some(first) = scan.unread.first() {
+        return Err(format!(
+            "cannot read {first}: listed by the walk and not audited ({} document(s) in all)",
+            scan.unread.len()
+        ));
+    }
+    Ok(scan.matches)
 }
 
 /// `prose <dir>`: the repo-wide prose-hygiene recheck (plan/0030 D4), the portable form of
@@ -2048,7 +2062,14 @@ fn prose(args: &[String]) {
     let flags = matches.iter().filter(|m| m.severity == Severity::Flag).count();
     let warns = matches.iter().filter(|m| m.severity == Severity::Warn).count();
     if flags + warns == 0 {
-        println!("prose: clean (authored markdown carries no flagging or warning tropes)");
+        // The engine that spoke, named in the verdict. Two host-lints reach a project
+        // (the pinned hook binary and this embedded library) and they can sit at
+        // different revisions, which they did: one tree, two verdicts, and neither
+        // output said which engine answered (call/0048).
+        println!(
+            "prose: clean (authored markdown carries no flagging or warning tropes) [host-lint {}]",
+            host_lint::ENGINE_VERSION
+        );
         return;
     }
     for m in &matches {
