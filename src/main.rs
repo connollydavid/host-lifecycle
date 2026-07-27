@@ -5782,14 +5782,25 @@ fn receipt_gate_problems(root: &Path, recipe: &[Software]) -> usize {
 
 /// Run a receipt's closed `recheck =` command in the project root; a non-zero exit
 /// re-opens the `done` (R1 — evidence is re-derived, never self-asserted).
+/// Run a phase's `recheck` string and say whether the condition held.
+///
+/// The shell is chosen per platform, as `run_verify` already did: a hardcoded `sh`
+/// reported every recheck false on a host without one, so a Windows tree re-opened
+/// every receipt it had earned and the message blamed the tree.
+///
+/// A shell that could not be spawned is not a condition that did not hold. The old
+/// `.unwrap_or(false)` collapsed the two, so "there is no shell here" and "your
+/// project is wrong" were the same verdict. It still fails closed, and now it says
+/// which failure it is.
 fn run_recheck(root: &Path, cmd: &str) -> bool {
-    process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(root)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let (sh, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    match process::Command::new(sh).arg(flag).arg(cmd).current_dir(root).status() {
+        Ok(s) => s.success(),
+        Err(e) => {
+            eprintln!("host-lifecycle: cannot run the recheck (`{sh}` did not start: {e}); this is the shell, not the tree");
+            false
+        }
+    }
 }
 
 /// Generated (untracked) skill links under `.claude/skills/` that dangle (plan/0029):
@@ -7034,7 +7045,12 @@ fn run_verify(root: &Path, cmd: &str) -> bool {
         .env("HOST_LIFECYCLE_IN_CHECK", "1")
         .status()
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or_else(|e| {
+            // As in `run_recheck`: a shell that never started is not a condition that
+            // failed. Still closed, but no longer indistinguishable.
+            eprintln!("host-lifecycle: cannot run the verify condition (`{sh}` did not start: {e}); this is the shell, not the tree");
+            false
+        })
 }
 
 /// Write `content` to `path` atomically (temp file + rename), so a crash or full
