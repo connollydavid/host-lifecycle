@@ -488,7 +488,10 @@ fn an_unreadable_document_gates_rather_than_being_counted_as_swept() {
         let (code, text) = run(&["refs", "--check", &dir]);
         assert_eq!(code, 1, "an unread document gates: {text}");
         assert!(text.contains("UNREAD") && text.contains("locked.md"), "{text}");
-        assert!(text.contains("2 doc(s) read of 3 listed"), "and the count is honest: {text}");
+        assert!(
+            text.contains("2 authored doc(s) read of 3 listed"),
+            "the count is honest and names the corpus it read: {text}"
+        );
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
     }
     let _ = fs::remove_dir_all(&base);
@@ -706,9 +709,9 @@ fn the_shared_walk_refuses_a_document_it_cannot_read() {
 #[test]
 fn a_capability_answers_for_the_binary_and_not_the_tree() {
     // Absent is the state that must be reachable: a binary too old to know the name
-    // fails the condition rather than passing it. `refs-gate` is not built yet, which
-    // makes this binary the pre-floor fixture for the entry that will require it.
-    let (code, text) = run(&["capability", "refs-gate"]);
+    // fails the condition rather than passing it. That is the whole point — an
+    // adopter's older binary is the fixture the ledger entry's verify has to fail on.
+    let (code, text) = run(&["capability", "a-capability-no-build-will-carry"]);
     assert_eq!(code, 1, "an unknown capability is absent, never assumed: {text}");
 
     let (code, text) = run(&["capability"]);
@@ -717,7 +720,7 @@ fn a_capability_answers_for_the_binary_and_not_the_tree() {
 
     // Every declared capability names a verb this binary actually dispatches, so the
     // registry cannot drift into claiming one that was removed.
-    for name in ["refs-check", "recipe-migration", "receipt-migration"] {
+    for name in ["refs-check", "refs-gate", "recipe-migration", "receipt-migration"] {
         let (code, _) = run(&["capability", name]);
         assert_eq!(code, 0, "declared capability {name} is carried");
     }
@@ -755,5 +758,78 @@ fn a_floor_above_this_binary_refuses_the_record() {
     let (code, text) = run(&["upgrade", "--record", "FUTURE-floor", &base.to_string_lossy()]);
     assert_ne!(code, 0, "a claim above the floor is refused: {text}");
     assert!(text.contains("v99.0.0"), "and the refusal names the floor: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// The gate judges the record; the sweep judges the working tree (call/0048). An
+// uncommitted draft carrying a dead pointer must not stop a release over a file the
+// release does not ship, and must still be caught by the walk that reads drafts.
+#[test]
+fn the_gate_judges_the_record_and_the_sweep_the_working_tree() {
+    let base = refs_fixture("gate-corpus");
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join("PLAN.md"), "# P\n\n[plan/0074](plan/0074-materialize/README.md)\n").unwrap();
+    commit_all(&base);
+    // A draft that exists but is not recorded.
+    fs::write(base.join("draft.md"), "# D\n\nSee plan/0099.\n").unwrap();
+
+    let (gate, gate_text) = run(&["refs", "--gate", &dir]);
+    assert_eq!(gate, 0, "the gate does not judge an uncommitted draft: {gate_text}");
+    assert!(!gate_text.contains("draft.md"), "and does not name it: {gate_text}");
+
+    let (sweep, sweep_text) = run(&["refs", "--check", &dir]);
+    assert_eq!(sweep, 1, "the sweep reads drafts and finds the dead pointer: {sweep_text}");
+    assert!(sweep_text.contains("draft.md"), "naming it: {sweep_text}");
+
+    // Once recorded, the gate judges it, so the corpus is the difference rather than
+    // the detection.
+    commit_all(&base);
+    let (gate, gate_text) = run(&["refs", "--gate", &dir]);
+    assert_eq!(gate, 1, "a recorded dead pointer gates: {gate_text}");
+    assert!(gate_text.contains("DEAD"), "naming the cause: {gate_text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// The gate's exit partition has two outcomes, not three. Legibility debt is disclosed
+// as a count and never enumerated: shown that census inside a green gate, the real
+// weak model abandoned its task to remediate references in both repeats.
+#[test]
+fn the_gate_never_returns_the_advisory_code() {
+    let base = refs_fixture("gate-advisory");
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join("PLAN.md"), "# P\n\nsee #17 and #18 for the reasons\n").unwrap();
+    commit_all(&base);
+
+    let (gate, gate_text) = run(&["refs", "--gate", &dir]);
+    assert_eq!(gate, 0, "legibility debt never gates: {gate_text}");
+    assert!(gate_text.contains("legibility debt"), "it is disclosed as a count: {gate_text}");
+    assert!(!gate_text.contains("bare     "), "and never enumerated per file: {gate_text}");
+    assert!(gate_text.contains("refs --check"), "the census is asked for by name: {gate_text}");
+
+    let (sweep, _) = run(&["refs", "--check", &dir]);
+    assert_eq!(sweep, 3, "the same tree advises under the sweep, so the split is the policy");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// An unread document gates whichever walk listed it: the corpus decides what is
+// listed, never whether a hole in it may be reported as clean.
+#[cfg(unix)]
+#[test]
+fn an_unread_document_gates_either_walk() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = refs_fixture("gate-unread");
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join("PLAN.md"), "# P\n\nplain\n").unwrap();
+    fs::write(base.join("locked.md"), "# L\n\nplain\n").unwrap();
+    commit_all(&base);
+    fs::set_permissions(base.join("locked.md"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (gate, gate_text) = run(&["refs", "--gate", &dir]);
+    let (sweep, sweep_text) = run(&["refs", "--check", &dir]);
+    let _ = fs::set_permissions(base.join("locked.md"), fs::Permissions::from_mode(0o644));
+
+    assert_eq!(gate, 1, "the gate refuses a corpus with a hole in it: {gate_text}");
+    assert_eq!(sweep, 1, "and so does the sweep: {sweep_text}");
+    assert!(gate_text.contains("UNREAD"), "naming the cause: {gate_text}");
     let _ = fs::remove_dir_all(&base);
 }

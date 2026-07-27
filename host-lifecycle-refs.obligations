@@ -120,3 +120,14 @@ rule-failure.DiscloseUncovered.1               => test:refs_check_splits_clean_a
 invariant.CleanVerdictReadEveryDocument        => test:an_unreadable_document_gates_rather_than_being_counted_as_swept exercises=UNREAD
 invariant.AdvisoryNeverHidAnUnreadDocument     => test:an_unreadable_document_gates_rather_than_being_counted_as_swept exercises=UNREAD
 invariant.UncoveredIsAlwaysDisclosed           => test:the_verdict_discloses_what_it_did_not_check_on_every_exit exercises=excluded
+
+# The two walks (plan/0078, call/0048). The gate reads the record and the sweep
+# reads the working tree, so the corpus is modelled rather than assumed: without
+# it no obligation could bite on a verdict judging a document no clone contains.
+enum-comparable.Corpus                         => structural
+surface-actor.RefsGate                         => structural
+surface-provides.RefsGate                      => structural
+rule-success.StartGate                         => test:the_gate_judges_the_record_and_the_sweep_the_working_tree exercises=--gate
+invariant.GateJudgesOnlyTheRecord              => test:the_gate_judges_the_record_and_the_sweep_the_working_tree exercises=draft.md
+invariant.GateNeverAdvises                     => test:the_gate_never_returns_the_advisory_code exercises=legibility debt
+invariant.UnreadGatesInEitherCorpus            => test:an_unread_document_gates_either_walk exercises=UNREAD

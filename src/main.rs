@@ -1963,7 +1963,22 @@ pub struct Corpus {
 /// relative to it, so an invocation from a subdirectory no longer loses every
 /// exclusion — which had the sweep telling an operator to rewrite two files their
 /// own list calls the immutable record.
+/// Which documents a run judges. The operator's sweep reads the working tree, drafts
+/// included, because it is answering a question about references. A gate reads the
+/// record: reddening over an uncommitted note asserts something no clone can
+/// re-derive, and stops a release at its first step over a file it does not ship
+/// (call/0048).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RefCorpus {
+    Record,
+    WorkingTree,
+}
+
 pub fn authored_corpus(root: &Path) -> Result<Corpus, String> {
+    authored_corpus_of(root, RefCorpus::WorkingTree)
+}
+
+pub fn authored_corpus_of(root: &Path, which: RefCorpus) -> Result<Corpus, String> {
     let top = git_out(root, &["rev-parse", "--show-toplevel"])
         .map(|s| PathBuf::from(s.trim()))
         .filter(|p| p.is_dir())
@@ -1972,7 +1987,11 @@ pub fn authored_corpus(root: &Path) -> Result<Corpus, String> {
     // Paths arrive NUL-delimited: git C-quotes any path holding a non-ASCII byte
     // under its default `core.quotepath`, and a quoted name was counted as swept
     // and then failed to open, so a dead pointer inside it shipped as clean.
-    let Some(out) = git_out_z(root, &["ls-files", "-z", "--cached", "--others", "--exclude-standard", "*.md"]) else {
+    let listing: &[&str] = match which {
+        RefCorpus::Record => &["ls-files", "-z", "--cached", "*.md"],
+        RefCorpus::WorkingTree => &["ls-files", "-z", "--cached", "--others", "--exclude-standard", "*.md"],
+    };
+    let Some(out) = git_out_z(root, listing) else {
         return Ok(Corpus { docs: Vec::new(), excluded: 0 });
     };
     // The listing is relative to `root`; the list is relative to the repository
@@ -5854,6 +5873,7 @@ fn version_below(running: &str, floor: &str) -> bool {
 /// behaviour, which is the case a `requires` floor cannot catch.
 const CAPABILITIES: &[(&str, &str)] = &[
     ("refs-check", "refs"),
+    ("refs-gate", "refs"),
     ("recipe-migration", "migrate-recipe"),
     ("receipt-migration", "migrate-receipts"),
 ];

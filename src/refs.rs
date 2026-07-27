@@ -715,12 +715,29 @@ pub fn scan_document(text: &str, file: &str, root: &Path) -> Vec<Finding> {
 /// `refs --check <dir>`: sweep the authored markdown, report what a reader cannot
 /// follow, and settle the verdict. `0` clean, `3` advisory, `1` on any dead
 /// pointer, `2` on a usage error.
+/// The operator's sweep: the working tree, drafts included, with the per-file census.
 pub fn refs_check(root: &Path) -> i32 {
+    refs_run(root, false)
+}
+
+/// The gate's walk, for the `verify` phase's recheck. Same detection over the record,
+/// with two differences that matter (call/0048). It never returns the advisory code,
+/// because only the author knows which tracker a bare number meant and a gate that
+/// returned it would make a deliberate advisory into a wall on the day it landed. And
+/// it never prints the per-file census: shown that wall inside a green gate, the real
+/// weak model abandoned its task to remediate references in both repeats, so the debt
+/// is disclosed as a count and asked for by name elsewhere.
+pub fn refs_gate(root: &Path) -> i32 {
+    refs_run(root, true)
+}
+
+fn refs_run(root: &Path, gate: bool) -> i32 {
     if !root.is_dir() {
         eprintln!("host-lifecycle: {} is not a directory", root.display());
         return 2;
     }
-    let corpus = match crate::authored_corpus(root) {
+    let which = if gate { crate::RefCorpus::Record } else { crate::RefCorpus::WorkingTree };
+    let corpus = match crate::authored_corpus_of(root, which) {
         Ok(c) => c,
         Err(why) => {
             eprintln!("host-lifecycle: {why}");
@@ -732,7 +749,8 @@ pub fn refs_check(root: &Path) -> i32 {
         // A clean verdict over nothing is the fail-unsafe shape: a cold reader
         // cannot tell it from a real pass.
         eprintln!(
-            "host-lifecycle: no authored markdown to sweep under {}{}",
+            "host-lifecycle: no authored markdown {} under {}{}",
+            if gate { "in the record" } else { "to sweep" },
             root.display(),
             if corpus.excluded > 0 {
                 format!(" ({} document(s) excluded by .host-lintignore or the record layer)", corpus.excluded)
@@ -775,15 +793,21 @@ pub fn refs_check(root: &Path) -> i32 {
         }
     }
     by_file.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    for (file, n) in by_file.iter().take(10) {
-        println!("bare     {file}: {n} issue number(s) written outside a link");
-    }
-    if by_file.len() > 10 {
-        println!("bare     … and {} more file(s)", by_file.len() - 10);
+    if !gate {
+        for (file, n) in by_file.iter().take(10) {
+            println!("bare     {file}: {n} issue number(s) written outside a link");
+        }
+        if by_file.len() > 10 {
+            println!("bare     … and {} more file(s)", by_file.len() - 10);
+        }
     }
     let swept = docs.len() - unread.len();
+    // The coverage line names the corpus it read. The same tree yields two counts
+    // under the two walks, and a reader comparing them cannot tell which fact moved
+    // unless each verdict says what it judged.
+    let corpus_name = if gate { "recorded" } else { "authored" };
     if !dead.is_empty() || !unread.is_empty() {
-        println!("-- {swept} doc(s) read of {} listed.", docs.len());
+        println!("-- {swept} {corpus_name} doc(s) read of {} listed.", docs.len());
         if let Some(first) = dead.first() {
             println!(
                 "   {} dead pointer(s): a reference naming a record that does not exist. Run `host-lifecycle resolve {} {}` to see where one points.",
@@ -800,6 +824,16 @@ pub fn refs_check(root: &Path) -> i32 {
         }
         disclose_uncovered(corpus.excluded, unchecked_registers, &rooms_here);
         return 1;
+    }
+    if !debt.is_empty() && gate {
+        // Disclosed as a count, never enumerated, and never gating. The gate's exit
+        // partition has two outcomes: this is one of the clean ones.
+        println!(
+            "-- {swept} recorded doc(s) read; every register reference in them resolves. {} issue reference(s) carry legibility debt, which this gate does not judge; run `host-lifecycle refs --check` to see them.",
+            debt.len()
+        );
+        disclose_uncovered(corpus.excluded, unchecked_registers, &rooms_here);
+        return 0;
     }
     if !debt.is_empty() {
         println!(
@@ -993,14 +1027,16 @@ fn first_bare_reference(root: &Path) -> Option<(String, String)> {
 /// `host-lifecycle refs --check <dir>`.
 pub fn refs(args: &[String]) {
     let mut check = false;
+    let mut gate = false;
     let mut fix = false;
     let mut pos: Vec<&String> = Vec::new();
     for a in args {
         match a.as_str() {
             "--check" => check = true,
+            "--gate" => gate = true,
             "--fix" => fix = true,
             _ if a.starts_with("--") => {
-                eprintln!("host-lifecycle: unknown flag `{a}` (expected --check)");
+                eprintln!("host-lifecycle: unknown flag `{a}` (expected --check or --gate)");
                 process::exit(2);
             }
             _ => pos.push(a),
@@ -1035,11 +1071,14 @@ pub fn refs(args: &[String]) {
         }
         process::exit(2);
     }
-    if !check {
-        eprintln!("host-lifecycle refs --check <dir>");
+    if !check && !gate {
+        eprintln!("host-lifecycle refs <--check|--gate> <dir>");
         process::exit(2);
     }
     let root = pos.first().map(|d| PathBuf::from(d.as_str())).unwrap_or_else(|| PathBuf::from("."));
+    if gate {
+        process::exit(refs_gate(&root));
+    }
     process::exit(refs_check(&root));
 }
 

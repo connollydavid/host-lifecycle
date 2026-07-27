@@ -52,6 +52,16 @@ enum Emission {
     full_url
 }
 
+-- Which documents a run judges. The hook and the operator's sweep read the
+-- working tree, because catching a document before it is staged is their job.
+-- A gate reads the record: reddening over an uncommitted note asserts something
+-- nobody can re-derive from any clone, and stops a release over a file the
+-- release does not ship.
+enum Corpus {
+    record
+    working_tree
+}
+
 -- A finding's weight, and the exit it drives. `dead_pointer` is mechanically
 -- evidenced: a register reference resolving to nothing is a pointer to a record
 -- that does not exist. `unrendered` is legibility debt: a bare issue number is a
@@ -88,6 +98,10 @@ entity Document {
     -- Whether the walk could open it. A listed document the run cannot read is a
     -- hole rather than a clean line: a dead pointer may sit inside it.
     readable: Boolean
+    -- Whether the record contains it. An untracked draft belongs to the working
+    -- tree alone, so a run that judged it would assert something about a tree no
+    -- clone contains.
+    tracked: Boolean
 }
 
 -- One reference as written, with the facts the resolver reads: which room it
@@ -146,6 +160,10 @@ entity UnreadDocument {
 -- neither is clean.
 entity Sweep {
     status: sweeping | clean | advisory | dead | error
+    -- Which walk this run is. The two differ in what they read and in what they
+    -- are allowed to conclude, and conflating them is what let an uncommitted
+    -- note block a release.
+    corpus: Corpus
     saw_finding: Boolean
     saw_dead_pointer: Boolean
     -- A listed document went unread. Gates alongside the dead pointer, because
@@ -178,12 +196,25 @@ surface ResolveOp {
         ResolveRequested(project)
 }
 
+-- The operator's sweep: the whole working tree, drafts included, reporting the
+-- legibility census nobody asked a gate for.
 surface RefsSweep {
     facing project: Project
     provides:
         SweepStarts(project)
         SweepCompletes(project)
         SweepFails(project)
+}
+
+-- The gate's walk, run from the verify phase's recheck. The same detection over
+-- a different corpus, and with the advisory outcome removed: what it reports has
+-- to be something a release may be stopped for.
+surface RefsGate {
+    facing project: Project
+    provides:
+        GateStarts(project)
+        GateCompletes(project)
+        GateFails(project)
 }
 
 -- === Resolving one reference ===
@@ -261,6 +292,7 @@ rule DetectUnrenderedIssue {
     when: reference: Reference.created
     requires: reference.kind = issue and not reference.in_link
               and not reference.quoted and not reference.document.excluded
+              and (sweep.corpus = working_tree or reference.document.tracked)
     ensures: Finding.created(reference: reference, weight: unrendered)
 }
 
@@ -270,6 +302,7 @@ rule DetectUnrenderedIssue {
 rule DetectUnreadDocument {
     when: document: Document.created
     requires: not document.excluded and not document.readable
+              and (sweep.corpus = working_tree or document.tracked)
     ensures: UnreadDocument.created(document: document)
 }
 
@@ -278,6 +311,21 @@ rule DetectUnreadDocument {
 rule StartSweep {
     when: SweepStarts(project)
     ensures: sweep.status = sweeping
+    ensures: sweep.corpus = working_tree
+    ensures: sweep.saw_finding = false
+    ensures: sweep.saw_dead_pointer = false
+    ensures: sweep.saw_unread = false
+    ensures: sweep.uncovered = false
+    ensures: sweep.disclosed_uncovered = false
+}
+
+-- The gate begins the same run over the record. Separate from StartSweep rather
+-- than parameterised, so the corpus each surface judges is stated where the run
+-- begins and cannot be inferred wrongly later.
+rule StartGate {
+    when: GateStarts(project)
+    ensures: sweep.status = sweeping
+    ensures: sweep.corpus = record
     ensures: sweep.saw_finding = false
     ensures: sweep.saw_dead_pointer = false
     ensures: sweep.saw_unread = false
@@ -447,4 +495,30 @@ invariant AdvisoryNeverSawDeadPointer {
 invariant DeadVerdictSawDeadPointer {
     for s in Sweeps where s.status = dead:
         s.saw_dead_pointer
+}
+
+-- A gate judges the record and nothing else. The working-tree walk is the hook's
+-- and the operator's; a gate that reported an untracked draft would assert
+-- something no clone can re-derive, and it blocked a release at its first step
+-- over a file the release does not ship (call/0048).
+invariant GateJudgesOnlyTheRecord {
+    for f in Findings where sweep.corpus = record:
+        f.reference.document.tracked
+}
+
+-- The gate's exit partition has two outcomes, not three. Legibility debt never
+-- gates, and it also never advises here: only the author knows which tracker a
+-- bare number meant, so a gate that returned the advisory code would turn a
+-- deliberate advisory into a wall on the day it landed, which is the failure the
+-- doctrine names.
+invariant GateNeverAdvises {
+    for s in Sweeps where s.corpus = record:
+        s.status in {sweeping, clean, dead, error}
+}
+
+-- An unread document gates whichever walk found it. The corpus decides what is
+-- listed, never whether a hole in it may be reported as clean.
+invariant UnreadGatesInEitherCorpus {
+    for s in Sweeps where s.saw_unread:
+        s.status in {sweeping, dead, error}
 }
