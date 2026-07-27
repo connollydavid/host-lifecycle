@@ -135,6 +135,7 @@ fn main() {
         Some("bootstrap") => bootstrap::bootstrap(&args[2..]),
         Some("resolve") => refs::resolve(&args[2..]),
         Some("refs") => refs::refs(&args[2..]),
+        Some("capability") => capability(&args[2..]),
         _ => {
             eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|bootstrap|env|resolve|refs|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|migrate-recipe|tasks|dream> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
@@ -5792,6 +5793,43 @@ fn receipt_gate_problems(root: &Path, recipe: &[Software]) -> usize {
 /// `.unwrap_or(false)` collapsed the two, so "there is no shell here" and "your
 /// project is wrong" were the same verdict. It still fails closed, and now it says
 /// which failure it is.
+/// The capabilities this binary carries, each named beside the verb that provides it.
+///
+/// An upgrade ledger `verify` has to be falsifiable in the adopter's tree, and almost
+/// none of them are: 26 of the 30 conditions grep a file under `host-template/`, which
+/// `upgrade` requires checked out before it will run at all, so the condition is a
+/// post-condition of the command's own precondition and can neither refuse a false
+/// record nor detect a revert (call/0048).
+///
+/// This answers about the **running binary** and reads no tree, so an entry can require
+/// a capability without also requiring a clean project — which would wedge an adopter
+/// whose one dead pointer sits in a record they must not rewrite. It is deliberately not
+/// a version comparison: a locally built binary can carry a high version and lack the
+/// behaviour, which is the case a `requires` floor cannot catch.
+const CAPABILITIES: &[(&str, &str)] = &[
+    ("refs-check", "refs"),
+    ("recipe-migration", "migrate-recipe"),
+    ("receipt-migration", "migrate-receipts"),
+];
+
+/// `host-lifecycle capability <name>`: exit 0 when this binary carries it, 1 when it
+/// does not, 2 on a usage error. One command, no shell operators, no tree access, so it
+/// survives a `cmd /C` verify on a native-Windows adopter.
+fn capability(args: &[String]) -> ! {
+    let Some(name) = args.first().filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: host-lifecycle capability <name>");
+        eprintln!("  names: {}", CAPABILITIES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "));
+        process::exit(2);
+    };
+    if CAPABILITIES.iter().any(|(n, _)| n == name) {
+        process::exit(0);
+    }
+    // An unrecognised name is absent, never assumed present: a binary too old to know
+    // the name must fail the condition rather than pass it.
+    eprintln!("host-lifecycle: no capability `{name}` in this binary");
+    process::exit(1);
+}
+
 fn run_recheck(root: &Path, cmd: &str) -> bool {
     let (sh, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
     match process::Command::new(sh).arg(flag).arg(cmd).current_dir(root).status() {

@@ -699,3 +699,37 @@ fn the_shared_walk_refuses_a_document_it_cannot_read() {
         "the refusal names the document it could not read, so the operator can fix it: {out}"
     );
 }
+
+// A ledger `verify` has to be falsifiable in the adopter's own tree. This answers about
+// the running binary and reads no tree, so an entry can require a capability without
+// also requiring a clean project (call/0048).
+#[test]
+fn a_capability_answers_for_the_binary_and_not_the_tree() {
+    // Absent is the state that must be reachable: a binary too old to know the name
+    // fails the condition rather than passing it. `refs-gate` is not built yet, which
+    // makes this binary the pre-floor fixture for the entry that will require it.
+    let (code, text) = run(&["capability", "refs-gate"]);
+    assert_eq!(code, 1, "an unknown capability is absent, never assumed: {text}");
+
+    let (code, text) = run(&["capability"]);
+    assert_eq!(code, 2, "a missing name is a usage error: {text}");
+    assert!(text.contains("refs-check"), "and the usage lists what this binary carries: {text}");
+
+    // Every declared capability names a verb this binary actually dispatches, so the
+    // registry cannot drift into claiming one that was removed.
+    for name in ["refs-check", "recipe-migration", "receipt-migration"] {
+        let (code, _) = run(&["capability", name]);
+        assert_eq!(code, 0, "declared capability {name} is carried");
+    }
+    for verb in ["refs", "migrate-recipe", "migrate-receipts"] {
+        let (_, text) = run(&[verb]);
+        assert!(
+            !text.contains("usage: host-lifecycle <validate"),
+            "{verb} dispatches rather than falling through to the top-level usage: {text}"
+        );
+    }
+
+    // It reads no tree: the answer is the same from a directory that is not a project.
+    let (code, _) = run(&["capability", "refs-check"]);
+    assert_eq!(code, 0, "the answer does not depend on where it was run");
+}
