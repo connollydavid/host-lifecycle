@@ -2329,6 +2329,11 @@ const CONCEPT_IDS: [&str; 4] = ["components", "verifiers", "software-root", "spe
 /// Gather tracked markdown as `(relative-path, content)`: `git ls-files`, honoring
 /// `.host-lintignore`, skipping symlinks and non-markdown. The one walk the reconcile
 /// checks share.
+///
+/// A document the walk lists and cannot read is an **error**, never a silent skip: a
+/// checker that drops it and reports over the rest makes a coverage claim it cannot
+/// support (call/0048). plan/0077 closed this for the reference sweep, which gates on
+/// `UNREAD`; this is the same class in the walk its siblings use.
 fn tracked_markdown(root: &Path) -> Result<Vec<(String, String)>, String> {
     let ignore = load_lintignore(root)?;
     let out = process::Command::new("git")
@@ -2350,8 +2355,9 @@ fn tracked_markdown(root: &Path) -> Result<Vec<(String, String)>, String> {
         if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) || !path.is_file() {
             continue;
         }
-        if let Ok(content) = fs::read_to_string(&path) {
-            docs.push((rel.to_string(), content));
+        match fs::read_to_string(&path) {
+            Ok(content) => docs.push((rel.to_string(), content)),
+            Err(e) => return Err(format!("cannot read {rel}: {e}")),
         }
     }
     Ok(docs)
@@ -3695,7 +3701,15 @@ fn tasks_new(title: Option<String>) {
 }
 
 fn tasks_status(root: &Path) {
-    let docs = tracked_markdown(root).unwrap_or_default();
+    // A walk that failed is not a project with no tasks: reporting over an empty set
+    // would be a status claim about documents nothing read (call/0048).
+    let docs = match tracked_markdown(root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("host-lifecycle: {e}");
+            process::exit(2);
+        }
+    };
     let (tasks, problems) = parse_tasks(&docs);
     let receipts = read_task_receipts(root);
     let discharged: std::collections::HashSet<&str> = tasks
@@ -3800,7 +3814,15 @@ fn tasks_record(root: &Path, key: Option<String>, disposition: Option<String>, e
 }
 
 fn tasks_rederive(root: &Path) -> usize {
-    let docs = tracked_markdown(root).unwrap_or_default();
+    // As in `tasks_status`: an unreadable corpus fails closed rather than re-deriving
+    // over nothing and reporting every task clean.
+    let docs = match tracked_markdown(root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("host-lifecycle: {e}");
+            process::exit(2);
+        }
+    };
     let (tasks, _) = parse_tasks(&docs);
     let receipts = read_task_receipts(root);
     let (mut refreshed, mut bad) = (0, 0);

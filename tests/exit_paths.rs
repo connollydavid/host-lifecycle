@@ -641,3 +641,28 @@ fn the_migration_preserves_everything_it_did_not_rename() {
     }
     let _ = fs::remove_dir_all(&base);
 }
+
+// The sibling walk fails closed too (agentic-host plan/0078). `tracked_markdown` feeds
+// reconcile and the task gate, and it used to drop a document it could not read with a
+// bare `if let Ok(content)`, so those checkers reported over a corpus with a hole in it.
+// plan/0077 closed this for the reference sweep; the walk its siblings share kept it.
+#[cfg(unix)]
+#[test]
+fn the_shared_walk_refuses_a_document_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = refs_fixture("shared-walk-unread");
+    fs::write(base.join("PLAN.md"), "# PLAN\n\nThe register.\n").unwrap();
+    fs::write(base.join("locked.md"), "# Locked\n\nProse.\n").unwrap();
+    git(&base, &["add", "-A"]);
+    git(&base, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    fs::set_permissions(base.join("locked.md"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (code, out) = run(&["reconcile", base.to_str().unwrap()]);
+    let _ = fs::set_permissions(base.join("locked.md"), fs::Permissions::from_mode(0o644));
+
+    assert_ne!(code, 0, "a checker cannot report over a corpus it did not fully read: {out}");
+    assert!(
+        out.contains("locked.md"),
+        "the refusal names the document it could not read, so the operator can fix it: {out}"
+    );
+}
