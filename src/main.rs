@@ -5793,6 +5793,31 @@ fn receipt_gate_problems(root: &Path, recipe: &[Software]) -> usize {
 /// `.unwrap_or(false)` collapsed the two, so "there is no shell here" and "your
 /// project is wrong" were the same verdict. It still fails closed, and now it says
 /// which failure it is.
+/// The host-lifecycle floor an entry's `requires` declares, as `X.Y.Z`. Every entry in
+/// the ledger spells it `host-lifecycle vX.Y.Z`; anything else names a tool this binary
+/// cannot speak for, and yields `None` rather than a guess.
+fn required_host_lifecycle(requires: &str) -> Option<String> {
+    let rest = requires.trim().strip_prefix("host-lifecycle")?.trim_start();
+    let v = rest.strip_prefix('v').unwrap_or(rest);
+    let v = v.split_whitespace().next()?;
+    (v.split('.').count() == 3 && v.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+        .then(|| v.to_string())
+}
+
+/// Is `running` below `floor`? Numeric field-by-field, never lexical: `v0.9.0` is not
+/// above `v0.44.0`, which a string comparison would claim.
+fn version_below(running: &str, floor: &str) -> bool {
+    let part = |s: &str| -> Vec<u64> { s.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    let (r, f) = (part(running), part(floor));
+    for i in 0..r.len().max(f.len()) {
+        let (a, b) = (r.get(i).copied().unwrap_or(0), f.get(i).copied().unwrap_or(0));
+        if a != b {
+            return a < b;
+        }
+    }
+    false
+}
+
 /// The capabilities this binary carries, each named beside the verb that provides it.
 ///
 /// An upgrade ledger `verify` has to be falsifiable in the adopter's tree, and almost
@@ -7249,6 +7274,21 @@ fn upgrade(args: &[String]) {
         if !unmet.is_empty() {
             eprintln!("host-lifecycle: refuse — {} depends on unapplied {}", short(&id), unmet.join(" "));
             process::exit(1);
+        }
+        // The declared floor, enforced at the one moment a claim is written. It was
+        // parsed, stored and only ever printed, so an adopter on an older binary could
+        // record an entry describing behaviour their tool does not have, and the record
+        // then said the work was done (call/0048). Refused here rather than at every
+        // gate, so a cherry-applied later entry is not blanket-blocked.
+        if let Some(floor) = required_host_lifecycle(&entry.requires) {
+            let running = env!("CARGO_PKG_VERSION");
+            if version_below(running, &floor) {
+                eprintln!(
+                    "host-lifecycle: refuse — {} requires host-lifecycle v{floor} and this is v{running}; bump the tool, then record",
+                    short(&id)
+                );
+                process::exit(1);
+            }
         }
         let via = if !entry.verify.is_empty() {
             if !run_verify(&root, &entry.verify) {
@@ -13110,5 +13150,32 @@ mod book_tests {
         drop(g);
         assert_eq!(fs::read_to_string(&cfg).unwrap(), "operator edit\n", "a disarmed guard does not re-restore");
         let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::{required_host_lifecycle, version_below};
+
+    #[test]
+    fn the_floor_is_read_only_when_it_names_this_tool() {
+        assert_eq!(required_host_lifecycle("host-lifecycle v0.44.0").as_deref(), Some("0.44.0"));
+        assert_eq!(required_host_lifecycle("  host-lifecycle 0.9.1  ").as_deref(), Some("0.9.1"));
+        // A floor naming another tool is not this binary's to enforce, and a malformed
+        // one is not guessed at: both yield no floor rather than a wrong refusal.
+        assert_eq!(required_host_lifecycle("host-lint v0.15.0"), None);
+        assert_eq!(required_host_lifecycle("host-lifecycle latest"), None);
+        assert_eq!(required_host_lifecycle(""), None);
+    }
+
+    #[test]
+    fn versions_compare_numerically_rather_than_as_text() {
+        // The comparison a string sort gets wrong, and the reason this is not `<`:
+        // lexically "0.9.0" sorts above "0.44.0", so an ancient binary would pass.
+        assert!(version_below("0.9.0", "0.44.0"));
+        assert!(!version_below("0.44.0", "0.9.0"));
+        assert!(!version_below("0.44.2", "0.44.2"), "the floor itself is met");
+        assert!(version_below("0.44.1", "0.44.2"));
+        assert!(!version_below("1.0.0", "0.44.2"));
     }
 }

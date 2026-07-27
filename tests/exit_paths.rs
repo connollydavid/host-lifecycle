@@ -733,3 +733,27 @@ fn a_capability_answers_for_the_binary_and_not_the_tree() {
     let (code, _) = run(&["capability", "refs-check"]);
     assert_eq!(code, 0, "the answer does not depend on where it was run");
 }
+
+// The declared floor is enforced where a claim is written. It was parsed, stored and
+// only ever printed, so an adopter on an older binary could record an entry describing
+// behaviour their tool does not have, and the record then said the work was done.
+#[test]
+fn a_floor_above_this_binary_refuses_the_record() {
+    let base = host_fixture("floor");
+    let template = base.join("host-template");
+    fs::create_dir_all(&template).unwrap();
+    // A floor no build of this tool will ever meet, so the test cannot rot into a pass
+    // the way a near-future version would.
+    fs::write(
+        template.join("UPGRADING.md"),
+        "# Upgrading\n\n[upgrade \"BASE-entry\"]\n    title    = The baseline\n    action   = Nothing to do.\n\n[upgrade \"FUTURE-floor\"]\n    title    = From a tool that does not exist yet\n    action   = Nothing to do.\n    requires = host-lifecycle v99.0.0\n    verify   = host-lifecycle capability refs-check\n",
+    )
+    .unwrap();
+    fs::write(base.join(".host"), "template = \"t\"\nbaseline = \"BASE-entry\"\nname = \"acme\"\n").unwrap();
+    commit_all(&base);
+
+    let (code, text) = run(&["upgrade", "--record", "FUTURE-floor", &base.to_string_lossy()]);
+    assert_ne!(code, 0, "a claim above the floor is refused: {text}");
+    assert!(text.contains("v99.0.0"), "and the refusal names the floor: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
