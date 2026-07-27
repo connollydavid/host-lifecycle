@@ -850,10 +850,11 @@ fn a_dead_pointer_reopens_the_verify_receipt_through_the_manifest() {
     // The wiring landing three will ship, exercised here against the real binary.
     fs::write(
         template.join("lifecycle.manifest"),
-        // The recheck shells out to `host-lifecycle` on PATH, which is whatever the
-        // operator installed rather than the binary under test. Naming the built one
-        // keeps this a test of the composition instead of a test of PATH.
-        format!("[phase \"verify\"]\n\torder     = 5\n\tmodality  = unconditional\n\tcommand   = host-lifecycle software --check\n\tskill     = verify\n\tevidence  = gate sweep green\n\tskippable = false\n\trecheck   = {BIN} refs --gate .\n"),
+        // The condition names `host-lifecycle` bare, exactly as the shipped manifest
+        // does. The binary under test is not on PATH, so this passes only because the
+        // recheck rewrites the invocation to the running executable rather than
+        // resolving it from PATH (host-lifecycle#24).
+        "[phase \"verify\"]\n\torder     = 5\n\tmodality  = unconditional\n\tcommand   = host-lifecycle software --check\n\tskill     = verify\n\tevidence  = gate sweep green\n\tskippable = false\n\trecheck   = host-lifecycle refs --gate .\n",
     )
     .unwrap();
     fs::write(base.join(".host"), "template = \"t\"\nbaseline = \"b\"\nname = \"acme\"\n").unwrap();

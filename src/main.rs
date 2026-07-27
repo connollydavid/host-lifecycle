@@ -114,6 +114,13 @@ fn main() {
         Some("init") => init(&args[2..]),
         Some("scaffold") => scaffold(&args[2..]),
         Some("mcp") => mcp::mcp(&args[2..]),
+        // `--version` is this BINARY's identity; `version <dir>` is the adopted
+        // TEMPLATE revision. Two different questions that read alike, which is half of
+        // why the binary's own version had no answer (host-lifecycle#24).
+        Some("--version") | Some("-V") => {
+            println!("host-lifecycle {}", env!("CARGO_PKG_VERSION"));
+            process::exit(0);
+        }
         Some("version") => version(args.get(2)),
         Some("classify") => classify(args.get(2)),
         Some("remap") => remap(&args[2..]),
@@ -4317,7 +4324,14 @@ fn software(args: &[String]) {
                     owed.join(", ")
                 );
             }
-            println!("-- all components at their pinned SHA; no worktree-symlink hazards");
+            // The verdict names the binary that reached it. A gate's output is the only
+            // supervision an unattended run has, and a green that cannot be attributed
+            // to a tool is not evidence of anything when it is read cold later
+            // (host-lifecycle#24, agentic-host call/0049 rule seven).
+            println!(
+                "-- all components at their pinned SHA; no worktree-symlink hazards [host-lifecycle {}]",
+                env!("CARGO_PKG_VERSION")
+            );
             // This check answers pin-versus-recorded and says nothing about whether
             // THIS clone is set up: it stayed green through a tree with no hooks
             // installed, which is the gap that produced plan/0074. Route to the
@@ -5833,6 +5847,29 @@ fn receipt_gate_problems(root: &Path, recipe: &[Software]) -> usize {
 /// `.unwrap_or(false)` collapsed the two, so "there is no shell here" and "your
 /// project is wrong" were the same verdict. It still fails closed, and now it says
 /// which failure it is.
+/// Rewrite a `host-lifecycle` invocation inside a manifest condition to name THIS
+/// binary, so a gate and the conditions it runs are always the same tool.
+///
+/// The conditions say `host-lifecycle …`, which a shell resolves from PATH — whatever
+/// the operator last installed, which is not necessarily what the project records or
+/// what is running. That skew is silent and it has bitten: a recheck failed with
+/// `unknown flag --gate` from an older PATH copy while the binary running the gate
+/// carried the mode, and the message read as a defect in the tree (host-lifecycle#24).
+///
+/// Only a whole token is replaced, so a path such as `.host-lifecycle-receipts` is
+/// untouched. If the running executable cannot be located the string is left alone,
+/// because falling back to PATH is the previous behaviour rather than a new failure.
+fn self_invoking(cmd: &str) -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return cmd.to_string();
+    };
+    let exe = exe.to_string_lossy().into_owned();
+    cmd.split_whitespace()
+        .map(|t| if t == "host-lifecycle" { exe.as_str() } else { t })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The host-lifecycle floor an entry's `requires` declares, as `X.Y.Z`. Every entry in
 /// the ledger spells it `host-lifecycle vX.Y.Z`; anything else names a tool this binary
 /// cannot speak for, and yields `None` rather than a guess.
@@ -5898,7 +5935,8 @@ fn capability(args: &[String]) -> ! {
 
 fn run_recheck(root: &Path, cmd: &str) -> bool {
     let (sh, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
-    match process::Command::new(sh).arg(flag).arg(cmd).current_dir(root).status() {
+    let cmd = self_invoking(cmd);
+    match process::Command::new(sh).arg(flag).arg(&cmd).current_dir(root).status() {
         Ok(s) => s.success(),
         Err(e) => {
             eprintln!("host-lifecycle: cannot run the recheck (`{sh}` did not start: {e}); this is the shell, not the tree");
@@ -13218,5 +13256,32 @@ mod floor_tests {
         assert!(!version_below("0.44.2", "0.44.2"), "the floor itself is met");
         assert!(version_below("0.44.1", "0.44.2"));
         assert!(!version_below("1.0.0", "0.44.2"));
+    }
+}
+
+#[cfg(test)]
+mod self_invoke_tests {
+    use super::self_invoking;
+
+    #[test]
+    fn a_condition_names_this_binary_rather_than_whatever_is_on_the_path() {
+        let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+
+        // Every whole `host-lifecycle` token becomes this executable, so a gate and the
+        // conditions it runs are the same tool. A stale PATH copy produced `unknown flag
+        // --gate` from a recheck while the running binary had the mode, and the message
+        // read as a defect in the tree (host-lifecycle#24).
+        let out = self_invoking("host-lifecycle validate plan/ call/ && host-lifecycle prose .");
+        assert_eq!(out.matches(exe.as_str()).count(), 2, "both invocations rewritten: {out}");
+        assert!(!out.split_whitespace().any(|t| t == "host-lifecycle"), "none left: {out}");
+
+        // A whole token only. A path that merely starts with the name is not an
+        // invocation, and rewriting it would corrupt the condition.
+        let kept = self_invoking("test -f .host-lifecycle-receipts");
+        assert_eq!(kept, "test -f .host-lifecycle-receipts", "a path is not a command");
+
+        // A condition naming another tool is untouched.
+        let other = self_invoking("host-lint --all .");
+        assert_eq!(other, "host-lint --all .");
     }
 }
