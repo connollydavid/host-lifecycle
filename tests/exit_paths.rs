@@ -833,3 +833,65 @@ fn an_unread_document_gates_either_walk() {
     assert!(gate_text.contains("UNREAD"), "naming the cause: {gate_text}");
     let _ = fs::remove_dir_all(&base);
 }
+
+// The composition, which is the whole change and which nothing has ever executed: a
+// manifest `recheck =` string, run by `software --check`, re-opening a `done` receipt
+// when the gate finds a dead pointer. `#gate-mode` tests the mode's exits and
+// `#template-wiring` will test the manifest's text; neither proves they meet.
+#[test]
+fn a_dead_pointer_reopens_the_verify_receipt_through_the_manifest() {
+    let outer = fixture("composition-outer");
+    let (src, pin) = seed_source(&outer);
+    let base = refs_fixture("composition");
+    let dir = base.to_string_lossy().to_string();
+    let template = base.join("host-template");
+    fs::create_dir_all(&template).unwrap();
+    fs::write(template.join("UPGRADING.md"), "# Upgrading\n").unwrap();
+    // The wiring landing three will ship, exercised here against the real binary.
+    fs::write(
+        template.join("lifecycle.manifest"),
+        // The recheck shells out to `host-lifecycle` on PATH, which is whatever the
+        // operator installed rather than the binary under test. Naming the built one
+        // keeps this a test of the composition instead of a test of PATH.
+        format!("[phase \"verify\"]\n\torder     = 5\n\tmodality  = unconditional\n\tcommand   = host-lifecycle software --check\n\tskill     = verify\n\tevidence  = gate sweep green\n\tskippable = false\n\trecheck   = {BIN} refs --gate .\n"),
+    )
+    .unwrap();
+    fs::write(base.join(".host"), "template = \"t\"\nbaseline = \"b\"\nname = \"acme\"\n").unwrap();
+    // A real component, materialized, so the recipe half of the gate is green and the
+    // only thing that can redden it is the recheck this test is about.
+    fs::write(
+        base.join(".host-software"),
+        format!("[software \"demo\"]\n\turl = {}\n\tpin = {pin}\n", src.to_string_lossy()),
+    )
+    .unwrap();
+    // As the real host does: the materialized worktrees are local, not recorded.
+    fs::write(base.join(".gitignore"), "/software/\n.host-envhash\n").unwrap();
+    assert_eq!(run(&["software", "--materialize", &dir]).0, 0, "the component materializes");
+    fs::write(
+        base.join(".host-lifecycle-receipts"),
+        "[receipt \"verify\"]\n    disposition = done\n    evidence = gate sweep green\n    tool = host-lifecycle@0.45.1\n    recorded = 2026-07-27\n",
+    )
+    .unwrap();
+
+    // A tree whose references all resolve: the receipt stands.
+    fs::write(base.join("PLAN.md"), "# P\n\n[plan/0074](plan/0074-materialize/README.md)\n").unwrap();
+    commit_all(&base);
+    let (code, text) = run(&["software", "--check", &dir]);
+    assert!(
+        text.contains("phase verify") && !text.contains("recheck FAILED"),
+        "a resolving tree keeps its receipt: {text}"
+    );
+    assert_eq!(code, 0, "and the gate is green: {text}");
+
+    // Now a dead pointer in a recorded document.
+    fs::write(base.join("PLAN.md"), "# P\n\nsuperseded by plan/0099\n").unwrap();
+    commit_all(&base);
+    let (code, text) = run(&["software", "--check", &dir]);
+    assert!(
+        text.contains("recheck FAILED, re-opened"),
+        "the manifest's recheck ran and the receipt re-opened: {text}"
+    );
+    assert_ne!(code, 0, "and the gate is red: {text}");
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&outer);
+}
