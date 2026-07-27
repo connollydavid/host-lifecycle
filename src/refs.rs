@@ -813,15 +813,28 @@ pub fn refs_check(root: &Path) -> i32 {
             println!("   {unqualified} of them name no repository, so a reader cannot tell whose tracker they mean.");
         }
         println!("   Advisory: nothing is blocked. No flag fixes this; each reference is an edit.");
-        // The remedy names THIS repository. Hardcoding a slug handed every
-        // adopter a command that rewrote their reference to point at another
-        // project's tracker, and the weak-agent acceptance is the evidence that
-        // the printed command gets run verbatim.
-        println!(
-            "   Write each as owner/repo#N inside a link. For one of them: host-lifecycle resolve {} --markdown {}",
-            remedy_reference(root, &debt[0].text),
-            root.display()
-        );
+        // The worked example is a reference this tree already carries in qualified
+        // form. It is never manufactured from a bare `#N`: prepending the origin
+        // guesses the tracker, because in a host repository most bare numbers name a
+        // component's issues while the origin remote is the host, and the weak-agent
+        // acceptance is the evidence that a printed command gets run verbatim. The
+        // placeholder spelling is no better; that was pasted verbatim too.
+        println!("   Write each as owner/repo#N inside a link.");
+        // Only an `owner/repo#N` example is offered. A bare component name would need a
+        // recipe lookup to be resolvable, and the scanner also reads a written range
+        // like `#10-#12` as the repository `10-`, so an example chosen on "not bare"
+        // alone can print a command that does not resolve. A command this tool prints
+        // is a command that gets run.
+        match debt.iter().find(|f| f.text.contains('/')) {
+            Some(example) => println!(
+                "   For one of them: host-lifecycle resolve {} --markdown {}",
+                example.text,
+                root.display()
+            ),
+            None => println!(
+                "   Every one of them names no repository, so only you know which tracker each meant."
+            ),
+        }
         disclose_uncovered(corpus.excluded, unchecked_registers, &rooms_here);
         return 3;
     }
@@ -857,16 +870,24 @@ fn disclose_uncovered(excluded: usize, unchecked_registers: usize, rooms_here: &
     }
 }
 
-/// A reference the remedy can name, qualified against THIS repository. Falls back
-/// to the placeholder form only where no origin says who owns the tree.
-fn remedy_reference(root: &Path, written: &str) -> String {
-    if !written.starts_with('#') {
-        return written.to_string();
+/// An issue reference this tree already carries in qualified form, for use as a worked
+/// example. `None` when every issue reference here is bare, in which case no command is
+/// demonstrated rather than one being manufactured.
+fn first_qualified_reference(root: &Path) -> Option<String> {
+    for doc in crate::authored_docs(root) {
+        let Ok(text) = fs::read_to_string(root.join(&doc)) else { continue };
+        for (_, line) in prose_of(&text) {
+            for (reference, _) in scan_line(&line) {
+                // `owner/repo#N` only, for the reason the advisory summary gives: a bare
+                // component name needs a lookup to resolve, and a written range reads as
+                // a repository, so either could print a command that does not work.
+                if reference.kind == RefKind::Issue && reference.repo.contains('/') {
+                    return Some(format!("{}#{}", reference.repo, reference.number));
+                }
+            }
+        }
     }
-    match origin_slug(root) {
-        Some(slug) => format!("{slug}{written}"),
-        None => format!("owner/repo{written}"),
-    }
+    None
 }
 
 /// References this repository cannot check, because it does not own their room.
@@ -994,16 +1015,21 @@ pub fn refs(args: &[String]) {
         eprintln!(
             "host-lifecycle: there is no --fix for references. A bare `#N` names no repository, and only the author knows which tracker it meant: rewriting it would be guessing."
         );
-        // Named from this tree, not written as a placeholder: the weak-agent probe
-        // pasted `owner/repo#N` verbatim when the refusal spelled it that way.
+        // Named from this tree, never written as a placeholder: the weak-agent probe
+        // pasted `owner/repo#N` verbatim when the refusal spelled it that way. The
+        // location comes from a real bare reference, and the runnable command is
+        // demonstrated on a reference the tree already carries qualified, because
+        // qualifying the bare one would be the guess this refusal exists to refuse.
         match first_bare_reference(&root) {
             Some((file, text)) => {
-                eprintln!("  Start with the first one, in {file}:");
-                eprintln!(
-                    "  host-lifecycle resolve {} --markdown {}",
-                    remedy_reference(&root, &text),
-                    root.display()
-                );
+                eprintln!("  Start with `{text}` in {file}; only you can say whose tracker it names.");
+                if let Some(example) = first_qualified_reference(&root) {
+                    eprintln!(
+                        "  Written as owner/repo#N it resolves, as this one already does: host-lifecycle resolve {} --markdown {}",
+                        example,
+                        root.display()
+                    );
+                }
             }
             None => eprintln!("  This tree has no bare issue reference to rewrite."),
         }

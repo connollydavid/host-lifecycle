@@ -302,7 +302,10 @@ fn refs_check_splits_clean_advisory_and_dead() {
     let (code, text) = run(&["refs", "--check", &dir]);
     assert_eq!(code, 3, "a bare issue number advises: {text}");
     assert!(text.contains("Advisory"), "and says so: {text}");
-    assert!(text.contains("--markdown"), "and names the remedy: {text}");
+    assert!(
+        text.contains("only you know which tracker each meant"),
+        "with every reference bare, no command is manufactured for one: {text}"
+    );
 
     fs::write(base.join("README.md"), "see plan/0099 and #17\n").unwrap();
     commit_all(&base);
@@ -410,8 +413,8 @@ fn refs_fix_refuses_with_the_reason() {
     let (code, text) = run(&["refs", "--fix", &base.to_string_lossy()]);
     assert_eq!(code, 2);
     assert!(text.contains("no --fix"), "{text}");
-    assert!(text.contains("--markdown"), "and names what does work: {text}");
     assert!(text.contains("#17"), "naming a real reference from this tree, never a placeholder: {text}");
+    assert!(!text.contains("resolve owner/repo"), "and no command carries the placeholder: {text}");
     let _ = fs::remove_dir_all(&base);
 }
 
@@ -564,7 +567,12 @@ fn the_verdict_discloses_what_it_did_not_check_on_every_exit() {
 // command that rewrote their own reference into a link to another project's
 // tracker, and the weak-agent acceptance is the evidence the command gets run.
 #[test]
-fn the_remedy_names_the_repository_it_was_run_in() {
+fn the_remedy_never_guesses_whose_tracker_a_bare_number_names() {
+    // This replaces a test that asserted the opposite. Deriving the remedy from the
+    // origin remote looked right and is wrong in the case that matters: in a host
+    // repository the origin is the host while most bare numbers name a component's
+    // issues, so the printed command rewrote the reference to the wrong tracker, and
+    // the weak-agent acceptance is the evidence that it gets run verbatim.
     let base = refs_fixture("refs-remedy");
     let dir = base.to_string_lossy().to_string();
     git(&base, &["remote", "add", "origin", "https://github.com/acme/widget.git"]);
@@ -572,9 +580,34 @@ fn the_remedy_names_the_repository_it_was_run_in() {
 
     for args in [vec!["refs", "--check", &dir], vec!["refs", "--fix", &dir]] {
         let (_, text) = run(&args);
-        assert!(text.contains("acme/widget#7"), "the remedy names this repository: {text}");
-        assert!(!text.contains("connollydavid"), "and never another one: {text}");
+        assert!(
+            !text.contains("acme/widget#7"),
+            "a bare #7 is never qualified with the origin remote: {text}"
+        );
+        assert!(
+            !text.contains("resolve owner/repo"),
+            "and no runnable command carries the placeholder: {text}"
+        );
     }
+
+    // The refusal still locates the debt, naming the bare reference it found rather
+    // than a shape: the operator has to know where to start even though the tool
+    // cannot say whose tracker it belongs to.
+    let (_, refusal) = run(&["refs", "--fix", &dir]);
+    assert!(refusal.contains("#7"), "the refusal names the real bare reference: {refusal}");
+
+    // With a qualified reference present, the worked example is that one, because it
+    // exists in the tree and resolves as written.
+    fs::write(base.join("README.md"), "closing #7 today, unlike acme/other#12\n").unwrap();
+    let (_, text) = run(&["refs", "--check", &dir]);
+    assert!(
+        text.contains("acme/other#12"),
+        "the example is a reference the tree already carries qualified: {text}"
+    );
+    assert!(
+        !text.contains("acme/widget#7"),
+        "and never the guessed qualification of the bare one: {text}"
+    );
     let _ = fs::remove_dir_all(&base);
 }
 
