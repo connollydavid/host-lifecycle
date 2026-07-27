@@ -676,7 +676,59 @@ fn enclosing_link(line: &[char], start: usize, end: usize) -> bool {
 
 /// Sweep one document. Fenced code is skipped: a fenced `#3` is an example, which
 /// is how the tell gate reads its own fixtures.
+/// The rooms this tree holds and the entry names each carries, read once per run.
+///
+/// Resolving a register reference lists its room directory, and this tree carries
+/// upward of two thousand register references, so a sweep spent itself listing the
+/// same two directories two thousand times: 9.4s against a 2.3s budget on a slow
+/// mount. The listing cannot change during a run, so it is read once (plan/0078).
+pub struct RoomIndex {
+    rooms: Vec<(String, Vec<String>)>,
+}
+
+impl RoomIndex {
+    pub fn read(root: &Path) -> Self {
+        let mut rooms = Vec::new();
+        for room in ROOMS {
+            let dir = root.join(room);
+            if !dir.is_dir() {
+                continue;
+            }
+            let names = fs::read_dir(&dir)
+                .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str().map(str::to_string)).collect())
+                .unwrap_or_else(|_| Vec::new());
+            rooms.push((room.to_string(), names));
+        }
+        Self { rooms }
+    }
+
+    fn names(&self, room: &str) -> Option<&Vec<String>> {
+        self.rooms.iter().find(|(r, _)| r == room).map(|(_, n)| n)
+    }
+
+    /// Whether this tree holds the room at all. A software repository holds none,
+    /// and its register references belong to the host that governs it.
+    pub fn owns(&self, room: &str) -> bool {
+        self.names(room).is_some()
+    }
+
+    /// Whether exactly one entry in the room carries this number. More than one is
+    /// an ambiguity the resolver refuses rather than picks between, so it is not a
+    /// resolution here either.
+    pub fn resolves(&self, room: &str, number: &str) -> bool {
+        self.names(room).is_some_and(|names| {
+            names.iter().filter(|n| n.strip_prefix(number).is_some_and(|r| r.starts_with('-'))).count() == 1
+        })
+    }
+}
+
 pub fn scan_document(text: &str, file: &str, root: &Path) -> Vec<Finding> {
+    scan_document_with(text, file, &RoomIndex::read(root))
+}
+
+/// The scan against a room index read once by the caller. The sweep resolves every
+/// reference in every document, so it reads the rooms once and passes them here.
+pub fn scan_document_with(text: &str, file: &str, rooms: &RoomIndex) -> Vec<Finding> {
     let mut out = Vec::new();
     // One reference per line per text: a markdown link writes the same reference
     // twice (its label and its target), and a reader sees one link. The text is
@@ -687,8 +739,8 @@ pub fn scan_document(text: &str, file: &str, root: &Path) -> Vec<Finding> {
         for (reference, in_link) in scan_line(&line) {
             let (text, weight) = match reference.kind {
                 RefKind::Register
-                    if owns_room(root, &reference)
-                        && resolution_of(root, &reference) == Resolution::UnresolvedHere =>
+                    if rooms.owns(&reference.room)
+                        && !rooms.resolves(&reference.room, &reference.number) =>
                 {
                     (format!("{}/{}", reference.room, reference.number), Weight::DeadPointer)
                 }
@@ -764,6 +816,7 @@ fn refs_run(root: &Path, gate: bool) -> i32 {
     let mut findings: Vec<Finding> = Vec::new();
     let mut unchecked_registers = 0usize;
     let mut unread: Vec<String> = Vec::new();
+    let rooms = RoomIndex::read(root);
     for doc in &docs {
         // A listed document that will not open is a hole in the corpus, never a
         // silent skip: the run cannot say what was in it, and a dead pointer
@@ -773,7 +826,7 @@ fn refs_run(root: &Path, gate: bool) -> i32 {
             continue;
         };
         unchecked_registers += count_unowned_registers(&text, root);
-        findings.extend(scan_document(&text, doc, root));
+        findings.extend(scan_document_with(&text, doc, &rooms));
     }
     for doc in &unread {
         println!("UNREAD   {doc}: listed by the walk and could not be read");
