@@ -117,3 +117,11 @@ invariant.VerdictMatchesFindings               => test:clean_verdict_implies_no_
 invariant.AdvisoryNeverSawConfirmed            => test:advisory_verdict_never_saw_confirmed exercises=dream
 invariant.FindingsVerdictSawConfirmed          => test:findings_verdict_implies_confirmed exercises=dream
 invariant.DanglingConfirmedOnlyWhenTierUnused   => test:dangling_confirmed_only_when_tier_unused exercises=detect
+
+# call/0050 convening, Q2: `absent` was a status no rule assigned, so `allium check`
+# warned and this spec sat outside CI. The binary has always performed the read that
+# establishes it (`read_tier_marker` maps a missing or unreadable `.host-memory-tier`
+# to Absent), so the fix models an observation the tool makes rather than inventing a
+# transition it does not have.
+rule-success.ObserveAbsentTierMarker           => test:marker_transition_absent_to_stamped exercises=read_tier_marker
+rule-failure.ObserveAbsentTierMarker.1         => test:marker_transition_stamped_to_retired exercises=read_tier_marker

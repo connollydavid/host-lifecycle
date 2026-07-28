@@ -179,8 +179,13 @@ surface MarkerLifecycle {
 
 -- === Project: shared with the wider host-lifecycle spec ===
 
+-- `marker_file_present` is what the run observes on disk, not what anyone
+-- declared: the tracked `.host-memory-tier` either is there to be read or is
+-- not. It is the input the marker's starting status is established FROM, which
+-- is why it lives on the project and not on the marker.
 entity Project {
     name: String
+    marker_file_present: Boolean
 }
 
 -- === Detectors (single-rule if/else form) ===
@@ -329,6 +334,18 @@ rule MarkerContradiction {
 -- init is what makes the verdict invariants provable: a stale latch from a
 -- prior run cannot leak in. fix_mode is bound at DreamStarts (the CLI flag)
 -- and stays constant for the run.
+-- The run reads the marker at start, and an unreadable or missing file reads as
+-- `absent`. Without this rule `absent` was a status no rule ever assigned: the
+-- spec modelled the marker's WRITES (stamp, retire) and two guards that read
+-- `absent`, but never the observation that establishes it, while the binary has
+-- always performed exactly this read. The gap was a real hole rather than
+-- checker noise, and closing it makes the spec more true rather than quieter.
+rule ObserveAbsentTierMarker {
+    when: DreamStarts(project)
+    requires: not project.marker_file_present
+    ensures: marker.status = absent
+}
+
 rule StartDream {
     when: DreamStarts(project)
     ensures: dream.status = dreaming

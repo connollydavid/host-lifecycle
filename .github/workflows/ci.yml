@@ -91,6 +91,16 @@ jobs:
         run: allium analyse host-lifecycle-refs.allium
       - name: allium plan (reference surface)
         run: allium plan host-lifecycle-refs.allium
+      # The memory-audit surface (call/0045). Unwired until the call/0050 convening:
+      # `absent` on TierMarker was a status no rule assigned, so `check` exited 1 and
+      # the spec sat outside CI while the other three gated. It audits MEMORY.md, a
+      # spine feature the template ships, so an ungated spec here reaches adopters.
+      - name: allium check (memory-audit surface)
+        run: allium check host-lifecycle-dream.allium
+      - name: allium analyse (memory-audit surface)
+        run: allium analyse host-lifecycle-dream.allium
+      - name: allium plan (memory-audit surface)
+        run: allium plan host-lifecycle-dream.allium
       - name: Build host-lifecycle (drives its own obligations check, no self-install)
         run: cargo build --release --locked
       - name: Discharge obligations (every obligation dispositioned, test refs exist)
@@ -98,6 +108,7 @@ jobs:
           ./target/release/host-lifecycle obligations host-lifecycle.allium --tests src
           ./target/release/host-lifecycle obligations host-lifecycle-materialize.allium --tests src --tests tests --strict-discharge
           ./target/release/host-lifecycle obligations host-lifecycle-refs.allium --tests src --tests tests --strict-discharge
+          ./target/release/host-lifecycle obligations host-lifecycle-dream.allium --tests src --tests tests --strict-discharge
 
   kani:
     # The materialize surface declares a `kani:` rung (the two artifacts' schema
