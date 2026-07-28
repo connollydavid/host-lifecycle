@@ -6635,6 +6635,7 @@ fn obligations(args: &[String]) {
 }
 
 /// How a `test:<name>` disposition resolves against the concatenated test source.
+#[derive(Debug)]
 enum TestRef<'a> {
     /// No `fn <name>(` definition (a substring of the name may still occur).
     Absent,
@@ -6664,6 +6665,25 @@ fn resolve_test<'a>(src: &'a str, name: &str) -> TestRef<'a> {
             hits.push(at);
         }
         from = at + needle.len();
+    }
+    // A shell test function, `name() {`. Some components ship a shell artifact, so
+    // their tests are shell functions; a checker that knew only Rust would leave
+    // them no honest disposition but `waived:`, which is the relabel dodge wearing
+    // another hat. Matched at the start of a line so a Rust call site like
+    // `if ready() {` cannot be read as a definition.
+    if hits.is_empty() {
+        let opener = format!("{name}()");
+        let mut at = 0usize;
+        for line in src.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with(&opener) {
+                let rest = trimmed[opener.len()..].trim_start();
+                if rest.starts_with('{') {
+                    hits.push(at + (line.len() - trimmed.len()));
+                }
+            }
+            at += line.len();
+        }
     }
     match hits.len() {
         0 => TestRef::Absent,
@@ -11073,6 +11093,32 @@ mod software_tests {
     // confirmed hole was a disposition pointed at a test that drives nothing; the
     // `exercises=` token must occur in the named test's body, the name must resolve to
     // exactly one definition, and an unlinked or substring-only `test:` is flagged.
+    #[test]
+    fn shell_test_functions_resolve_like_rust_ones() {
+        // A component whose artifact is a shell script tests it with shell
+        // functions. Before this, `test:` could only name a Rust `fn`, so such a
+        // component had no honest disposition left: `structural` on a behavioural
+        // obligation is the relabel dodge, and `waived:` would waive a test that
+        // exists and runs.
+        let sh = "digest_mismatch_refuses() {\n    run_install acme\n    want_rc 6 \"x\"\n}\n";
+        match resolve_test(sh, "digest_mismatch_refuses") {
+            TestRef::Found { body, ignored } => {
+                assert!(!ignored);
+                assert!(body.contains("want_rc 6"), "body should be the function body: {body:?}");
+            }
+            other => panic!("shell function should resolve: {other:?}"),
+        }
+
+        // A Rust call site is not a definition. `if ready() {` must stay Absent,
+        // which is what keeps the shell form from loosening the Rust check.
+        let rs = "fn caller() {\n    if ready() {\n        go();\n    }\n}\n";
+        assert!(matches!(resolve_test(rs, "ready"), TestRef::Absent));
+
+        // The Rust form still wins where both could match.
+        let both = "fn thing() {\n    let _ = 1;\n}\n";
+        assert!(matches!(resolve_test(both, "thing"), TestRef::Found { .. }));
+    }
+
     #[test]
     fn discharge_warnings_catch_hollow_unlinked_and_ambiguous() {
         let src = "fn a_drives() { let _ = software_check(&p); }\n\
