@@ -182,6 +182,16 @@ entity Delta {
 -- hazarded state to reach. `clean` and `drifted` both exit 0; `cannot_proceed`
 -- exits 2 and only ever means "no envhash on disk yet"
 -- (CannotProceedOnlyWithoutRecord).
+--
+-- The run prints one line this model deliberately does not carry: a disagreement
+-- between the GitHub account `gh` is active as and the account the project pins for
+-- git. Both facts are read live, so there is no recorded value to have moved away
+-- from, and a mismatch is wrong the first time it is seen rather than wrong because
+-- it changed — it is not a Dimension and yields no Delta. It therefore cannot reach
+-- `saw_delta`, and a run whose only output is that line still settles `clean`. Stated
+-- here because the delta model would otherwise read as the complete account of what
+-- the run emits, not as an invariant: the model already makes it structurally true,
+-- and an invariant that cannot fail is not a check.
 entity EnvCheck {
     status: checking | clean | drifted | cannot_proceed
     saw_delta: Boolean

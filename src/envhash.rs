@@ -416,6 +416,46 @@ fn dimension_meaning(kind: &str, root: &Path) -> String {
     }
 }
 
+/// The account `gh` will act as, against the one this repository pins for git.
+///
+/// These are two mechanisms and only one of them was ever pinned. The repository's
+/// credential helper resolves the account **by name** at push time, so a push stays
+/// correct whatever `gh` has active — while `gh` itself (`gh issue close`, `gh pr
+/// create`) acts as whichever account *is* active. When one silently became another
+/// here, pushes kept working and the API call was refused, so the failure read as a
+/// permissions problem with the repository rather than an identity problem with the
+/// machine. The two facts are both readable at any moment; only their disagreement is
+/// news.
+///
+/// Not a fingerprint dimension: nothing here is compared against a recorded snapshot,
+/// and the mismatch is wrong the first time it is seen rather than wrong because it
+/// moved. Silent unless both facts read cleanly — no `gh` on PATH, no pinned username,
+/// or a `gh` too old for `--active` all mean there is nothing to compare.
+fn gh_account_mismatch(root: &Path) -> Option<(String, String)> {
+    let pinned = crate::git_out(root, &["config", "--get", "credential.https://github.com.username"])?;
+    let out = process::Command::new("gh").args(["auth", "status", "--active"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let active = active_gh_account(&String::from_utf8_lossy(&out.stdout))?;
+    (active != pinned).then_some((active, pinned))
+}
+
+/// The account name in `gh auth status --active` output.
+///
+/// Only the name is taken. The surrounding block also quotes a masked token, and a
+/// tool that reports on its environment must not widen what it prints; a parse that
+/// returned the whole line would put that in a log. `None` when the shape is not the
+/// one this was written against, which is the honest answer for a `gh` that changed
+/// its output — silence, not a guess at which word is a username.
+fn active_gh_account(text: &str) -> Option<String> {
+    text.lines()
+        .find(|l| l.contains("Logged in to"))
+        .and_then(|l| l.split(" account ").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+}
+
 /// `env --check <dir>`: recompute, diff, print the route. Advisory by
 /// construction — `0` clean, `0` with a delta, `2` when nothing is recorded yet.
 pub fn env_check(root: &Path, recipe: &[Software]) -> i32 {
@@ -441,6 +481,13 @@ pub fn env_check(root: &Path, recipe: &[Software]) -> i32 {
                 root.display()
             );
         }
+    }
+    if let Some((active, pinned)) = gh_account_mismatch(root) {
+        println!(
+            "mismatch gh is acting as {active} but this repository pins {pinned} for git — \
+             a push resolves {pinned} by name and stays correct, while `gh issue`/`gh pr` act as {active} \
+             and are refused; run `gh auth switch --user {pinned}` before any outward GitHub call"
+        );
     }
     let unread = current.iter().filter(|d| d.value.is_none()).count();
     if moved.is_empty() {
@@ -493,6 +540,20 @@ mod tests {
 
     fn dim(kind: &str, value: Option<&str>) -> EnvDimension {
         EnvDimension { kind: kind.to_string(), value: value.map(str::to_string) }
+    }
+
+    // The account name is lifted out of real `gh auth status --active` output (gh
+    // 2.96.0), and nothing else is: the masked token on the line below must not travel
+    // with it. A shape this parse was not written against yields None rather than a
+    // guess, so a future `gh` goes quiet instead of naming the wrong account.
+    #[test]
+    fn active_gh_account_reads_only_the_name() {
+        let real = "github.com\n  \u{2713} Logged in to github.com account connollydavid (/home/u/.config/gh/hosts.yml)\n\
+                    \x20 - Active account: true\n  - Token: gho_************************************\n";
+        assert_eq!(active_gh_account(real).as_deref(), Some("connollydavid"));
+        assert!(!active_gh_account(real).unwrap().contains("gho_"));
+        assert_eq!(active_gh_account("You are not logged into any GitHub hosts.\n"), None);
+        assert_eq!(active_gh_account(""), None);
     }
 
     // The fingerprint round-trips through its own format, unreadable dimensions
