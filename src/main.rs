@@ -5782,6 +5782,14 @@ fn software_check_owed(root: &Path, recipe: &[Software], owed: &mut Vec<String>)
         println!("HAZARD   .claude/skills/{link} dangles (run: host-lifecycle bootstrap <dir>)");
         bad += 1;
     }
+    // File modes are recorded state, so they are this check's business and not the
+    // setup gate's: an entry point recorded non-executable is wrong in the commit,
+    // before any clone exists to be set up.
+    let (mode_bad, mode_seen) = entry_point_mode_problems(root, recipe);
+    bad += mode_bad;
+    if mode_bad == 0 && mode_seen > 0 {
+        println!("ok       {mode_seen} invoked entry point(s) recorded executable");
+    }
     // Re-check every recorded upgrade claim against the ledger (plan/0022 step 6).
     bad += upgrade_claim_problems(root);
     // #12: a spec under plan/*/spec/ evades the mandatory lanes — co-locate it with software.
@@ -5966,6 +5974,102 @@ fn dangling_generated_links(root: &Path) -> Vec<String> {
     }
     bad.sort();
     bad
+}
+
+/// The recorded mode of every entry point this corpus invokes in place.
+///
+/// No gate in this project read a file mode, and the cost was silent: `./bootstrap.sh`
+/// — the one command the host's own CLAUDE.md names for a fresh clone — was recorded
+/// `100644` and exited 126, and the same defect landed on four other scripts. Every
+/// symptom arrived somewhere other than the cause (a CI step "failing", a documented
+/// command "not working"), and a filesystem with no executable bit re-introduces it on
+/// every write, so it is not a defect that stays fixed by hand.
+///
+/// The rule is deliberately narrower than "a shebang must be executable", which fires
+/// on payload scripts that a copier chmods on install — host-lint's tracked `pre-commit`
+/// is one, and an exemption list maintained to silence it would be the next thing to
+/// rot. What must be executable is what the corpus *invokes in place*: a path written
+/// `./x` in a tracked document, workflow or script. That population is derived on every
+/// run, so a new entry point is covered the day it is first invoked.
+///
+/// Returns `(hazards, entry points examined)`. The second number is the denominator: a
+/// detector that reports only what it found cannot be seen to be looking at the wrong
+/// set, which is a failure this project has already paid for three times.
+fn entry_point_mode_problems(root: &Path, recipe: &[Software]) -> (usize, usize) {
+    let mut repos: Vec<(String, PathBuf)> = vec![(".".to_string(), root.to_path_buf())];
+    for s in recipe {
+        let wt = worktree_dir(root, &s.name, &s.branch);
+        if wt.is_dir() {
+            repos.push((worktree_label(&s.name, &s.branch), wt));
+        }
+    }
+    let (mut bad, mut checked) = (0usize, 0usize);
+    for (label, dir) in repos {
+        // Index modes, not worktree modes: the recorded state is what a fresh clone
+        // receives, and it is the only one of the two a commit can carry.
+        let mut recorded: std::collections::BTreeMap<String, (String, String)> = std::collections::BTreeMap::new();
+        let Some(entries) = git_out_z(&dir, &["ls-files", "-sz"]) else {
+            continue;
+        };
+        for e in entries {
+            let Some((meta, path)) = e.split_once('\t') else {
+                continue;
+            };
+            let mut f = meta.split_whitespace();
+            let (Some(mode), Some(sha)) = (f.next(), f.next()) else {
+                continue;
+            };
+            recorded.insert(path.to_string(), (mode.to_string(), sha.to_string()));
+        }
+        // `git grep -z -o` emits `<path>NUL<match>` per line, so the invoking document
+        // is known and `./x` can be read the way a reader reads it — beside the document
+        // first, then from the repository root, which is what a workflow at depth means.
+        let Some(hits) = git_out(&dir, &["grep", "-I", "-z", "-o", "-E", r"\./[A-Za-z0-9_][A-Za-z0-9_./-]*", "--", "."]) else {
+            continue;
+        };
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for line in hits.lines() {
+            let Some((from, invoked)) = line.split_once('\0') else {
+                continue;
+            };
+            let rel = &invoked[2..];
+            let beside = match from.rsplit_once('/') {
+                Some((d, _)) => format!("{d}/{rel}"),
+                None => rel.to_string(),
+            };
+            let Some(target) = [beside, rel.to_string()].into_iter().find(|c| recorded.contains_key(c)) else {
+                continue;
+            };
+            if !seen.insert(target.clone()) {
+                continue;
+            }
+            let (mode, sha) = &recorded[&target];
+            if !blob_is_script(&dir, sha) {
+                continue;
+            }
+            checked += 1;
+            if mode != "100644" {
+                continue;
+            }
+            println!("HAZARD   {label}: {target} is invoked as `./{rel}` in {from} but recorded {mode} — exit 126 in a fresh clone");
+            println!("           remedy: git -C {} update-index --chmod=+x {target}", dir.display());
+            bad += 1;
+        }
+    }
+    (bad, checked)
+}
+
+/// Whether a tracked blob opens with a `#!` line. Read raw rather than through
+/// `git_out`, whose trim would let a file that merely *contains* a shebang further
+/// down read as one.
+fn blob_is_script(dir: &Path, sha: &str) -> bool {
+    process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["cat-file", "blob", sha])
+        .output()
+        .map(|o| o.status.success() && o.stdout.starts_with(b"#!"))
+        .unwrap_or(false)
 }
 
 /// Tracked symlinks whose resolved target is **not itself tracked here** — they
@@ -10215,6 +10319,44 @@ mod tests {
             .arg("-C").arg(&base).args(["log", "--oneline", "-1"]).output().unwrap();
         assert!(log.status.success() && !log.stdout.is_empty(), "a commit exists");
         assert!(String::from_utf8_lossy(&log.stdout).contains("scaffold agentic-x"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The entry-point mode gate, proved by breaking it (call/0049 rule sixteen). The
+    // fixture carries all three populations at once: an invoked script, an invoked
+    // script one directory down, and a payload script that is never invoked in place.
+    #[test]
+    fn entry_point_mode_gate_fires_only_on_an_invoked_script() {
+        let base = std::env::temp_dir().join(format!("hl-execbit-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("bootstrap.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(base.join("sub/run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        // The host-lint `pre-commit` case: a shebang, never invoked as `./pre-commit`,
+        // installed by a copier that chmods. A blanket shebang rule would flag it.
+        fs::write(base.join("payload"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(base.join("README.md"), "run ./bootstrap.sh from the root\n").unwrap();
+        fs::write(base.join("sub/doc.md"), "then ./run.sh beside this file\n").unwrap();
+        assert!(git_ok(&base, &["init", "-q"]), "fixture repo");
+        assert!(git_ok(&base, &["add", "-A"]));
+        for f in ["bootstrap.sh", "sub/run.sh"] {
+            assert!(git_ok(&base, &["update-index", "--chmod=+x", f]));
+        }
+        assert!(git_ok(&base, &["update-index", "--chmod=-x", "payload"]));
+
+        let (bad, seen) = entry_point_mode_problems(&base, &[]);
+        assert_eq!(bad, 0, "both invoked scripts are recorded executable");
+        assert_eq!(seen, 2, "the payload is not an invoked entry point, so it is not judged");
+
+        // Break exactly the thing the gate exists for.
+        assert!(git_ok(&base, &["update-index", "--chmod=-x", "bootstrap.sh"]));
+        let (bad, seen) = entry_point_mode_problems(&base, &[]);
+        assert_eq!(bad, 1, "a non-executable invoked entry point is a hazard");
+        assert_eq!(seen, 2, "the denominator does not shrink when a member fails");
+
+        // And the one reached through the invoking document's own directory.
+        assert!(git_ok(&base, &["update-index", "--chmod=-x", "sub/run.sh"]));
+        assert_eq!(entry_point_mode_problems(&base, &[]).0, 2, "`./run.sh` resolves beside sub/doc.md");
         let _ = fs::remove_dir_all(&base);
     }
 
