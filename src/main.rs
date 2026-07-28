@@ -4240,6 +4240,7 @@ fn software(args: &[String]) {
     // from the recorded pin and drives its release (plan/0057). The name is the flag's
     // value, not a positional, so it never collides with the `<dir>` positional.
     let mut lock_name: Option<&str> = None;
+    let mut authorized: Option<String> = None;
     // `--teardown` removes a component's materialized worktrees + bare store;
     // `--force` overrides the unsaved-work guard (plan/0029).
     let mut force = false;
@@ -4268,6 +4269,16 @@ fn software(args: &[String]) {
                 i += 1;
             }
             "--force" => force = true,
+            // `--lock` graduates a bundle by driving a fix-only release, so it is a
+            // release and carries the same authorization (call/0050).
+            "--authorized" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("host-lifecycle: --authorized needs <ref>");
+                    process::exit(2);
+                };
+                authorized = Some(v.clone());
+                i += 1;
+            }
             "--item" => {
                 let Some(v) = args.get(i + 1) else {
                     eprintln!("host-lifecycle: --item needs <name>[@<branch>]");
@@ -4342,7 +4353,7 @@ fn software(args: &[String]) {
         "install-hooks" => software_install_hooks(&root, &recipe),
         "verify-setup" => process::exit(setup::verify_setup(&root, &recipe)),
         "teardown" => software_teardown(&root, &recipe, force),
-        "lock" => software_lock(&root, &recipe, lock_name.expect("--lock sets lock_name")),
+        "lock" => software_lock(&root, &recipe, lock_name.expect("--lock sets lock_name"), authorized.as_deref()),
         _ => unreachable!(),
     }
 }
@@ -4353,7 +4364,7 @@ fn software(args: &[String]) {
 /// advances the producer HEAD, so `.host-software` keeps pinning a released, tagged commit
 /// (dual-release-authority unchanged). Fails loud on the wrong state; a no-op on an
 /// already-locked component, so the verb is idempotent.
-fn software_lock(root: &Path, recipe: &[Software], name: &str) {
+fn software_lock(root: &Path, recipe: &[Software], name: &str, authorized: Option<&str>) {
     let Some(s) = recipe.iter().find(|s| s.name == name) else {
         eprintln!("host-lifecycle: no component `{name}` in {SOFTWARE}");
         process::exit(2);
@@ -4381,6 +4392,24 @@ fn software_lock(root: &Path, recipe: &[Software], name: &str) {
         eprintln!("host-lifecycle: {name} deps-bundle.lock differs from the recorded pin (producer drift) — resolve the drift; --lock will not overwrite a disagreeing lock");
         process::exit(1);
     }
+    // Graduating a bundle IS a release, so it answers to the same gate rather than
+    // reaching the cascade by a side door (call/0050). Checked HERE, before the first
+    // write: refusing after the lock was written and staged would stop with a dirty
+    // tree, which is the state rule eighteen exists to forbid and the same defect the
+    // convening found in the release path. The no-op and drift branches above need no
+    // authorization, because neither performs a release.
+    let Some(reference) = authorized else {
+        eprintln!("host-lifecycle: --lock drives a release, so it needs `--authorized <ref>` (call/0050)");
+        process::exit(2);
+    };
+    let authorization = match parse_authorization(root, reference) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("host-lifecycle: {e}");
+            process::exit(2);
+        }
+    };
+
     // Write the lock from the recorded pin (so the content is never hand-typed) and stage it.
     let content = format!("{url} {sha}\n");
     if let Err(e) = fs::write(&lock, &content) {
@@ -4397,7 +4426,7 @@ fn software_lock(root: &Path, recipe: &[Software], name: &str) {
     // Drive the fix-only release: the verify gate, the version bump, the container rebuild
     // (the artifact re-derives byte-identically — the lock is never compiled in), and the
     // operator-run outward steps (commit the lock + bump, tag, push, re-pin, receipt).
-    run_release(root, name, Some("neither"), false);
+    run_release(root, name, Some("neither"), false, authorization);
 }
 
 /// `--install-hooks`: for each component with a `hooks` script, copy it into
@@ -5310,6 +5339,7 @@ fn append_materialize_receipt(root: &Path, s: &Software, items: usize) {
         disposition: "done".to_string(),
         evidence: Some(materialize_evidence(s, items)),
         reason: None,
+        authorization: None,
         tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
         recorded: Some(today()),
     };
@@ -5790,6 +5820,7 @@ fn software_check_owed(root: &Path, recipe: &[Software], owed: &mut Vec<String>)
     if mode_bad == 0 && mode_seen > 0 {
         println!("ok       {mode_seen} invoked entry point(s) recorded executable");
     }
+    bad += release_authorization_problems(root);
     // Re-check every recorded upgrade claim against the ledger (plan/0022 step 6).
     bad += upgrade_claim_problems(root);
     // #12: a spec under plan/*/spec/ evades the mandatory lanes — co-locate it with software.
@@ -6057,6 +6088,39 @@ fn entry_point_mode_problems(root: &Path, recipe: &[Software]) -> (usize, usize)
         }
     }
     (bad, checked)
+}
+
+/// Every release receipt a binary that knew the field recorded without one (call/0050).
+///
+/// What is judged is presence, never honesty. A field the audited party fills in cannot
+/// testify to its own truth, and this project has already read an agent-authored
+/// migration that minuted an invented operator override. Forging this one means also
+/// authoring the record it points at, in a commit, in history the operator reads, which
+/// converts an invisible act into an attributable one. That is the whole claim.
+///
+/// Receipts written before the flag existed are counted and named, not hazarded.
+/// Reddening the gate over history nobody can amend teaches the reader to skip the
+/// line, and this project has twice paid for a verdict that was ignored.
+fn release_authorization_problems(root: &Path) -> usize {
+    let receipts = read_all_receipts(root);
+    let mut bad = 0usize;
+    let mut predating = 0usize;
+    for r in receipts.iter().filter(|r| r.phase == "release" && r.disposition == "done") {
+        if !owes_authorization(r) {
+            predating += 1;
+            continue;
+        }
+        if r.authorization.is_none() {
+            let who = r.component.as_deref().unwrap_or("(no component)");
+            let ev = r.evidence.as_deref().unwrap_or("(no evidence)");
+            println!("HAZARD   release receipt {who} {ev} carries no authorization (call/0050)");
+            bad += 1;
+        }
+    }
+    if predating > 0 {
+        println!("-- {predating} release receipt(s) predate the authorization field and are not judged (call/0050)");
+    }
+    bad
 }
 
 /// Whether a tracked blob opens with a `#!` line. Read raw rather than through
@@ -8810,8 +8874,73 @@ struct Receipt {
     disposition: String,
     evidence: Option<String>,
     reason: Option<String>,
+    /// What authorized this act, as a reference that resolves in the tree (call/0050).
+    /// Carried so an operator's go survives the window it was spoken in: nine releases
+    /// were approved in conversation and the record could show neither the approval nor
+    /// its absence. Only release receipts require one, and what the gate reads is
+    /// whether the field is THERE — never whether its content is honest, because a
+    /// field the audited party fills in cannot testify to its own truth.
+    authorization: Option<String>,
     tool: Option<String>,
     recorded: Option<String>,
+}
+
+/// The release that introduced `--authorized`, and with it the `authorization` field.
+///
+/// The cut between "this receipt is missing its authorization" and "this receipt
+/// predates the field" is read from the receipt's own `tool = host-lifecycle@X.Y.Z`
+/// line, not from a date: ninety-six release receipts already existed when call/0050
+/// landed and some were recorded the same day, so no date separates them. Asking which
+/// binary wrote a receipt asks exactly the right question — did the tool that recorded
+/// this even know the field existed — and it needs no cutover list to maintain.
+const AUTHORIZATION_SINCE: (u32, u32, u32) = (0, 48, 0);
+
+/// `X.Y.Z` from a `host-lifecycle@X.Y.Z` tool string, for the threshold comparison.
+/// A tool line this cannot parse reads as predating the field, which is the safe
+/// direction: an unreadable provenance is disclosed rather than hazarded.
+fn tool_version(tool: Option<&str>) -> Option<(u32, u32, u32)> {
+    let v = tool?.rsplit_once('@')?.1;
+    let mut p = v.split('.').map(|n| n.trim().parse::<u32>().ok());
+    Some((p.next()??, p.next()??, p.next()??))
+}
+
+/// Whether a release receipt is one this decision governs: recorded by a binary that
+/// carried the flag, so its author could have supplied an authorization.
+fn owes_authorization(r: &Receipt) -> bool {
+    r.phase == "release" && tool_version(r.tool.as_deref()).is_some_and(|v| v >= AUTHORIZATION_SINCE)
+}
+
+/// Whether `<ref>` is a form the tree can resolve, and what it names.
+///
+/// Three forms, per call/0050: a decision, a plan node, and a forge issue. The first
+/// two are checked against the tree and must exist. The third cannot be: an issue does
+/// not live in the corpus, and reaching the network to confirm it would put a release
+/// behind an outage. Its shape is checked and its existence is not, which the release
+/// output says out loud rather than implying a verification it did not perform.
+enum Authorization {
+    InTree(String),
+    ForgeIssue(String),
+}
+
+fn parse_authorization(root: &Path, r: &str) -> Result<Authorization, String> {
+    // The same resolver `resolve` and `refs --gate` use, so an authorization is
+    // exactly a reference this project already knows how to follow, and a form the
+    // gate would call dead cannot authorize anything.
+    let Some(reference) = refs::parse_reference(r) else {
+        return Err(format!(
+            "`{r}` is not a reference — use `call/NNNN`, `plan/NNNN[#anchor]`, or `owner/repo#N`"
+        ));
+    };
+    match refs::resolution_of(root, &reference) {
+        refs::Resolution::Resolved => Ok(match reference.kind {
+            refs::RefKind::Issue => Authorization::ForgeIssue(r.to_string()),
+            refs::RefKind::Register => Authorization::InTree(r.to_string()),
+        }),
+        refs::Resolution::UnresolvedHere => Err(format!(
+            "`{r}` names nothing in this tree — an authorization must resolve, or the record points at a record that is not there"
+        )),
+        refs::Resolution::Malformed => Err(format!("`{r}` is not a well-formed reference")),
+    }
 }
 
 /// Parse `.host-receipts`: `[receipt "<phase>"]` or `[receipt "<phase>" "<component>"]`
@@ -8834,6 +8963,7 @@ fn parse_receipts(text: &str) -> Vec<Receipt> {
                 disposition: String::new(),
                 evidence: None,
                 reason: None,
+                authorization: None,
                 tool: None,
                 recorded: None,
             });
@@ -8846,6 +8976,7 @@ fn parse_receipts(text: &str) -> Vec<Receipt> {
             "disposition" => cur.disposition = val.to_string(),
             "evidence" => cur.evidence = Some(val.to_string()),
             "reason" => cur.reason = Some(val.to_string()),
+            "authorization" => cur.authorization = Some(val.to_string()),
             "tool" => cur.tool = Some(val.to_string()),
             "recorded" => cur.recorded = Some(val.to_string()),
             _ => {}
@@ -8866,7 +8997,13 @@ fn receipt_stanza(r: &Receipt) -> String {
         None => format!("[receipt \"{}\"]", r.phase),
     };
     let mut s = format!("{head}\n    disposition = {}\n", r.disposition);
-    for (k, v) in [("evidence", &r.evidence), ("reason", &r.reason), ("tool", &r.tool), ("recorded", &r.recorded)] {
+    for (k, v) in [
+        ("evidence", &r.evidence),
+        ("reason", &r.reason),
+        ("authorization", &r.authorization),
+        ("tool", &r.tool),
+        ("recorded", &r.recorded),
+    ] {
         if let Some(v) = v {
             s.push_str(&format!("    {k} = {v}\n"));
         }
@@ -9247,6 +9384,7 @@ fn receipt(args: &[String]) {
 
 fn receipt_record(args: &[String]) {
     let (mut phase, mut component, mut disposition, mut evidence, mut reason) = (None, None, None, None, None);
+    let mut authorization: Option<String> = None;
     let mut dir = String::from(".");
     let mut i = 0;
     while i < args.len() {
@@ -9255,6 +9393,7 @@ fn receipt_record(args: &[String]) {
             "--disposition" => { disposition = args.get(i + 1).cloned(); i += 2; }
             "--evidence" => { evidence = args.get(i + 1).cloned(); i += 2; }
             "--reason" => { reason = args.get(i + 1).cloned(); i += 2; }
+            "--authorization" => { authorization = args.get(i + 1).cloned(); i += 2; }
             s if s.starts_with("--") => { i += 1; }
             s if phase.is_none() => { phase = Some(s.to_string()); i += 1; }
             s => { dir = s.to_string(); i += 1; }
@@ -9281,12 +9420,31 @@ fn receipt_record(args: &[String]) {
         eprintln!("host-lifecycle: {e}");
         process::exit(2);
     }
+    // A release receipt must carry the authorization that permitted it (call/0050).
+    // Checked at the point of record as well as at the gate: a receipt written without
+    // one would be a permanent hole in the log, and the gate that catches it later
+    // catches it after the tag exists.
+    if phase == "release" && disposition == "done" {
+        match &authorization {
+            None => {
+                eprintln!("host-lifecycle: a release receipt needs `--authorization <ref>` naming what authorized it (call/0050)");
+                process::exit(2);
+            }
+            Some(reference) => {
+                if let Err(e) = parse_authorization(root, reference) {
+                    eprintln!("host-lifecycle: {e}");
+                    process::exit(2);
+                }
+            }
+        }
+    }
     let r = Receipt {
         phase: phase.clone(),
         component: component.clone(),
         disposition: disposition.clone(),
         evidence,
         reason,
+        authorization,
         tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
         recorded: Some(today()),
     };
@@ -9467,23 +9625,46 @@ fn release(args: &[String]) {
         return;
     }
     let (mut component, mut change_class, mut dir, mut preview) = (None, None, String::from("."), false);
+    let mut authorized: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--next" | "--preview" => { preview = true; i += 1; }
             "--change-class" => { change_class = args.get(i + 1).cloned(); i += 2; }
+            "--authorized" => { authorized = args.get(i + 1).cloned(); i += 2; }
             s if s.starts_with("--") => { i += 1; }
             s if component.is_none() => { component = Some(s.to_string()); i += 1; }
             s => { dir = s.to_string(); i += 1; }
         }
     }
     let Some(component) = component else {
-        eprintln!("usage: host-lifecycle release <component> [--change-class {CHANGE_CLASSES}] [<dir>]");
+        eprintln!("usage: host-lifecycle release <component> --authorized <ref> [--change-class {CHANGE_CLASSES}] [<dir>]");
         eprintln!("       host-lifecycle release --next <component> [<dir>]");
         eprintln!("       host-lifecycle release --record <component> --skip call/NNNN [<dir>]");
         process::exit(2);
     };
-    run_release(Path::new(&dir), &component, change_class.as_deref(), preview);
+    // A preview answers "what would the next version be" and performs nothing, so it
+    // needs no authorization; the run that changes the tree does. Refusing here is
+    // fail-closed on purpose (call/0050): forgetting the flag stops the release rather
+    // than producing an unattributable one, which is the outcome the rule is about.
+    let authorization = if preview {
+        None
+    } else {
+        let Some(reference) = authorized else {
+            eprintln!("host-lifecycle: release needs `--authorized <ref>` naming what authorizes it (call/0050)");
+            eprintln!("  the reference must resolve here: a `call/NNNN`, a `plan/NNNN[#anchor]`, or an `owner/repo#N`");
+            eprintln!("  it is recorded on the release receipt, because an approval spoken in a session window is not a record");
+            process::exit(2);
+        };
+        match parse_authorization(Path::new(&dir), &reference) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("host-lifecycle: {e}");
+                process::exit(2);
+            }
+        }
+    };
+    run_release(Path::new(&dir), &component, change_class.as_deref(), preview, authorization);
 }
 
 /// Resolve the component's recipe + a live `release` phase, exiting with a clear
@@ -9648,7 +9829,7 @@ fn inherits_workspace_version(member_toml: &str) -> bool {
     false
 }
 
-fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview: bool) {
+fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview: bool, authorization: Option<Authorization>) {
     let recipe = load_software(root);
     let s = release_context(root, &recipe, component);
     let work = worktree_dir(root, &s.name, &s.branch);
@@ -9665,10 +9846,10 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     if preview {
         match change_class {
             None => {
-                println!("next: host-lifecycle release {component} --change-class <{CHANGE_CLASSES}>");
+                println!("next: host-lifecycle release {component} --change-class <{CHANGE_CLASSES}> --authorized <ref>");
                 println!("  (the tool maps the change class to the version; you never name a semver level)");
             }
-            Some(_) => println!("next: host-lifecycle release {component} --change-class {} (runs the gated sequence)", change_class.unwrap()),
+            Some(_) => println!("next: host-lifecycle release {component} --change-class {} --authorized <ref> (runs the gated sequence)", change_class.unwrap()),
         }
         return;
     }
@@ -9714,7 +9895,7 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
 
     // Step 2 — change class. The one decision the agent supplies; the tool maps it.
     let Some(class_str) = change_class else {
-        println!("next: host-lifecycle release {component} --change-class <{CHANGE_CLASSES}>");
+        println!("next: host-lifecycle release {component} --change-class <{CHANGE_CLASSES}> --authorized <ref>");
         println!("  removes-flag = a removed/renamed public flag or changed output (breaking)");
         println!("  adds-flag    = a new flag or behaviour (feature)");
         println!("  neither      = a fix only");
@@ -9852,10 +10033,17 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     };
     println!("  canonical hash: {hash}");
 
-    // Step 4 — the operator-run outward sequence, with the tool-computed values filled
-    // in. The tool never pushes (software-first ordering + push authorization); it
-    // hands over the EXACT re-pin/re-hash so nothing is hand-derived.
-    println!("\nrelease {component} v{new} — verified build reproduces. Outward steps (operator-run):");
+    // Step 4 — the outward sequence, with the tool-computed values filled in. The tool
+    // performs none of it (no tag, no push, no asset appears anywhere in this crate);
+    // it hands over the EXACT re-pin/re-hash so nothing is hand-derived.
+    //
+    // The heading used to read "operator-run", which was the wrong shape twice over.
+    // It named an outcome and not a means, and the real qwen3.5-4b, handed this output,
+    // ran a step in both repeats rather than handing back — one of them writing the
+    // artifact hash into the pin. And since call/0050 an authorized run may perform
+    // these, so "operator-run" was also no longer true. What carries the boundary now
+    // is the authorization already checked above, not an adjective in a heading.
+    println!("\nrelease {component} v{new} — verified build reproduces. Outward steps, authorized by {}:", authorization_text(&authorization));
     println!("    cd {} && git commit -am 'release v{new}' && git push", work.display());
     println!("    git -C {} tag -a v{new} -m 'release v{new}' && git -C {0} push origin v{new}", work.display());
     println!("  then re-pin {SOFTWARE} for [software \"{component}\"]:");
@@ -9865,7 +10053,24 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     for line in template_pin_bump_lines(component, &new, &carried) {
         println!("{line}");
     }
-    println!("    host-lifecycle receipt --record release --component {component} --disposition done --evidence v{new}@{hash}");
+    println!(
+        "    host-lifecycle receipt --record release --component {component} --disposition done --evidence v{new}@{hash} --authorization {}",
+        authorization_text(&authorization)
+    );
+    // An issue is the one authorization form naming something outside the corpus, so
+    // the tool says which check it did not perform rather than letting a resolved
+    // verdict imply one it could not reach.
+    if let Some(Authorization::ForgeIssue(r)) = &authorization {
+        println!("  note: {r} is a forge reference; its shape resolves here and its existence was not fetched");
+    }
+}
+
+/// The reference an authorization carries, for the receipt line and the heading.
+fn authorization_text(a: &Option<Authorization>) -> &str {
+    match a {
+        Some(Authorization::InTree(r) | Authorization::ForgeIssue(r)) => r,
+        None => "<ref>",
+    }
 }
 
 /// The outward template-pin-bump steps a release must run (call/0038): a host-lifecycle release
@@ -9955,6 +10160,9 @@ fn release_record_skip(args: &[String]) {
         disposition: "skip".to_string(),
         evidence: None,
         reason: Some(cite.clone()),
+        // A skip's `reason` is already an accepted `call/` this function verified, so
+        // it carries its own authority; the field would restate it.
+        authorization: None,
         tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
         recorded: Some(today()),
     };
@@ -10358,6 +10566,86 @@ mod tests {
         assert!(git_ok(&base, &["update-index", "--chmod=-x", "sub/run.sh"]));
         assert_eq!(entry_point_mode_problems(&base, &[]).0, 2, "`./run.sh` resolves beside sub/doc.md");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // call/0050: which receipts the authorization rule governs is read from the binary
+    // that wrote them, because no date separates the ninety-six that already existed
+    // from the ones recorded the same day the decision landed.
+    #[test]
+    fn only_receipts_written_by_a_knowing_binary_owe_an_authorization() {
+        let rel = |tool: Option<&str>| Receipt {
+            phase: "release".to_string(),
+            component: Some("host-lint".to_string()),
+            disposition: "done".to_string(),
+            evidence: Some("v1.0.0@abc".to_string()),
+            reason: None,
+            authorization: None,
+            tool: tool.map(str::to_string),
+            recorded: Some("2026-07-28".to_string()),
+        };
+        assert!(!owes_authorization(&rel(Some("host-lifecycle@0.47.2"))), "predates the field");
+        assert!(owes_authorization(&rel(Some("host-lifecycle@0.48.0"))), "the release that added it");
+        assert!(owes_authorization(&rel(Some("host-lifecycle@1.2.3"))), "and everything after");
+        // An unreadable or absent provenance is disclosed, never hazarded: a receipt
+        // whose author cannot be identified is not evidence that its author skipped.
+        assert!(!owes_authorization(&rel(None)));
+        assert!(!owes_authorization(&rel(Some("nonsense"))));
+        // Only releases. A materialize receipt records a state change nobody authorizes.
+        let mut m = rel(Some("host-lifecycle@0.48.0"));
+        m.phase = "materialize".to_string();
+        assert!(!owes_authorization(&m));
+    }
+
+    // The gate, proved by breaking it (call/0049 rule sixteen): a receipt from a
+    // knowing binary with no authorization must HAZARD, and the ones predating the
+    // field must be counted rather than reddened.
+    #[test]
+    fn a_release_receipt_without_an_authorization_hazards() {
+        let base = std::env::temp_dir().join(format!("hl-auth-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let old = "[receipt \"release\" \"host-lint\"]\n    disposition = done\n    \
+                   evidence = v0.16.6@abc\n    tool = host-lifecycle@0.47.2\n    recorded = 2026-07-28\n";
+        fs::write(base.join(LIFECYCLE_RECEIPTS), old).unwrap();
+        assert_eq!(release_authorization_problems(&base), 0, "a receipt predating the field is disclosed, not judged");
+
+        // The same receipt, written by a binary that had the flag: now it is a hole.
+        let new_unauthorized = format!(
+            "{old}\n[receipt \"release\" \"host-prove\"]\n    disposition = done\n    \
+             evidence = v9.9.9@def\n    tool = host-lifecycle@0.48.0\n    recorded = 2026-07-28\n"
+        );
+        fs::write(base.join(LIFECYCLE_RECEIPTS), &new_unauthorized).unwrap();
+        assert_eq!(release_authorization_problems(&base), 1, "a knowing binary that recorded none is a hazard");
+
+        // And with the field present it clears. Presence is the whole test: the gate
+        // never asks whether `call/0050` really authorized anything.
+        let authorized = new_unauthorized.replace(
+            "    evidence = v9.9.9@def\n",
+            "    evidence = v9.9.9@def\n    authorization = call/0050\n",
+        );
+        fs::write(base.join(LIFECYCLE_RECEIPTS), &authorized).unwrap();
+        assert_eq!(release_authorization_problems(&base), 0, "presence clears it");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The field survives a write/read round trip, so a recorded authorization is still
+    // there when the gate looks. A stanza that serialised without it would read as a
+    // missing authorization forever after.
+    #[test]
+    fn the_authorization_round_trips_through_the_stanza() {
+        let r = Receipt {
+            phase: "release".to_string(),
+            component: Some("host-lint".to_string()),
+            disposition: "done".to_string(),
+            evidence: Some("v0.16.6@abc".to_string()),
+            reason: None,
+            authorization: Some("plan/0071#ship-it".to_string()),
+            tool: Some("host-lifecycle@0.48.0".to_string()),
+            recorded: Some("2026-07-28".to_string()),
+        };
+        let back = parse_receipts(&receipt_stanza(&r));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].authorization.as_deref(), Some("plan/0071#ship-it"));
     }
 
     // plan/0065 shims: the program name maps to the verb; host-lifecycle itself falls through.
