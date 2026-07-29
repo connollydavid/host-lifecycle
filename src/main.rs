@@ -2876,7 +2876,10 @@ fn entrance(args: &[String]) {
     for a in args {
         match a.as_str() {
             "--check" => check = true,
-            s if s.starts_with("--") => {}
+            s if s.starts_with("--") => {
+                eprintln!("host-lifecycle: unknown flag `{s}` (expected --check)");
+                process::exit(2);
+            }
             s => dir = s.to_string(),
         }
     }
@@ -3691,7 +3694,10 @@ fn tasks(args: &[String]) {
                 record_digests = true;
                 i += 1;
             }
-            s if s.starts_with("--") => i += 1,
+            s if s.starts_with("--") => {
+                eprintln!("host-lifecycle: unknown flag `{s}` (expected --check, --new, --record, --disposition, --evidence, --reason, --rederive, --record-digests)");
+                process::exit(2);
+            }
             s => {
                 dir = s.to_string();
                 i += 1;
@@ -9394,7 +9400,17 @@ fn receipt_record(args: &[String]) {
             "--evidence" => { evidence = args.get(i + 1).cloned(); i += 2; }
             "--reason" => { reason = args.get(i + 1).cloned(); i += 2; }
             "--authorization" => { authorization = args.get(i + 1).cloned(); i += 2; }
-            s if s.starts_with("--") => { i += 1; }
+            // A flag this parser does not know is refused, never skipped. Skipping it
+            // wrote a real receipt from a run meant to be a rehearsal: `--dry-run` is
+            // not a flag here, it was silently dropped, and the command recorded. An
+            // ignored flag means the caller asked for something the tool did not do
+            // and did not say so, which is the fail-open shape this project keeps
+            // paying for. The value after it is consumed too, so a dropped flag can
+            // also swallow a positional and change where the write lands.
+            s if s.starts_with("--") => {
+                eprintln!("host-lifecycle: unknown flag `{s}` (expected --component, --disposition, --evidence, --reason, --authorization)");
+                process::exit(2);
+            }
             s if phase.is_none() => { phase = Some(s.to_string()); i += 1; }
             s => { dir = s.to_string(); i += 1; }
         }
@@ -9632,7 +9648,10 @@ fn release(args: &[String]) {
             "--next" | "--preview" => { preview = true; i += 1; }
             "--change-class" => { change_class = args.get(i + 1).cloned(); i += 2; }
             "--authorized" => { authorized = args.get(i + 1).cloned(); i += 2; }
-            s if s.starts_with("--") => { i += 1; }
+            s if s.starts_with("--") => {
+                eprintln!("host-lifecycle: unknown flag `{s}` (expected --change-class, --authorized, --next, --preview, --record)");
+                process::exit(2);
+            }
             s if component.is_none() => { component = Some(s.to_string()); i += 1; }
             s => { dir = s.to_string(); i += 1; }
         }
@@ -10121,7 +10140,10 @@ fn release_record_skip(args: &[String]) {
     while i < args.len() {
         match args[i].as_str() {
             "--skip" => { cite = args.get(i + 1).cloned(); i += 2; }
-            s if s.starts_with("--") => { i += 1; }
+            s if s.starts_with("--") => {
+                eprintln!("host-lifecycle: unknown flag `{s}` (expected --skip)");
+                process::exit(2);
+            }
             s if component.is_none() => { component = Some(s.to_string()); i += 1; }
             s => { dir = s.to_string(); i += 1; }
         }

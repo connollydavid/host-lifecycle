@@ -1,0 +1,127 @@
+-- allium: 3
+-- host-lifecycle invocation: what happens to a flag the verb does not declare.
+--
+-- Every verb this tool exposes parses its own arguments, and each one used to
+-- skip an argument beginning with `--` that it did not recognise. The skip is
+-- silent, so a caller who asks for something the tool does not offer is told
+-- nothing and the operation proceeds as though the flag had never been typed.
+--
+-- That is not hypothetical. `--dry-run` is not a flag of `receipt --record`. It
+-- was dropped, the command ran to completion, and a real receipt landed in the
+-- append-only lifecycle log from an invocation intended as a rehearsal. The
+-- record cannot be un-appended; the only repair available was a history rewrite.
+--
+-- The failure has a second edge. A dropped flag consumes only itself, so the
+-- VALUE the caller wrote after it becomes a positional, and the positional a
+-- verb reads last is usually the directory it writes to. An unrecognised flag
+-- can therefore move where the write lands, not merely fail to change it.
+--
+-- Scope: the parse outcome and what an outcome permits. One entity per
+-- invocation, one per flag it carries, and the single claim worth gating — a
+-- refused invocation performs nothing. Excludes (implementation): the flag names
+-- each verb declares, the argument-order rules, the exact message text, and
+-- which verb is being run.
+
+-- === Entities ===
+
+-- One flag as written on the command line. `declared` is whether the verb being
+-- invoked offers it; the tool answers that from its own parser, never from the
+-- caller. A positional argument is not a Flag.
+entity Flag {
+    declared: Boolean
+}
+
+-- One run of one verb. `performed` is whether the operation the verb exists to
+-- do actually happened: a receipt appended, a lock written, a tree changed.
+-- Parsing is a distinct state from performing precisely so that a refusal has
+-- somewhere to land that is not "did the work and then complained".
+entity Invocation {
+    performed: Boolean
+    saw_undeclared: Boolean
+    status: parsing | refused | accepted
+    transitions status {
+        parsing -> refused
+        parsing -> accepted
+        terminal: refused, accepted
+    }
+}
+
+given {
+    invocation: Invocation
+}
+
+-- === Surface ===
+
+surface CommandLine {
+    facing operator: Operator
+    provides:
+        InvocationStarts(operator)
+        InvocationCompletes(operator)
+    @guarantee AnUndeclaredFlagIsNamed
+        -- The refusal names the flag it did not recognise and what the verb does
+        -- declare, so the caller can tell a typo from a capability the tool does
+        -- not have. A refusal that says only "usage" sends the reader to the
+        -- documentation to look for something that is not there.
+}
+
+entity Operator {
+    name: String
+}
+
+-- === Rules ===
+
+rule StartInvocation {
+    when: InvocationStarts(operator)
+    ensures: invocation.status = parsing
+    ensures: invocation.performed = false
+    ensures: invocation.saw_undeclared = false
+}
+
+-- An undeclared flag latches a fact onto the run rather than setting the verdict
+-- directly. Two rules that both set `status` from `parsing` are a conflict the
+-- analyser is right to reject: they race, and which one wins is an artefact of
+-- evaluation order rather than of the design. The parser reads every argument
+-- and then the outcome is decided once, which is also what the code does.
+-- Guarded on `parsing` so a flag seen after a settled outcome cannot reopen it.
+rule RecordUndeclaredFlag {
+    when: flag: Flag.created
+    requires: invocation.status = parsing and not flag.declared
+    ensures: invocation.saw_undeclared = true
+}
+
+rule VerdictRefused {
+    when: InvocationCompletes(operator)
+    requires: invocation.status = parsing and invocation.saw_undeclared
+    ensures: invocation.status = refused
+}
+
+rule VerdictAccepted {
+    when: InvocationCompletes(operator)
+    requires: invocation.status = parsing and not invocation.saw_undeclared
+    ensures: invocation.status = accepted
+}
+
+-- Only an accepted invocation performs. This is the rule the silent skip
+-- violated: it left the invocation in a state that performed without ever
+-- having been accepted, because nothing ever judged the flag.
+rule PerformAcceptedInvocation {
+    when: run: Invocation.status transitions_to accepted
+    ensures: invocation.performed = true
+}
+
+-- === Invariants ===
+
+-- The whole claim. A refused invocation writes nothing, which is what the
+-- integration test asserts by comparing the target file byte-for-byte either
+-- side of the refused run rather than trusting the exit code alone.
+invariant RefusedInvocationPerformsNothing {
+    for i in Invocations where i.status = refused: not i.performed
+}
+
+-- An invocation carrying a flag the verb does not declare never reaches
+-- accepted. Stated separately from the rule because it is the property that
+-- must hold however the parse is implemented, including for a verb added later.
+invariant AnUndeclaredFlagNeverReachesAccepted {
+    for i in Invocations where i.status = accepted:
+        not Flags.any(f => not f.declared)
+}

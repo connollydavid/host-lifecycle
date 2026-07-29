@@ -1,0 +1,43 @@
+# host-lifecycle-invocation.obligations — disposition for every `allium plan` obligation.
+# `host-lifecycle obligations host-lifecycle-invocation.allium --tests tests --strict-discharge`
+# checks this is complete (no obligation undispositioned, no stale entry, every
+# test: name real, every exercises= symbol referenced).
+#   <id> => test:<name> [exercises=<symbol>] | structural | waived: <reason>
+# structural = the spec's own `allium check`/`analyse` lane discharges it (field
+# and transition-graph shape), never a claim about behaviour.
+#
+# The behavioural obligations here discharge through the integration suite rather
+# than through unit tests, and deliberately: the refusal ends the process, and a
+# process that exits cannot be observed from inside its own test. `tests/exit_paths.rs`
+# runs the real binary and reads the exit code and output an operator would see.
+
+entity-fields.Flag                             => structural
+entity-fields.Invocation                       => structural
+entity-fields.Operator                         => structural
+transition-rejected.Invocation.status          => structural
+transition-terminal.Invocation.status          => structural
+surface-actor.CommandLine                      => structural
+surface-provides.CommandLine                   => structural
+
+# parsing -> refused is the whole point: the exact invocation that wrote a real
+# receipt from a rehearsal now ends here.
+transition-edge.Invocation.parsing.refused     => test:an_undeclared_flag_refuses_and_writes_nothing exercises=receipt
+transition-edge.Invocation.parsing.accepted    => test:every_arg_parser_refuses_an_undeclared_flag exercises=release
+
+# Not `structural`: the init is behaviour, and the checker refused the relabel.
+# Every run inits, so any accepted invocation exercises it.
+rule-success.StartInvocation                   => test:resolve_emits_the_form_asked_for exercises=resolve
+rule-success.RecordUndeclaredFlag              => test:an_unknown_flag_is_a_usage_error_rather_than_a_verdict exercises=resolve
+# The guard's other side: a declared flag latches nothing, so the run proceeds.
+rule-failure.RecordUndeclaredFlag.1            => test:resolve_emits_the_form_asked_for exercises=resolve
+
+rule-success.VerdictRefused                    => test:an_undeclared_flag_refuses_and_writes_nothing exercises=receipt
+rule-failure.VerdictRefused.1                  => test:resolve_emits_the_form_asked_for exercises=resolve
+rule-success.VerdictAccepted                   => test:resolve_emits_the_form_asked_for exercises=resolve
+rule-failure.VerdictAccepted.1                 => test:an_undeclared_flag_refuses_and_writes_nothing exercises=receipt
+rule-success.PerformAcceptedInvocation         => test:resolve_emits_the_form_asked_for exercises=resolve
+
+# The claim the exit code alone would not have caught: the target file is compared
+# byte-for-byte either side of the refused run.
+invariant.RefusedInvocationPerformsNothing     => test:an_undeclared_flag_refuses_and_writes_nothing exercises=receipt
+invariant.AnUndeclaredFlagNeverReachesAccepted => test:every_arg_parser_refuses_an_undeclared_flag exercises=release

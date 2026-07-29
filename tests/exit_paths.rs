@@ -896,3 +896,50 @@ fn a_dead_pointer_reopens_the_verify_receipt_through_the_manifest() {
     let _ = fs::remove_dir_all(&base);
     let _ = fs::remove_dir_all(&outer);
 }
+
+/// A flag the verb does not declare is refused, and nothing happens.
+///
+/// `--dry-run` is not a flag of `receipt --record`. It was silently dropped, the
+/// command ran to completion, and a real receipt landed in the append-only log from
+/// an invocation meant as a rehearsal. An ignored flag means the caller asked for
+/// something the tool did not do and did not say so.
+///
+/// Both halves are asserted, because the exit code alone would not have caught it:
+/// the run must refuse, AND the file it would have written must be byte-identical.
+#[test]
+fn an_undeclared_flag_refuses_and_writes_nothing() {
+    let base = fixture("undeclared-flag");
+    let receipts = base.join(RECEIPTS);
+    fs::write(&receipts, "[receipt \"release\" \"seed\"]\n    disposition = done\n").unwrap();
+    let before = fs::read_to_string(&receipts).unwrap();
+
+    let (code, out) = run(&[
+        "receipt", "--record", "release", "--component", "seed", "--disposition", "done",
+        "--evidence", "v1.0.0@abc", "--dry-run", base.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "an undeclared flag is a usage error, not a warning: {out}");
+    assert!(out.contains("unknown flag `--dry-run`"), "the message names the flag: {out}");
+    assert!(out.contains("--evidence"), "and names what the verb does declare: {out}");
+    assert_eq!(fs::read_to_string(&receipts).unwrap(), before, "a refused run writes nothing");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// The refusal is the verb's, not one verb's. Each of these swallowed an unknown
+/// flag before; a caller could mistype any of them and be told nothing.
+#[test]
+fn every_arg_parser_refuses_an_undeclared_flag() {
+    let base = fixture("undeclared-flag-verbs");
+    let d = base.to_str().unwrap();
+    for args in [
+        vec!["entrance", "--check", "--nope", d],
+        vec!["tasks", "--check", "--nope", d],
+        vec!["release", "--next", "host-lint", "--nope", d],
+        vec!["release", "--record", "x", "--skip", "call/0001", "--nope", d],
+        vec!["upgrade", "--next", "--nope", d],
+    ] {
+        let (code, out) = run(&args);
+        assert_eq!(code, 2, "{args:?} must refuse `--nope`, got {code}: {out}");
+        assert!(out.contains("--nope"), "{args:?} must name the flag: {out}");
+    }
+    let _ = fs::remove_dir_all(&base);
+}
