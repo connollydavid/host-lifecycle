@@ -125,3 +125,13 @@ invariant.DanglingConfirmedOnlyWhenTierUnused   => test:dangling_confirmed_only_
 # transition it does not have.
 rule-success.ObserveAbsentTierMarker           => test:marker_transition_absent_to_stamped exercises=read_tier_marker
 rule-failure.ObserveAbsentTierMarker.1         => test:marker_transition_stamped_to_retired exercises=read_tier_marker
+
+# call/0050 follow-on: `--fix` refuses the repo store. The spine states it and
+# dream.rs enforces it, and no rule bound it — a doctrine with nothing behind it,
+# guarding the append-only tier, which is the one store a wrong write cannot be
+# taken back from. `route = append` IS the repo route (RepoFindingsNeverEdit).
+rule-success.RecordRepoStoreFinding            => test:dream_verdict_error_on_fail_signal exercises=dream_outcome
+rule-failure.RecordRepoStoreFinding.1          => test:dream_no_false_error_verdict exercises=dream_outcome
+rule-success.VerdictFixRefusedOnRepoStore      => test:dream_transition_dreaming_to_error exercises=dream_outcome
+rule-failure.VerdictFixRefusedOnRepoStore.1    => test:dream_no_false_error_verdict exercises=dream_outcome
+invariant.FixNeverSettlesARepoStoreFinding     => test:dream_verdict_error_on_fail_signal exercises=dream_outcome

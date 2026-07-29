@@ -142,6 +142,7 @@ entity Dream {
     saw_finding: Boolean
     saw_confirmed: Boolean
     fix_mode: Boolean
+    saw_repo_finding: Boolean
     transitions status {
         dreaming -> clean
         dreaming -> advisory
@@ -351,6 +352,7 @@ rule StartDream {
     ensures: dream.status = dreaming
     ensures: dream.saw_finding = false
     ensures: dream.saw_confirmed = false
+    ensures: dream.saw_repo_finding = false
 }
 
 -- RecordFinding is guarded on dreaming: a late Finding under a settled
@@ -369,22 +371,40 @@ rule RecordConfirmedFinding {
     ensures: dream.saw_confirmed = true
 }
 
+-- The repo-store latch. `append` IS the repo route (RepoFindingsNeverEdit), so a
+-- finding that routes to append is a finding on the append-only tier.
+rule RecordRepoStoreFinding {
+    when: finding: Finding.created
+    requires: dream.status = dreaming and finding.route = append
+    ensures: dream.saw_repo_finding = true
+}
+
 rule VerdictFindings {
     when: DreamCompletes(project)
-    requires: dream.status = dreaming and dream.saw_confirmed
+    requires: dream.status = dreaming and dream.saw_confirmed and not (dream.fix_mode and dream.saw_repo_finding)
     ensures: dream.status = findings
 }
 
 rule VerdictAdvisory {
     when: DreamCompletes(project)
-    requires: dream.status = dreaming and dream.saw_finding and not dream.saw_confirmed
+    requires: dream.status = dreaming and dream.saw_finding and not dream.saw_confirmed and not (dream.fix_mode and dream.saw_repo_finding)
     ensures: dream.status = advisory
 }
 
 rule VerdictClean {
     when: DreamCompletes(project)
-    requires: dream.status = dreaming and not dream.saw_finding
+    requires: dream.status = dreaming and not dream.saw_finding and not (dream.fix_mode and dream.saw_repo_finding)
     ensures: dream.status = clean
+}
+
+-- `--fix` refuses the repo store. The spine states it, dream.rs enforces it, and
+-- until now no rule bound it — a doctrine with nothing behind it, on the guard
+-- protecting an append-only record, which is the one place that cannot be
+-- repaired after the fact. The run ends in error and applies nothing.
+rule VerdictFixRefusedOnRepoStore {
+    when: DreamCompletes(project)
+    requires: dream.status = dreaming and dream.fix_mode and dream.saw_repo_finding
+    ensures: dream.status = error
 }
 
 rule VerdictError {
@@ -398,6 +418,14 @@ rule VerdictError {
 -- A repo-store finding never routes to edit. Encoded at Finding creation time
 -- via the if/else in each detector's ensures block. The Kani harness at
 -- #write-tests proves `route_for(StoreLoc::Repo) == Route::Append` directly.
+-- --fix never settles a repo-store finding as a normal verdict. A run carrying
+-- one under --fix reaches error, so no path exists on which the tool applied a
+-- change to the append-only tier and then reported success.
+invariant FixNeverSettlesARepoStoreFinding {
+    for d in Dreams where d.fix_mode and d.saw_repo_finding and d.status != dreaming:
+        d.status = error
+}
+
 invariant RepoFindingsNeverEdit {
     for f in Findings where f.entry != null and f.entry.store.loc = repo:
         f.route != edit
