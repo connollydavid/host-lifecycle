@@ -2037,21 +2037,23 @@ fn is_record_layer(rel: &str) -> bool {
 /// The prose-hygiene audit (plan/0030 D4): run host-lint's `--docs` engine in-process via
 /// the linked `host_lint` crate, so the verdict is byte-identical to `host-lint --docs`
 /// without needing host-lint on PATH (this host's host-lint is embedded Where software).
-/// `load_lexicon` supplies the repo's LEXICON masking phrases and `run_docs` performs the
-/// shared `git ls-files` walk over tracked `.md` (honoring `.host-lintignore`, skipping
-/// symlinks and non-files), masking each declared phrase before detection — so a domain
-/// noun a project declares in its LEXICON clears the same trope here as at the CLI, and the
-/// embedded engine cannot drift from the standalone one (host-lifecycle#2). Returns the
+/// `run_docs` performs the shared `git ls-files` walk over tracked `.md` (honoring
+/// `.host-lintignore`, skipping symlinks and non-files), masking each declared phrase before
+/// detection — so a domain noun a project declares in its LEXICON clears the same trope here
+/// as at the CLI, and the embedded engine cannot drift from the standalone one
+/// (host-lifecycle#2). It resolves the lexicon governing each document from that document's
+/// own directory outward, bounded by `root`, so an audit of a repo that contains another one
+/// does not mask the inner document with the outer project's vocabulary. Returns the
 /// accumulated matches, or an error if the repo cannot be walked.
 fn prose_audit(root: &Path) -> Result<Vec<Match>, String> {
-    let allow = host_lint::load_lexicon(root).phrases_lc;
+    let scopes = host_lint::LexiconScopes::new(root);
     let ignore = load_lintignore(root)?;
     // The record, not the working tree. This runs inside the `verify` phase's recheck,
     // so reddening over an uncommitted note would assert something about a tree no
     // clone contains, and block a release over a file the release does not ship. The
     // hook keeps the wider corpus, because catching a document before it is staged is
     // its job (call/0048).
-    let scan = host_lint::run_docs(root, &allow, &ignore, host_lint::Corpus::Record)?;
+    let scan = host_lint::run_docs(root, &scopes, &ignore, host_lint::Corpus::Record)?;
     // A document listed and not read is a hole in the corpus, never a skip: reporting
     // the rest as clean would claim coverage this run cannot support.
     if let Some(first) = scan.unread.first() {
@@ -5958,6 +5960,11 @@ const CAPABILITIES: &[(&str, &str)] = &[
     ("refs-gate", "refs"),
     ("recipe-migration", "migrate-recipe"),
     ("receipt-migration", "migrate-receipts"),
+    // The embedded engine carries the word-choice split (call/0051): the catalog's two
+    // entries are two rules citing it by name, this project's own additions are a third
+    // that does not, and `harness` and `leverage` are matched as verbs. An adopter whose
+    // binary predates it answers absent, which is what the ledger entry needs to know.
+    ("word-choice-rules", "prose"),
 ];
 
 /// `host-lifecycle capability <name>`: exit 0 when this binary carries it, 1 when it
@@ -12564,7 +12571,7 @@ mod software_tests {
 
     // host-lifecycle#2: the in-process prose audit now runs host-lint's shared --docs
     // engine, so it consults the repo's LEXICON. A declared domain noun clears the
-    // ai-diction trope here exactly as at the CLI; before the shared-engine bump the
+    // word-choice trope here exactly as at the CLI; before the shared-engine bump the
     // embedded engine ignored LEXICON and the verify recheck warned forever.
     #[test]
     fn prose_audit_honours_lexicon_masking() {
@@ -12575,10 +12582,10 @@ mod software_tests {
         g(&["init", "-q", "-b", "main"]);
         g(&["config", "user.email", "t@t"]);
         g(&["config", "user.name", "t"]);
-        // "harness" is an ai-diction term; two occurrences trip the density warn.
+        // "landscape" is a grandiose-noun term; two occurrences trip the density warn.
         fs::write(
             base.join("doc.md"),
-            "# Title\n\nThe wdm-harness drives the lane. The harness emits a verdict.\n",
+            "# Title\n\nThe fitness-landscape drives the lane. The landscape emits a verdict.\n",
         )
         .unwrap();
         g(&["add", "-A"]);
@@ -12587,10 +12594,10 @@ mod software_tests {
         let bare = prose_audit(&base).unwrap();
         assert!(
             bare.iter().any(|m| m.severity == Severity::Warn),
-            "undeclared, the ai-diction term warns in the in-process audit"
+            "undeclared, the grandiose-noun term warns in the in-process audit"
         );
         // Declare the phrases: the audit masks them before detection, so the warn clears.
-        fs::write(base.join("LEXICON"), "wdm-harness\nthe harness\n").unwrap();
+        fs::write(base.join("LEXICON"), "fitness-landscape\nthe landscape\n").unwrap();
         g(&["add", "-A"]);
         g(&["commit", "-qm", "lexicon"]);
         let masked = prose_audit(&base).unwrap();
