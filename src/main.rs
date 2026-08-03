@@ -5843,6 +5843,11 @@ fn software_check_owed(root: &Path, recipe: &[Software], owed: &mut Vec<String>)
     // gates on; a drifted pin ships new adopters a stale tool. Inert unless this repo develops
     // host-lifecycle and carries the template submodule, so it fires only on the dev host.
     bad += template_pin_problems(root, recipe);
+    // call/0052: the family tools a component's own CI installs. Those revisions went unread
+    // while the template's were gated. Read as a floor rather than as the anchor (the
+    // template's equality argument is about distribution, and a component CI ships nothing),
+    // so only a rev outside the tool's history gates; below-anchor pins read advisory.
+    bad += component_workflow_pin_problems(root, recipe);
     bad
 }
 
@@ -7834,9 +7839,35 @@ enum TemplatePin {
 
 /// Read the host-lifecycle pin out of the template's prose-CI text. Pure, so it is unit-tested.
 fn template_hostlc_pin(prose_yaml: &str) -> TemplatePin {
+    workflow_tool_pin(prose_yaml, "host-lifecycle")
+}
+
+/// As above for any family tool: read a `cargo install --git …/<tool> --rev <sha>` pin out of
+/// workflow text. A component's own CI installs the tools its lanes need, and those revisions
+/// are recorded sites exactly as the template's are (call/0052).
+fn workflow_tool_pin(prose_yaml: &str, tool: &str) -> TemplatePin {
+    let (revs, saw_install) = workflow_tool_revs(prose_yaml, tool);
+    match revs.into_iter().next() {
+        Some(rev) => TemplatePin::Rev(rev),
+        None if saw_install => TemplatePin::InstallNoRev,
+        None => TemplatePin::NoInstall,
+    }
+}
+
+/// EVERY pinned revision of `tool` in workflow text, with whether an install was seen at all.
+/// All of them rather than the first: one workflow can install the same tool on several lines
+/// (host-lint's does), and reading only the first lets the rest drift unread, which is the
+/// defect this surface was found to have.
+fn workflow_tool_revs(prose_yaml: &str, tool: &str) -> (Vec<String>, bool) {
     let mut saw_install = false;
+    let mut revs = Vec::new();
     for line in prose_yaml.lines() {
-        if !(line.contains("cargo install") && line.contains("host-lifecycle")) {
+        if !(line.contains("cargo install") && line.contains(tool)) {
+            continue;
+        }
+        // `host-lint` is a prefix of `host-lint-ffmpeg`, so match the tool as a whole path
+        // segment; otherwise a sibling crate's install answers for the tool's pin.
+        if !line.split(['/', ' ']).any(|seg| seg.trim_end_matches(".git") == tool) {
             continue;
         }
         saw_install = true;
@@ -7844,18 +7875,14 @@ fn template_hostlc_pin(prose_yaml: &str) -> TemplatePin {
         while let Some(t) = toks.next() {
             if t == "--rev" {
                 if let Some(sha) = toks.next() {
-                    return TemplatePin::Rev(sha.trim_matches('"').to_string());
+                    revs.push(sha.trim_matches('"').to_string());
                 }
             } else if let Some(sha) = t.strip_prefix("--rev=") {
-                return TemplatePin::Rev(sha.trim_matches('"').to_string());
+                revs.push(sha.trim_matches('"').to_string());
             }
         }
     }
-    if saw_install {
-        TemplatePin::InstallNoRev
-    } else {
-        TemplatePin::NoInstall
-    }
+    (revs, saw_install)
 }
 
 /// Whether two hex commit ids designate the same commit: a case-insensitive prefix match (git
@@ -7987,6 +8014,152 @@ fn template_pin_problems(root: &Path, recipe: &[Software]) -> usize {
     }
 
     bad
+}
+
+/// A component's own CI installs family tools by pinned revision, and nothing read those
+/// revisions: eight sat below the anchor by up to nineteen releases while the whole-suite
+/// check stayed green, and what surfaced the first was a version string added to a verdict
+/// line for an unrelated purpose (call/0052).
+///
+/// **A component CI pin declares a floor, not the anchor.** The equality this decision first
+/// asserted came from `call/0038`, whose argument is about *distribution*: the template ships
+/// the tool to adopters, so a stale pin there hands out a stale tool. A component's CI ships
+/// nothing — it installs a lane driver to run `obligations` over its own spec — so the premise
+/// does not transfer. Equality is also wrong in both directions, which is what the convening
+/// on `call/0052` found unanimously: a uniformly stale tree satisfies it, and a consumer that
+/// has correctly taken a release violates it until the anchor moves. A floor is monotone and
+/// has neither pathology, so the ordering is what this reads.
+///
+/// Hence the tiers. Below the anchor is a satisfied floor: reported every run, never gating,
+/// bumped on the component's next release. Above it is the cascade window and equally benign.
+/// What gates is a rev that is *not in the tool's history at all* — unresolvable, or on a line
+/// the anchor never descended from. That is not a floor, it is a pin that names nothing, and
+/// CI would fail to install it. That red always means something and is always clearable, which
+/// is the property a gate has to have (plan/0051's retro-red trap: a gate that is red on
+/// pre-existing state and cannot be cleared cheaply teaches its readers to skim it).
+///
+/// Returns the count of revs outside the tool's history (0 clean). Inert where a component or
+/// a tool's store is unmaterialized, since an absent tree is a question this host cannot
+/// answer rather than a failure.
+fn component_workflow_pin_problems(root: &Path, recipe: &[Software]) -> usize {
+    let tools: Vec<(&str, &str)> = recipe.iter().map(|s| (s.name.as_str(), s.pin.as_str())).collect();
+    let mut bad = 0usize;
+    let mut below: Vec<String> = Vec::new();
+
+    for comp in recipe {
+        let wdir = worktree_dir(root, &comp.name, &comp.branch).join(".github").join("workflows");
+        let Ok(entries) = fs::read_dir(&wdir) else { continue };
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+            .collect();
+        files.sort();
+        for wf in files {
+            let Ok(yaml) = fs::read_to_string(&wf) else { continue };
+            let shown = wf.strip_prefix(root).unwrap_or(&wf).display().to_string();
+            for (tool, want) in &tools {
+                // A component installing itself pins nothing; the checkout is the source.
+                if *tool == comp.name.as_str() {
+                    continue;
+                }
+                let (revs, _) = workflow_tool_revs(&yaml, tool);
+                if revs.is_empty() {
+                    continue;
+                }
+                // The ordering is answered in the TOOL's store, not the component's: the
+                // component's objects know nothing of the tool's history.
+                let store = store_dir(root, tool);
+                for rev in revs {
+                    if sha_eq(&rev, want) {
+                        continue;
+                    }
+                    match pin_order(&store, &rev, want) {
+                        // Below the anchor: the floor holds, and the bump rides the
+                        // component's next release. A reading, not a work queue.
+                        Some(PinOrder::Below) => below.push(format!(
+                            "{shown} {tool} {}{} (anchor {})",
+                            short(&rev),
+                            describe_tag(&store, &rev),
+                            short(want)
+                        )),
+                        // Above the anchor: the cascade window, benign by construction.
+                        Some(PinOrder::Above) => println!(
+                            "ok       {shown} pins {tool} {} ahead of the anchor {} (cascade window)",
+                            short(&rev),
+                            short(want)
+                        ),
+                        // Not a floor at all: names a commit this tool's history has no
+                        // path to, so the install itself would fail.
+                        None => {
+                            println!(
+                                "HAZARD   {shown} pins {tool} {} — not in {tool}'s history (call/0052: a pin that names nothing is not a floor)",
+                                short(&rev)
+                            );
+                            bad += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Counted, enumerated, next action named — the tier this codebase already uses for an
+    // owed deps-bundle graduation. It must not hide behind a bare green, so it re-lists
+    // every run and a cold read surfaces it (plan/0057, Bly's over-report direction).
+    if !below.is_empty() {
+        println!("-- {} component CI pin(s) below the anchor; bump on each component's next release:", below.len());
+        for line in &below {
+            println!("     {line}");
+        }
+    }
+
+    bad
+}
+
+/// Where a recorded rev sits relative to the anchor in a tool's own history.
+#[derive(PartialEq, Debug)]
+enum PinOrder {
+    Below,
+    Above,
+}
+
+/// Order a recorded rev against the anchor inside `store`. `None` when the rev resolves to
+/// nothing here, or sits on a line neither commit descends from — the case that gates.
+fn pin_order(store: &Path, rev: &str, anchor: &str) -> Option<PinOrder> {
+    if !store.is_dir() {
+        // An unmaterialized tool store cannot answer the question; say nothing rather
+        // than report a hazard this host has no evidence for.
+        return Some(PinOrder::Below);
+    }
+    let is_ancestor = |a: &str, b: &str| {
+        // stderr is swallowed on purpose: a rev that resolves to nothing is an expected
+        // input here (it is the case that gates), and git's raw `fatal:` printed above
+        // this tool's own HAZARD line reads as a crash rather than as the finding.
+        process::Command::new("git")
+            .arg("-C")
+            .arg(store)
+            .args(["merge-base", "--is-ancestor", a, b])
+            .stderr(process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if is_ancestor(rev, anchor) {
+        Some(PinOrder::Below)
+    } else if is_ancestor(anchor, rev) {
+        Some(PinOrder::Above)
+    } else {
+        None
+    }
+}
+
+/// ` (v1.2.3)` when a rev carries a tag, else empty. The version is what an author reads a
+/// pin as, so the reading says it where it can.
+fn describe_tag(store: &Path, rev: &str) -> String {
+    match git_out(store, &["tag", "--points-at", rev]) {
+        Some(t) if !t.is_empty() => format!(" ({})", t.lines().next().unwrap_or("")),
+        _ => String::new(),
+    }
 }
 
 /// Root-level `.md` files the book places in a specific room (so the catch-all
@@ -12301,6 +12474,96 @@ mod software_tests {
         carried.sort();
         assert_eq!(carried, vec!["host-foo".to_string(), "host-lifecycle".to_string(), "host-lint".to_string()],
             "carried = .host-software ∩ tools/ (excludes allium the external tool and host-reference the non-distributed component)");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // call/0052: the family tools a component's own CI installs. Eight sat below the anchor by
+    // up to nineteen releases under a green whole-suite check, and a manual sweep by four
+    // reviewers found six of the eight, which is why this is a check and not a census.
+    //
+    // The pin is a FLOOR, so the ordering is what decides the tier: below the anchor reads
+    // advisory (the floor holds; the bump rides the next release), above it is the cascade
+    // window, and only a rev outside the tool's history gates. That last one is the case
+    // equality could never distinguish, and it is the only one where CI actually breaks.
+    #[test]
+    fn component_workflow_pin_reads_a_floor_and_gates_only_a_rev_outside_the_history() {
+        let base = std::env::temp_dir().join(format!("hl-cwpin-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wf = base.join("software").join("host-lint").join("main").join(".github").join("workflows");
+        fs::create_dir_all(&wf).unwrap();
+
+        // A real store for the tool: the ordering is answered in the TOOL's history, so a
+        // fixture that fakes it would prove nothing about the branch that matters.
+        let store = store_dir(&base, "host-lifecycle");
+        fs::create_dir_all(&store).unwrap();
+        let git = |dir: &Path, args: &[&str]| process::Command::new("git")
+            .arg("-C").arg(dir).args(args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(git(&store, &["init", "-q"]));
+        assert!(git(&store, &["config", "user.email", "t@t"]) && git(&store, &["config", "user.name", "t"]));
+        let commit = |msg: &str| {
+            fs::write(store.join("f"), msg).unwrap();
+            assert!(git(&store, &["add", "-A"]) && git(&store, &["commit", "-qm", msg]));
+            git_out(&store, &["rev-parse", "HEAD"]).unwrap()
+        };
+        let old = commit("old");            // below the anchor
+        let anchor = commit("anchor");      // the recorded pin
+        let newer = commit("newer");        // above the anchor (cascade window)
+        assert!(git(&store, &["tag", "v0.34.0", &old]), "a released floor carries its tag");
+        // A commit on a line the anchor never descended from: not a floor at all.
+        assert!(git(&store, &["checkout", "-q", "--orphan", "sideline"]));
+        let orphan = commit("orphan");
+        assert!(git(&store, &["checkout", "-q", "master"]) || git(&store, &["checkout", "-q", "main"]));
+
+        let mk = |name: &str, pin: &str| Software {
+            name: name.into(), url: "u".into(), pin: pin.into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        };
+        let recipe = vec![mk("host-lifecycle", &anchor), mk("host-lint", "9999999999999")];
+
+        let inst = |tool: &str, rev: &str| {
+            format!("      - name: install\n        run: cargo install --git https://github.com/connollydavid/{tool} --rev {rev} --root x\n")
+        };
+
+        // Below the anchor: a satisfied floor. Reported, never gating — this is the whole
+        // point of the reading, and the case equality wrongly turned red.
+        fs::write(wf.join("ci.yml"), inst("host-lifecycle", &old)).unwrap();
+        assert_eq!(component_workflow_pin_problems(&base, &recipe), 0, "a pin below the anchor is a satisfied floor, not a fault");
+
+        // Above the anchor: the cascade window a consumer sits in after correctly taking a
+        // release. Equality called this a violation, which is the second of finding one's
+        // two directions.
+        fs::write(wf.join("ci.yml"), inst("host-lifecycle", &newer)).unwrap();
+        assert_eq!(component_workflow_pin_problems(&base, &recipe), 0, "a pin ahead of the anchor is the cascade window, not a fault");
+
+        // Outside the tool's history: names nothing reachable, so `cargo install` fails. The
+        // one condition that earns a red, and it is always clearable.
+        fs::write(wf.join("ci.yml"), inst("host-lifecycle", &orphan)).unwrap();
+        assert_eq!(component_workflow_pin_problems(&base, &recipe), 1, "a rev outside the tool's history gates");
+        fs::write(wf.join("ci.yml"), inst("host-lifecycle", "0000000000000000000000000000000000000000")).unwrap();
+        assert_eq!(component_workflow_pin_problems(&base, &recipe), 1, "a rev that resolves to nothing gates");
+
+        // Matching, abbreviated: clean (git abbreviates, so the compare is prefix-tolerant).
+        fs::write(wf.join("ci.yml"), inst("host-lifecycle", &anchor[..8])).unwrap();
+        assert_eq!(component_workflow_pin_problems(&base, &recipe), 0, "a matching abbreviated rev is clean");
+
+        // TWO installs of the same tool in one file: both are read, not just the first. This is
+        // the shape host-lint's own CI has, and reading only the first left one unchecked.
+        fs::write(wf.join("ci.yml"), format!("{}{}", inst("host-lifecycle", &anchor), inst("host-lifecycle", &orphan))).unwrap();
+        assert_eq!(component_workflow_pin_problems(&base, &recipe), 1, "a second install of the same tool is read too");
+
+        // A component installing ITSELF pins nothing — the checkout is the source.
+        fs::write(wf.join("ci.yml"), inst("host-lint", &orphan)).unwrap();
+        assert_eq!(component_workflow_pin_problems(&base, &recipe), 0, "a component's own install is not a pin site");
+
+        // A tag is what an author reads a pin as, so the advisory says it where it can.
+        assert_eq!(describe_tag(&store, &old), " (v0.34.0)", "a released floor reports its version");
+        assert_eq!(describe_tag(&store, &anchor), "", "an untagged rev adds nothing");
+
+        // Inert where the worktree is not materialized: an absent tree is a question this host
+        // cannot answer, never a failure.
+        let _ = fs::remove_dir_all(base.join("software").join("host-lint"));
+        assert_eq!(component_workflow_pin_problems(&base, &recipe), 0, "inert when unmaterialized");
         let _ = fs::remove_dir_all(&base);
     }
 
