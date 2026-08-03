@@ -5848,6 +5848,10 @@ fn software_check_owed(root: &Path, recipe: &[Software], owed: &mut Vec<String>)
     // template's equality argument is about distribution, and a component CI ships nothing),
     // so only a rev outside the tool's history gates; below-anchor pins read advisory.
     bad += component_workflow_pin_problems(root, recipe);
+    // call/0052 finding two: the surface that started it. A manifest rev is compiled into the
+    // artifact the anchor records, so it is an equality claim about the anchor itself — unlike
+    // the CI pins above, which declare a floor and ship to nobody.
+    bad += component_manifest_pin_problems(root, recipe);
     bad
 }
 
@@ -8160,6 +8164,80 @@ fn describe_tag(store: &Path, rev: &str) -> String {
         Some(t) if !t.is_empty() => format!(" ({})", t.lines().next().unwrap_or("")),
         _ => String::new(),
     }
+}
+
+/// The value of an inline TOML `key = "value"` on one line, or `None`. Written for a cargo
+/// git dependency, whose conventional spelling here is a single inline table, and honest about
+/// that: a dependency split across lines is not read, and the caller says so.
+fn toml_inline_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let mut from = 0usize;
+    while let Some(i) = line[from..].find(key) {
+        let at = from + i;
+        // The key must stand alone, or `git` matches inside `github.com` and `rev` inside
+        // any word carrying it.
+        let before_ok = at == 0 || !line[..at].ends_with(|c: char| c.is_alphanumeric() || c == '-' || c == '_');
+        let rest = line[at + key.len()..].trim_start();
+        if before_ok {
+            if let Some(v) = rest.strip_prefix('=') {
+                let v = v.trim_start().strip_prefix('"')?;
+                return v.find('"').map(|e| &v[..e]);
+            }
+        }
+        from = at + key.len();
+    }
+    None
+}
+
+/// A component's own manifest git-depends on a sibling of this family, and that revision is
+/// compiled into the artifact `.host-software` records the hash of. `host-lifecycle` embeds
+/// `host-lint` as the engine its prose gate runs in process, so a drifted rev means the gate
+/// that closes a release and the CLI installed beside it can return different verdicts on the
+/// same file. Measured on 2026-07-29 the embedded engine was six releases behind the pin, and
+/// no check read it; what surfaced it was a version string added to a verdict line for an
+/// unrelated purpose (call/0052).
+///
+/// **Equality here, unlike the CI workflow pins.** The distinction is what the artifact is: a
+/// manifest rev determines the bytes the anchor records the hash of, so it is a claim about the
+/// anchor itself and the anchor is its own reference. A CI install is a lane driver that ships
+/// to nobody and declares a floor. Same family, same file tree, different claims.
+///
+/// Returns the drift count (0 clean). Inert where a component is unmaterialized.
+fn component_manifest_pin_problems(root: &Path, recipe: &[Software]) -> usize {
+    let tools: Vec<(&str, &str)> = recipe.iter().map(|s| (s.name.as_str(), s.pin.as_str())).collect();
+    let mut bad = 0usize;
+
+    for comp in recipe {
+        let manifest = worktree_dir(root, &comp.name, &comp.branch).join("Cargo.toml");
+        let Ok(toml) = fs::read_to_string(&manifest) else { continue };
+        let shown = manifest.strip_prefix(root).unwrap_or(&manifest).display().to_string();
+        for line in toml.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let Some(url) = toml_inline_value(line, "git") else { continue };
+            let dep = url.trim_end_matches('/').rsplit('/').next().unwrap_or("").trim_end_matches(".git");
+            let Some((_, want)) = tools.iter().find(|(t, _)| *t == dep) else { continue };
+            match toml_inline_value(line, "rev") {
+                Some(rev) if sha_eq(rev, want) => {}
+                Some(rev) => {
+                    println!(
+                        "HAZARD   {shown} embeds {dep} {} but .host-software pins {} (call/0052: the embedded engine is the recorded one)",
+                        short(rev),
+                        short(want)
+                    );
+                    bad += 1;
+                }
+                // A family dependency floating on a branch cannot re-derive: the artifact
+                // hash the anchor records would not be reproducible from the manifest.
+                None => {
+                    println!("HAZARD   {shown} git-depends on {dep} with no rev (call/0052: an unpinned family dep cannot re-derive)");
+                    bad += 1;
+                }
+            }
+        }
+    }
+
+    bad
 }
 
 /// Root-level `.md` files the book places in a specific room (so the catch-all
@@ -12474,6 +12552,65 @@ mod software_tests {
         carried.sort();
         assert_eq!(carried, vec!["host-foo".to_string(), "host-lifecycle".to_string(), "host-lint".to_string()],
             "carried = .host-software ∩ tools/ (excludes allium the external tool and host-reference the non-distributed component)");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // call/0052 finding two: the surface that started the decision. host-lifecycle embedded a
+    // host-lint six releases behind the pin, so the gate that closes a release and the CLI
+    // beside it could disagree on the same file, and nothing read it. Equality, not a floor:
+    // the rev is compiled into the artifact whose hash the anchor records.
+    #[test]
+    fn component_manifest_pin_gate_hazards_a_drifted_embedded_engine() {
+        let base = std::env::temp_dir().join(format!("hl-cmpin-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software").join("host-lifecycle").join("main");
+        fs::create_dir_all(&wt).unwrap();
+        let mk = |name: &str, pin: &str| Software {
+            name: name.into(), url: "u".into(), pin: pin.into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        };
+        let recipe = vec![mk("host-lifecycle", "aaaa111122223333"), mk("host-lint", "bbbb444455556666")];
+        let dep = |rev: &str| format!(
+            "[dependencies]\nhost-lint = {{ git = \"https://github.com/connollydavid/host-lint\", rev = \"{rev}\" }}\n"
+        );
+
+        // Drifted: the embedded engine is not the recorded one.
+        fs::write(wt.join("Cargo.toml"), dep("9999888877776666")).unwrap();
+        assert_eq!(component_manifest_pin_problems(&base, &recipe), 1, "a drifted embedded rev hazards");
+
+        // Reconciled, abbreviated: clean.
+        fs::write(wt.join("Cargo.toml"), dep("bbbb4444")).unwrap();
+        assert_eq!(component_manifest_pin_problems(&base, &recipe), 0, "a matching abbreviated rev is clean");
+
+        // Unpinned family dep: the artifact could not re-derive from the manifest.
+        fs::write(wt.join("Cargo.toml"),
+            "[dependencies]\nhost-lint = { git = \"https://github.com/connollydavid/host-lint\", branch = \"main\" }\n").unwrap();
+        assert_eq!(component_manifest_pin_problems(&base, &recipe), 1, "an unpinned family dep hazards");
+
+        // A commented-out dependency is not a dependency.
+        fs::write(wt.join("Cargo.toml"), format!("[dependencies]\n# {}", dep("9999888877776666").lines().nth(1).unwrap())).unwrap();
+        assert_eq!(component_manifest_pin_problems(&base, &recipe), 0, "a commented dep is not read");
+
+        // A NON-family git dep is none of this check's business, even drifted-looking, and its
+        // URL carries `git` inside `github.com` — the substring the key match must not take.
+        fs::write(wt.join("Cargo.toml"),
+            "[dependencies]\nserde = { git = \"https://github.com/serde-rs/serde\", rev = \"deadbeef\" }\n").unwrap();
+        assert_eq!(component_manifest_pin_problems(&base, &recipe), 0, "a non-family git dep is out of scope");
+
+        // `.git` suffix and a trailing slash both still name the tool.
+        fs::write(wt.join("Cargo.toml"),
+            "[dependencies]\nhost-lint = { git = \"https://github.com/connollydavid/host-lint.git\", rev = \"bbbb4444\" }\n").unwrap();
+        assert_eq!(component_manifest_pin_problems(&base, &recipe), 0, "a .git suffix still resolves the tool");
+
+        // The key match stands alone: `git` inside `github.com` and a bare `rev` word.
+        assert_eq!(toml_inline_value("x = { git = \"https://github.com/a/b\" }", "git"), Some("https://github.com/a/b"));
+        assert_eq!(toml_inline_value("x = { git = \"u\", rev = \"abc\" }", "rev"), Some("abc"));
+        assert_eq!(toml_inline_value("x = { git = \"u\", branch = \"main\" }", "rev"), None);
+
+        // Inert where the worktree is not materialized.
+        let _ = fs::remove_dir_all(base.join("software"));
+        assert_eq!(component_manifest_pin_problems(&base, &recipe), 0, "inert when unmaterialized");
         let _ = fs::remove_dir_all(&base);
     }
 
