@@ -718,13 +718,28 @@ fn a_capability_answers_for_the_binary_and_not_the_tree() {
     assert_eq!(code, 2, "a missing name is a usage error: {text}");
     assert!(text.contains("refs-check"), "and the usage lists what this binary carries: {text}");
 
-    // Every declared capability names a verb this binary actually dispatches, so the
-    // registry cannot drift into claiming one that was removed.
-    for name in ["refs-check", "refs-gate", "recipe-migration", "receipt-migration"] {
+    // Every name the usage lists answers carried. Read from the binary's own usage rather
+    // than from a copy here, so the listing and the lookup cannot disagree; a hardcoded
+    // list stops covering the next name added, which is the drift this guards.
+    let names: Vec<String> = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("names:"))
+        .expect("usage lists the declared names")
+        .split(',')
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    assert!(names.len() >= 6, "the registry is non-trivial: {names:?}");
+    for name in &names {
         let (code, _) = run(&["capability", name]);
         assert_eq!(code, 0, "declared capability {name} is carried");
     }
-    for verb in ["refs", "migrate-recipe", "migrate-receipts"] {
+
+    // The claim with teeth: every VERB a capability is declared against actually dispatches,
+    // so the registry cannot promise a mode that was removed or renamed. This list is
+    // hardcoded because the usage prints names and not verbs; extend it when a capability
+    // is declared against a verb not already here.
+    for verb in ["refs", "migrate-recipe", "migrate-receipts", "prose", "software"] {
         let (_, text) = run(&[verb]);
         assert!(
             !text.contains("usage: host-lifecycle <validate"),

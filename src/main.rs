@@ -5974,6 +5974,12 @@ const CAPABILITIES: &[(&str, &str)] = &[
     // that does not, and `harness` and `leverage` are matched as verbs. An adopter whose
     // binary predates it answers absent, which is what the ledger entry needs to know.
     ("word-choice-rules", "prose"),
+    // `software --check` reads the two component pin surfaces (call/0052): a manifest git
+    // dependency on a family sibling compared as equality, because it is compiled into the
+    // recorded artifact, and a CI workflow install read as a floor, because it ships to
+    // nobody. An adopter whose binary predates this answers absent, which is what the ledger
+    // entry needs to know before it claims the readings run.
+    ("component-pin-readings", "software"),
 ];
 
 /// `host-lifecycle capability <name>`: exit 0 when this binary carries it, 1 when it
