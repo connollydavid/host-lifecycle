@@ -5646,18 +5646,18 @@ fn upgrade_claim_problems(root: &Path) -> usize {
         }
         for d in &e.depends {
             if !is_applied(d) {
-                println!("HAZARD   upgrade {} applied but its dependency {} is not", short(&e.revision), short(d));
+                println!("HAZARD   upgrade {} applied but its dependency {} is not", short_id(&e.revision), short_id(d));
                 bad += 1;
             }
         }
         if !e.verify.is_empty() && !nested && !run_verify(root, &e.verify) {
-            println!("HAZARD   upgrade {} claimed applied but its verify no longer holds: {}", short(&e.revision), e.verify);
+            println!("HAZARD   upgrade {} claimed applied but its verify no longer holds: {}", short_id(&e.revision), e.verify);
             bad += 1;
         }
     }
     let pending = entries.iter().filter(|e| !is_applied(&e.revision)).count();
     match base {
-        Some(b) => println!("ok       upgrade: baseline {}, {} applied out of order, {} pending", short(b), applied.len(), pending),
+        Some(b) => println!("ok       upgrade: baseline {}, {} applied out of order, {} pending", short_id(b), applied.len(), pending),
         None => println!("note     upgrade: stamp has no baseline yet (run host-lifecycle upgrade to migrate)"),
     }
     bad
@@ -5843,14 +5843,10 @@ fn software_check_owed(root: &Path, recipe: &[Software], owed: &mut Vec<String>)
     // gates on; a drifted pin ships new adopters a stale tool. Inert unless this repo develops
     // host-lifecycle and carries the template submodule, so it fires only on the dev host.
     bad += template_pin_problems(root, recipe);
-    // call/0052: the family tools a component's own CI installs. Those revisions went unread
-    // while the template's were gated. Read as a floor rather than as the anchor (the
-    // template's equality argument is about distribution, and a component CI ships nothing),
-    // so only a rev outside the tool's history gates; below-anchor pins read advisory.
+    // The two component pin surfaces (call/0052). A CI install declares a floor, so only a rev
+    // outside the tool's history gates; a manifest rev is compiled into the recorded artifact,
+    // so it compares to the pin as equality.
     bad += component_workflow_pin_problems(root, recipe);
-    // call/0052 finding two: the surface that started it. A manifest rev is compiled into the
-    // artifact the anchor records, so it is an equality claim about the anchor itself — unlike
-    // the CI pins above, which declare a floor and ship to nobody.
     bad += component_manifest_pin_problems(root, recipe);
     bad
 }
@@ -5974,11 +5970,9 @@ const CAPABILITIES: &[(&str, &str)] = &[
     // that does not, and `harness` and `leverage` are matched as verbs. An adopter whose
     // binary predates it answers absent, which is what the ledger entry needs to know.
     ("word-choice-rules", "prose"),
-    // `software --check` reads the two component pin surfaces (call/0052): a manifest git
-    // dependency on a family sibling compared as equality, because it is compiled into the
-    // recorded artifact, and a CI workflow install read as a floor, because it ships to
-    // nobody. An adopter whose binary predates this answers absent, which is what the ledger
-    // entry needs to know before it claims the readings run.
+    // `software --check` reads the two component pin surfaces, a manifest rev as equality and
+    // a CI install as a floor (call/0052). An adopter whose binary predates them answers
+    // absent, which is what the ledger entry needs before it claims the readings run.
     ("component-pin-readings", "software"),
 ];
 
@@ -6268,6 +6262,18 @@ fn git_out_z(cwd: &Path, args: &[&str]) -> Option<Vec<String>> {
 /// First 12 chars of a SHA for display (ASCII hex, so byte-slicing is safe).
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
+}
+
+/// A ledger id as displayed: a hex id abbreviates the way git does, a named entry is never
+/// cut. The ledger keyed entries by SHA before it keyed them by name, so abbreviating both
+/// printed `LEXICON-declaration-is-a-report` as `LEXICON-decl`, which resolves to nothing in
+/// `UPGRADING.md` and is the form the tool then told the operator to type.
+fn short_id(id: &str) -> &str {
+    if id.len() > 12 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+        &id[..12]
+    } else {
+        id
+    }
 }
 
 /// sha256 of a file via `sha256sum`, or None if it can't be computed.
@@ -7537,7 +7543,7 @@ fn upgrade(args: &[String]) {
         if is_applied(&e.revision) {
             for d in &e.depends {
                 if !is_applied(d) {
-                    eprintln!("host-lifecycle: INCONSISTENT — {} is applied but its dependency {} is not", short(&e.revision), short(d));
+                    eprintln!("host-lifecycle: INCONSISTENT — {} is applied but its dependency {} is not", short_id(&e.revision), short_id(d));
                     inconsistent = true;
                 }
             }
@@ -7562,12 +7568,12 @@ fn upgrade(args: &[String]) {
         };
         let entry = entries.iter().find(|e| e.revision == id).expect("resolved id is a ledger entry");
         if is_applied(&id) {
-            println!("already applied: {} ({})", short(&id), entry.title);
+            println!("already applied: {} ({})", short_id(&id), entry.title);
             return;
         }
-        let unmet: Vec<String> = entry.depends.iter().filter(|d| !is_applied(d)).map(|d| short(d).to_string()).collect();
+        let unmet: Vec<String> = entry.depends.iter().filter(|d| !is_applied(d)).map(|d| short_id(d).to_string()).collect();
         if !unmet.is_empty() {
-            eprintln!("host-lifecycle: refuse — {} depends on unapplied {}", short(&id), unmet.join(" "));
+            eprintln!("host-lifecycle: refuse — {} depends on unapplied {}", short_id(&id), unmet.join(" "));
             process::exit(1);
         }
         // The declared floor, enforced at the one moment a claim is written. It was
@@ -7580,20 +7586,20 @@ fn upgrade(args: &[String]) {
             if version_below(running, &floor) {
                 eprintln!(
                     "host-lifecycle: refuse — {} requires host-lifecycle v{floor} and this is v{running}; bump the tool, then record",
-                    short(&id)
+                    short_id(&id)
                 );
                 process::exit(1);
             }
         }
         let via = if !entry.verify.is_empty() {
             if !run_verify(&root, &entry.verify) {
-                eprintln!("host-lifecycle: refuse — the verify post-condition for {} failed: {}", short(&id), entry.verify);
+                eprintln!("host-lifecycle: refuse — the verify post-condition for {} failed: {}", short_id(&id), entry.verify);
                 process::exit(1);
             }
             "verify".to_string()
         } else {
             let Some(cite) = unverified else {
-                eprintln!("host-lifecycle: refuse — {} declares no `verify`; recording an unverifiable claim needs `--unverified call/NNNN` (a decision authorizing it)", short(&id));
+                eprintln!("host-lifecycle: refuse — {} declares no `verify`; recording an unverifiable claim needs `--unverified call/NNNN` (a decision authorizing it)", short_id(&id));
                 process::exit(1);
             };
             if !cited_decision_exists(&root, cite) {
@@ -7613,7 +7619,7 @@ fn upgrade(args: &[String]) {
             process::exit(2);
         }
         let remaining = entries.iter().filter(|e| e.revision != id && !is_applied(&e.revision)).count();
-        println!("recorded {} ({}) via {}; {} still pending", short(&id), entry.title, via, remaining);
+        println!("recorded {} ({}) via {}; {} still pending", short_id(&id), entry.title, via, remaining);
         return;
     }
 
@@ -7624,7 +7630,7 @@ fn upgrade(args: &[String]) {
     if advance {
         let pos = |x: &str| ledger_ids.iter().position(|e| e == x);
         let Some(cur) = pos(&baseline) else {
-            eprintln!("host-lifecycle: baseline {} is not a ledger entry", short(&baseline));
+            eprintln!("host-lifecycle: baseline {} is not a ledger entry", short_id(&baseline));
             process::exit(1);
         };
         let mut new_pos = cur;
@@ -7636,7 +7642,7 @@ fn upgrade(args: &[String]) {
             }
         }
         if new_pos == cur {
-            println!("baseline already at the furthest contiguous-applied entry ({})", short(&baseline));
+            println!("baseline already at the furthest contiguous-applied entry ({})", short_id(&baseline));
             return;
         }
         let new_baseline = ledger_ids[new_pos].clone();
@@ -7664,7 +7670,7 @@ fn upgrade(args: &[String]) {
                 }
             }
         }
-        println!("advanced baseline {} -> {}; absorbed {} applied id(s)", short(&baseline), short(&new_baseline), absorbed.len());
+        println!("advanced baseline {} -> {}; absorbed {} applied id(s)", short_id(&baseline), short_id(&new_baseline), absorbed.len());
         return;
     }
 
@@ -7674,38 +7680,38 @@ fn upgrade(args: &[String]) {
     if next_only {
         match pending.iter().find(|e| deps_ready(e)) {
             Some(e) => {
-                println!("next: {}  {}", short(&e.revision), e.title);
+                println!("next: {}  {}", short_id(&e.revision), e.title);
                 println!("  action: {}", e.action);
                 if !e.requires.is_empty() {
                     println!("  requires: {}", e.requires);
                 }
-                println!("  record after applying: host-lifecycle upgrade --record {} {dir}", short(&e.revision));
+                println!("  record after applying: host-lifecycle upgrade --record {} {dir}", short_id(&e.revision));
             }
-            None if pending.is_empty() => println!("up to date (baseline {}, {} applied out of order)", short(&baseline), applied.len()),
+            None if pending.is_empty() => println!("up to date (baseline {}, {} applied out of order)", short_id(&baseline), applied.len()),
             None => println!("blocked: {} pending, none with all dependencies applied", pending.len()),
         }
         return;
     }
 
     if pending.is_empty() {
-        println!("up to date (baseline {}, {} applied out of order)", short(&baseline), applied.len());
+        println!("up to date (baseline {}, {} applied out of order)", short_id(&baseline), applied.len());
         return;
     }
-    println!("baseline {} — {} pending:", short(&baseline), pending.len());
+    println!("baseline {} — {} pending:", short_id(&baseline), pending.len());
     for e in &pending {
         let dep = if e.independent {
             "  [independent]".to_string()
         } else if e.depends.is_empty() {
             String::new()
         } else {
-            let unmet: Vec<String> = e.depends.iter().filter(|d| !is_applied(d)).map(|d| short(d).to_string()).collect();
+            let unmet: Vec<String> = e.depends.iter().filter(|d| !is_applied(d)).map(|d| short_id(d).to_string()).collect();
             if unmet.is_empty() {
                 "  [deps ok]".to_string()
             } else {
                 format!("  [blocked on: {}]", unmet.join(" "))
             }
         };
-        println!("  {}  {}{}", short(&e.revision), e.title, dep);
+        println!("  {}  {}{}", short_id(&e.revision), e.title, dep);
     }
 }
 
@@ -7760,18 +7766,18 @@ fn validate_ledger(entries: &[Upgrade]) -> Vec<String> {
     let mut problems = Vec::new();
     for e in entries {
         if e.independent && !e.depends.is_empty() {
-            problems.push(format!("{}: both `independent` and `depends`", short(&e.revision)));
+            problems.push(format!("{}: both `independent` and `depends`", short_id(&e.revision)));
         }
         for k in &e.restates {
             if !RECONCILE_KINDS.contains(&k.as_str()) {
-                problems.push(format!("{}: restates unknown kind `{k}` (known: {})", short(&e.revision), RECONCILE_KINDS.join(", ")));
+                problems.push(format!("{}: restates unknown kind `{k}` (known: {})", short_id(&e.revision), RECONCILE_KINDS.join(", ")));
             }
         }
         for d in &e.depends {
             if d == &e.revision {
-                problems.push(format!("{}: depends on itself", short(&e.revision)));
+                problems.push(format!("{}: depends on itself", short_id(&e.revision)));
             } else if !ids.contains(d.as_str()) {
-                problems.push(format!("{}: depends on unknown entry {}", short(&e.revision), short(d)));
+                problems.push(format!("{}: depends on unknown entry {}", short_id(&e.revision), short_id(d)));
             }
         }
     }
@@ -8026,27 +8032,15 @@ fn template_pin_problems(root: &Path, recipe: &[Software]) -> usize {
     bad
 }
 
-/// A component's own CI installs family tools by pinned revision, and nothing read those
-/// revisions: eight sat below the anchor by up to nineteen releases while the whole-suite
-/// check stayed green, and what surfaced the first was a version string added to a verdict
-/// line for an unrelated purpose (call/0052).
+/// Reads the family-tool revisions a component's own CI installs, as a FLOOR rather than as
+/// the anchor: that CI installs a lane driver and ships to nobody, so the revision states the
+/// minimum its lane needs. `call/0038`'s equality holds where a pin is distributed to
+/// adopters, which is the template's case and not this one (call/0052 carries the argument).
 ///
-/// **A component CI pin declares a floor, not the anchor.** The equality this decision first
-/// asserted came from `call/0038`, whose argument is about *distribution*: the template ships
-/// the tool to adopters, so a stale pin there hands out a stale tool. A component's CI ships
-/// nothing — it installs a lane driver to run `obligations` over its own spec — so the premise
-/// does not transfer. Equality is also wrong in both directions, which is what the convening
-/// on `call/0052` found unanimously: a uniformly stale tree satisfies it, and a consumer that
-/// has correctly taken a release violates it until the anchor moves. A floor is monotone and
-/// has neither pathology, so the ordering is what this reads.
-///
-/// Hence the tiers. Below the anchor is a satisfied floor: reported every run, never gating,
-/// bumped on the component's next release. Above it is the cascade window and equally benign.
-/// What gates is a rev that is *not in the tool's history at all* — unresolvable, or on a line
-/// the anchor never descended from. That is not a floor, it is a pin that names nothing, and
-/// CI would fail to install it. That red always means something and is always clearable, which
-/// is the property a gate has to have (plan/0051's retro-red trap: a gate that is red on
-/// pre-existing state and cannot be cleared cheaply teaches its readers to skim it).
+/// The ordering decides the tier, answered in the tool's own history. Below the anchor is a
+/// satisfied floor, reported and never gating. Above it is the cascade window a consumer
+/// occupies after correctly taking a release. Outside the history is not a floor at all: the
+/// revision names nothing reachable, the install itself fails, and that alone gates.
 ///
 /// Returns the count of revs outside the tool's history (0 clean). Inert where a component or
 /// a tool's store is unmaterialized, since an absent tree is a question this host cannot
@@ -8194,18 +8188,12 @@ fn toml_inline_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-/// A component's own manifest git-depends on a sibling of this family, and that revision is
-/// compiled into the artifact `.host-software` records the hash of. `host-lifecycle` embeds
-/// `host-lint` as the engine its prose gate runs in process, so a drifted rev means the gate
-/// that closes a release and the CLI installed beside it can return different verdicts on the
-/// same file. Measured on 2026-07-29 the embedded engine was six releases behind the pin, and
-/// no check read it; what surfaced it was a version string added to a verdict line for an
-/// unrelated purpose (call/0052).
-///
-/// **Equality here, unlike the CI workflow pins.** The distinction is what the artifact is: a
-/// manifest rev determines the bytes the anchor records the hash of, so it is a claim about the
-/// anchor itself and the anchor is its own reference. A CI install is a lane driver that ships
-/// to nobody and declares a floor. Same family, same file tree, different claims.
+/// Compares a component manifest's git dependency on a family sibling to that sibling's pin.
+/// Equality here, unlike the CI workflow pins above: a manifest rev is compiled into the
+/// artifact `.host-software` records the hash of, so it is a claim about the anchor and the
+/// anchor is its own reference (call/0052). `host-lifecycle` embeds `host-lint` as the engine
+/// its prose gate runs in process, so a drifted rev lets that gate and the CLI installed
+/// beside it return different verdicts on the same file.
 ///
 /// Returns the drift count (0 clean). Inert where a component is unmaterialized.
 fn component_manifest_pin_problems(root: &Path, recipe: &[Software]) -> usize {
@@ -12561,10 +12549,9 @@ mod software_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    // call/0052 finding two: the surface that started the decision. host-lifecycle embedded a
-    // host-lint six releases behind the pin, so the gate that closes a release and the CLI
-    // beside it could disagree on the same file, and nothing read it. Equality, not a floor:
-    // the rev is compiled into the artifact whose hash the anchor records.
+    // Equality, not a floor: a manifest rev is compiled into the artifact whose hash the
+    // anchor records, so a drifted one lets the in-process gate and the installed CLI
+    // disagree on the same file (call/0052).
     #[test]
     fn component_manifest_pin_gate_hazards_a_drifted_embedded_engine() {
         let base = std::env::temp_dir().join(format!("hl-cmpin-{}", process::id()));
@@ -12620,14 +12607,10 @@ mod software_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    // call/0052: the family tools a component's own CI installs. Eight sat below the anchor by
-    // up to nineteen releases under a green whole-suite check, and a manual sweep by four
-    // reviewers found six of the eight, which is why this is a check and not a census.
-    //
-    // The pin is a FLOOR, so the ordering is what decides the tier: below the anchor reads
+    // A component CI pin is a FLOOR, so the ordering decides the tier: below the anchor reads
     // advisory (the floor holds; the bump rides the next release), above it is the cascade
-    // window, and only a rev outside the tool's history gates. That last one is the case
-    // equality could never distinguish, and it is the only one where CI actually breaks.
+    // window, and only a rev outside the tool's history gates. That last case is the one
+    // equality cannot distinguish, and the only one where the install actually fails.
     #[test]
     fn component_workflow_pin_reads_a_floor_and_gates_only_a_rev_outside_the_history() {
         let base = std::env::temp_dir().join(format!("hl-cwpin-{}", process::id()));
@@ -13775,6 +13758,25 @@ mod book_tests {
         assert_eq!(derive_baseline(&base, &ledger, &c3).as_deref(), Some(c3.as_str()));
         assert_eq!(derive_baseline(&base, &ledger, &c4).as_deref(), Some(c4.as_str()));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // A named ledger id reaches the operator whole: abbreviating one yields a fragment that
+    // resolves to nothing in UPGRADING.md, and that fragment is what the tool prints in the
+    // command it tells the operator to run.
+    #[test]
+    fn a_named_ledger_id_is_displayed_whole_and_a_sha_abbreviates() {
+        assert_eq!(short_id("LEXICON-declaration-is-a-report"), "LEXICON-declaration-is-a-report");
+        assert_eq!(short_id("PIN-two-surfaces-two-claims"), "PIN-two-surfaces-two-claims");
+        // A full SHA still abbreviates the way git does, which is what the baseline and the
+        // `depends` fields hold.
+        assert_eq!(short_id("b6232a5c1d4e8f90a1b2c3d4e5f60718293a4b5c"), "b6232a5c1d4e");
+        // An already-abbreviated SHA is left alone rather than cut further.
+        assert_eq!(short_id("ff04a94"), "ff04a94");
+        // The instruction the tool prints has to be runnable: what it displays must resolve.
+        let ids: Vec<String> = vec!["LEXICON-declaration-is-a-report".to_string(), "PIN-two-surfaces-two-claims".to_string()];
+        for id in &ids {
+            assert_eq!(resolve_ledger_id(short_id(id), &ids).unwrap(), *id, "displayed id resolves back");
+        }
     }
 
     #[test]
