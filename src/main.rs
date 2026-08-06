@@ -10013,21 +10013,32 @@ fn release_context<'a>(root: &Path, recipe: &'a [Software], component: &str) -> 
     s
 }
 
-/// The current version of a component: an artifact-bearing crate reads its worktree
-/// `Cargo.toml` `[package] version`; a tool reads its latest `v*` git tag.
+/// The current version of a component: the nearest release tag (`vX.Y.Z`); a never-tagged
+/// artifact crate falls back to its worktree `Cargo.toml` `[package] version`.
 fn current_version(root: &Path, s: &Software) -> Result<String, String> {
     let work = worktree_dir(root, &s.name, &s.branch);
     // The current version is the last RELEASE TAG — the canonical released version —
     // never the worktree Cargo.toml. The release bumps Cargo.toml in place, so reading it
     // back would drift the version on a re-run (each attempt would re-bump from the last).
+    // The lookup matches only release-shaped tags: a component's bundle tags (vendor-vN,
+    // call/0043) share the ref namespace, and the nearest tag of any kind is as likely a
+    // bundle as a release. A matched tag that does not read as vX.Y.Z is an error, never
+    // a fallthrough, because the fallback below restarts versioning as if no release had
+    // ever happened.
     // A never-tagged component falls back to its declared Cargo.toml version (an artifact
     // crate, so its first release starts from the version it ships) or 0.0.0 (a tag-only
     // tool); the first release computes from the change-class either way (plan/0029).
-    if let Some(tag) = git_out(&work, &["describe", "--tags", "--abbrev=0"]) {
-        let v = tag.trim().trim_start_matches('v');
-        if !v.is_empty() {
-            return Ok(v.to_string());
+    if let Some(tag) = git_out(&work, &["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"]) {
+        let t = tag.trim();
+        let v = t.trim_start_matches('v');
+        let parts: Vec<&str> = v.split('.').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+            return Err(format!(
+                "{}: nearest release-shaped tag `{t}` does not read as vX.Y.Z; fix the tag (the untagged fallback is for a component with no release tags)",
+                s.name
+            ));
         }
+        return Ok(v.to_string());
     }
     if is_artifact_bearing(s) {
         let toml = fs::read_to_string(work.join("Cargo.toml")).map_err(|e| format!("cannot read {}/Cargo.toml: {e}", s.name))?;
@@ -12657,6 +12668,45 @@ mod software_tests {
         }
         assert!(git(&wt, &["remote", "remove", "origin"]));
         assert_eq!(pin_publication_problems(&base, &[mk(&local)]), 0, "inert where the store tracks no remote");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // Version discovery, constrained to the tag shape the release itself writes. A
+    // component's bundle tags (call/0043) share the ref namespace, and the unconstrained
+    // nearest-tag lookup read `vendor-v8` as version `endor-v8`; a bundle tag that
+    // happened to parse would instead mis-base the next bump, a wrong version rather
+    // than a stop (host-lifecycle#27).
+    #[test]
+    fn version_discovery_reads_release_tags_and_refuses_a_malformed_one() {
+        let base = std::env::temp_dir().join(format!("hl-vertags-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software").join("demo").join("main");
+        fs::create_dir_all(&wt).unwrap();
+        let git = |args: &[&str]| process::Command::new("git")
+            .arg("-C").arg(&wt).args(args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(git(&["init", "-q"]));
+        assert!(git(&["config", "user.email", "t@t"]) && git(&["config", "user.name", "t"]));
+        let s = Software {
+            name: "demo".into(), url: "u".into(), pin: String::new(), branch: "main".into(),
+            worktrees: vec![], lines: vec![], build: None, toolchain: None, deploy: None,
+            artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        };
+
+        assert!(git(&["commit", "-q", "--allow-empty", "-m", "one"]));
+        assert!(git(&["tag", "vendor-v8"]));
+        assert_eq!(current_version(&base, &s).as_deref(), Ok("0.0.0"),
+            "a bundle tag is not a release tag, so the untagged path applies");
+
+        assert!(git(&["commit", "-q", "--allow-empty", "-m", "two"]));
+        assert!(git(&["tag", "v0.2.0"]));
+        assert!(git(&["commit", "-q", "--allow-empty", "-m", "three"]));
+        assert!(git(&["tag", "vendor-v9"]));
+        assert_eq!(current_version(&base, &s).as_deref(), Ok("0.2.0"),
+            "a nearer bundle tag does not shadow the release tag behind it");
+
+        assert!(git(&["tag", "v3rc"]));
+        let err = current_version(&base, &s).unwrap_err();
+        assert!(err.contains("v3rc"), "a malformed release-shaped tag is refused by name: {err}");
         let _ = fs::remove_dir_all(&base);
     }
 
