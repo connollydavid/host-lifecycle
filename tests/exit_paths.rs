@@ -125,6 +125,49 @@ fn materialize_run_reaches_realized() {
     let _ = fs::remove_dir_all(&base);
 }
 
+// Upstream tracking rides the worktree. Without it the first push from a fresh clone
+// fails on configuration in a tree --verify-setup called complete, and an unattended
+// run halts right there (call/0049 rule 13; host-lifecycle#26). Three claims: a created
+// worktree tracks, an existing worktree heals on re-materialize, and a store that does
+// not track the branch has no upstream invented for it.
+#[test]
+fn materialize_sets_upstream_on_the_worktree_it_creates() {
+    let base = fixture("upstream");
+    let (src, pin) = seed_source(&base);
+    let host = base.join("host");
+    fs::create_dir_all(&host).unwrap();
+    fs::write(
+        host.join(".host-software"),
+        format!("[software \"demo\"]\n\turl = {}\n\tpin = {pin}\n", src.to_string_lossy()),
+    )
+    .unwrap();
+    let cfg = |wt: &Path, key: &str| -> Option<String> {
+        let out = Command::new("git").arg("-C").arg(wt).args(["config", "--get", key]).output().unwrap();
+        if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
+    };
+
+    let (code, text) = run(&["software", "--materialize", &host.to_string_lossy()]);
+    assert_eq!(code, 0, "{text}");
+    let wt = host.join("software").join("demo").join("main");
+    assert_eq!(cfg(&wt, "branch.main.remote").as_deref(), Some("origin"), "the created worktree tracks");
+    assert_eq!(cfg(&wt, "branch.main.merge").as_deref(), Some("refs/heads/main"));
+
+    git(&wt, &["config", "--unset", "branch.main.remote"]);
+    git(&wt, &["config", "--unset", "branch.main.merge"]);
+    let (code, _) = run(&["software", "--materialize", &host.to_string_lossy()]);
+    assert_eq!(code, 0);
+    assert_eq!(cfg(&wt, "branch.main.remote").as_deref(), Some("origin"), "an existing worktree heals");
+
+    git(&wt, &["config", "--unset", "branch.main.remote"]);
+    git(&wt, &["config", "--unset", "branch.main.merge"]);
+    git(&wt, &["update-ref", "-d", "refs/remotes/origin/main"]);
+    let (code, _) = run(&["software", "--materialize", &host.to_string_lossy()]);
+    assert_eq!(code, 0);
+    assert_eq!(cfg(&wt, "branch.main.remote"), None, "no tracking is invented from nothing");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
 // The advisory reader's exit split: nothing recorded is the one non-zero outcome,
 // and it routes to the op that records one. A recorded tree exits zero.
 #[test]

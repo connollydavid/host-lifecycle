@@ -5311,6 +5311,27 @@ fn add_worktree(bare: &Path, path: &Path, args: &[&str]) -> bool {
     true
 }
 
+/// Upstream tracking on a materialized branch whose remote-tracking ref exists: without
+/// it the first `git push` from a fresh clone fails on configuration in a tree every
+/// gate called complete, and an unattended run halts right there (call/0049 rule 13;
+/// host-lifecycle#26). Runs on the skip path too, so a worktree from before this fix
+/// heals on the next materialize. No upstream is invented for a branch origin does not
+/// carry, and an upstream already set is left as found.
+fn ensure_upstream(bare: &Path, label: &str, branch: &str) -> bool {
+    if !git_ok(bare, &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")]) {
+        return true;
+    }
+    if git_out(bare, &["config", "--get", &format!("branch.{branch}.remote")]).is_some() {
+        return true;
+    }
+    if git_ok(bare, &["branch", "-q", &format!("--set-upstream-to=origin/{branch}"), branch]) {
+        println!("upstream {label} -> origin/{branch}");
+        true
+    } else {
+        false
+    }
+}
+
 /// `--materialize`: clone the bare store and add the worktrees, skipping any that
 /// already exist. The bare clone needs its remote-tracking refspec set by hand —
 /// `git clone --bare` does not write one — before a `fetch`/`worktree` resolves a
@@ -5458,6 +5479,10 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
             println!("worktree {canon_label} @ {}", short(&s.pin));
             made += 1;
         }
+        if !ensure_upstream(&bare, &canon_label, &s.branch) {
+            eprintln!("host-lifecycle: cannot set upstream origin/{} for {canon_label}", s.branch);
+            materialize_abort(root, recipe);
+        }
         // Bare `worktrees = <branch> …`: a parallel line per branch (existing branch at
         // its tip, else created at the component pin), keyed by branch under the component.
         for branch in &s.worktrees {
@@ -5465,21 +5490,25 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
             let label = worktree_label(&s.name, branch);
             if wtp.exists() {
                 println!("skip     {label} (exists)");
-                continue;
-            }
-            let wtp_s = wtp.to_string_lossy().to_string();
-            let exists = git_ok(&bare, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]);
-            let args: Vec<&str> = if exists {
-                vec!["worktree", "add", &wtp_s, branch]
             } else {
-                vec!["worktree", "add", "-b", branch, &wtp_s, &s.pin]
-            };
-            if !add_worktree(&bare, &wtp, &args) {
-                eprintln!("host-lifecycle: worktree add {label} failed");
+                let wtp_s = wtp.to_string_lossy().to_string();
+                let exists = git_ok(&bare, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]);
+                let args: Vec<&str> = if exists {
+                    vec!["worktree", "add", &wtp_s, branch]
+                } else {
+                    vec!["worktree", "add", "-b", branch, &wtp_s, &s.pin]
+                };
+                if !add_worktree(&bare, &wtp, &args) {
+                    eprintln!("host-lifecycle: worktree add {label} failed");
+                    materialize_abort(root, recipe);
+                }
+                println!("worktree {label} ({branch})");
+                made += 1;
+            }
+            if !ensure_upstream(&bare, &label, branch) {
+                eprintln!("host-lifecycle: cannot set upstream origin/{branch} for {label}");
                 materialize_abort(root, recipe);
             }
-            println!("worktree {label} ({branch})");
-            made += 1;
         }
         // Explicit `worktree = <branch> <pin> …`: own branch at own pin, maybe off-tree.
         for w in &s.lines {
@@ -5499,6 +5528,10 @@ fn software_materialize(root: &Path, recipe: &[Software], partial: bool) {
             } else {
                 println!("worktree {target_s} ({} @ {})", w.branch, short(&w.pin));
                 made += 1;
+            }
+            if !ensure_upstream(&bare, &label, &w.branch) {
+                eprintln!("host-lifecycle: cannot set upstream origin/{} for {label}", w.branch);
+                materialize_abort(root, recipe);
             }
             // The in-structure handle: a symlink/junction so an external store still
             // surfaces under the host root (issue #2).
