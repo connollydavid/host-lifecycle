@@ -1592,9 +1592,9 @@ fn is_spec_ext(ext: &str) -> bool {
 }
 
 /// `--check`: apply the dictionary in memory, then run `host-lint` over the result
-/// (honouring `.host-lint-allow`) and report every tell that remains — these are
-/// undispositioned and need a dictionary or allow entry. Exit 1 on a remaining
-/// flag, 3 on a remaining warning, 0 when clean.
+/// (honouring the `LEXICON`, with `.host-lint-allow` merged as a deprecated alias) and
+/// report every tell that remains — these are undispositioned and need a dictionary or
+/// `LEXICON` entry. Exit 1 on a remaining flag, 3 on a remaining warning, 0 when clean.
 fn remap_check(root: &Path, rules: &[Rule], allow: &[String], ignore: &[String]) {
     process::exit(remap_check_code(root, rules, allow, ignore));
 }

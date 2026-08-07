@@ -43,7 +43,7 @@ hook signal that a proof's inputs drifted, without re-running the verifier.
 
 ## Remap — the enforced adoption rename
 
-An adoption clean-break renames old ordinal concepts (`Phase 4`) to content names.
+An adoption clean-break renames old ordinal concepts to content names.
 `remap` does that **deterministically** from a declared dictionary, so the rewrite
 is map-only by construction — no token outside the dictionary is ever touched, so
 there is no fabrication and no drift across files (the failure mode of a free-form,
@@ -53,18 +53,20 @@ fan-out rewrite).
     host-lifecycle remap --apply <dir> [--dry-run]  # apply it (archive-first; clean git tree required)
 
 The dictionary is a root `.host-remap` file, `old => new` per line (`#` comments,
-blanks ignored), matched case-insensitively and at word boundaries (`Phase 1`
-rewrites `Phase 1` but not `Phase 12`), longest match first (`Phase 5.0` before
-`Phase 5`):
+blanks ignored), matched case-insensitively and at word boundaries (an entry never
+matches inside a longer token), longest match first (of the overlapping entries
+below, the decimal one wins):
 
-    # .host-remap
-    Phase 5.0 => mcp-integration bring-up
-    Phase 5   => mcp-integration
-    Phase 4   => command-execution
+```host-lint:ignore
+# .host-remap
+Phase 5.0 => mcp-integration bring-up
+Phase 5   => mcp-integration
+Phase 4   => command-execution
+```
 
 - **`--check`** applies the dictionary in memory, runs `host-lint` over the result
-  (honouring the repo's `.host-lint-allow`), and reports every tell that *remains* —
-  the undispositioned ones, each needing a dictionary entry, an allow-list entry, or
+  (honouring the repo's `LEXICON`), and reports every tell that *remains* —
+  the undispositioned ones, each needing a dictionary entry, a `LEXICON` entry, or
   an acknowledgement. Exit 1 on a remaining flag, 3 on a warning, 0 when clean. So a
   clean `--check` is the gate: every detected concept has been consciously handled.
 - **`--apply`** writes the substitutions, skipping VCS/build dirs and submodule

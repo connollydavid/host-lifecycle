@@ -13,7 +13,7 @@ You turn the rename map from `classify` into a deterministic, map-only substitut
 1. Write the rename map into a `.host-remap` dictionary (`old => new` per line).
 2. `git mv` each ordinal-named file to its content-named home.
 3. `host-lifecycle remap --check <dir>` until clean: disposition **every** remaining
-   tell — a dictionary entry, a `.host-lint-allow` entry (genuine vocabulary), or an
+   tell — a dictionary entry, a `LEXICON` entry (genuine vocabulary), or an
    excluded path. (The discipline mirrors `obligations`: nothing left undispositioned.)
 4. Commit the clean tree (the verbatim archive), then `host-lifecycle remap --apply
    <dir>` (makes only the declared substitutions — map-only by construction).
