@@ -5848,6 +5848,9 @@ fn software_check_owed(root: &Path, recipe: &[Software], owed: &mut Vec<String>)
     // so it compares to the pin as equality.
     bad += component_workflow_pin_problems(root, recipe);
     bad += component_manifest_pin_problems(root, recipe);
+    // A pin naming a commit no remote carries resolves only on this machine; checked
+    // beside the other pin readings.
+    bad += pin_publication_problems(root, recipe);
     bad
 }
 
@@ -6262,6 +6265,57 @@ fn git_out_z(cwd: &Path, args: &[&str]) -> Option<Vec<String>> {
 /// First 12 chars of a SHA for display (ASCII hex, so byte-slicing is safe).
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
+}
+
+/// Whether a recorded commit is one another clone could resolve, given the remote-tracking
+/// branches that contain it. Pure, and split from the observation
+/// (`remote_branches_containing`) so the conclusion is testable against states this
+/// repository does not have.
+///
+/// `git branch -r --contains` exits zero for a commit no remote has and lists nothing,
+/// so an exit-code reading calls that commit published; the predicate reads the listed
+/// content instead.
+fn commit_is_published(remote_branches: &[String]) -> bool {
+    remote_branches.iter().any(|b| !b.trim().is_empty())
+}
+
+/// The remote-tracking branches in `dir` that contain `commit`. Offline: this reads refs the
+/// clone already has and never fetches, so it is honest in CI and in a fresh clone alike.
+fn remote_branches_containing(dir: &Path, commit: &str) -> Vec<String> {
+    git_out(dir, &["branch", "-r", "--contains", commit])
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Every recorded pin names a commit some remote carries (the `CLAUDE.md` workflow rule:
+/// never push a host commit whose software pin or submodule pointer is unpushed). A pin
+/// naming a commit only this machine holds is an anchor no other clone can resolve.
+///
+/// Returns the count of unpublished pins (0 clean). Inert where a component is unmaterialized,
+/// and inert where its store carries no remote-tracking refs at all: `--materialize` configures
+/// `refs/remotes/origin/*` when it clones, but skips that on a store it did not create, so a
+/// component migrated from the old `.git` layout can legitimately track nothing and is not
+/// failed for what it cannot report.
+fn pin_publication_problems(root: &Path, recipe: &[Software]) -> usize {
+    let mut bad = 0usize;
+    for s in recipe {
+        let wt = worktree_dir(root, &s.name, &s.branch);
+        if !wt.is_dir() {
+            continue;
+        }
+        if git_out(&wt, &["for-each-ref", "--count=1", "refs/remotes/"]).is_none_or(|r| r.trim().is_empty()) {
+            continue;
+        }
+        if !commit_is_published(&remote_branches_containing(&wt, &s.pin)) {
+            println!(
+                "HAZARD   {} pin {} is on no remote branch — unpushed, so no other clone resolves it",
+                s.name,
+                short(&s.pin)
+            );
+            bad += 1;
+        }
+    }
+    bad
 }
 
 /// A ledger id as displayed: a hex id abbreviates the way git does, a named entry is never
@@ -12546,6 +12600,63 @@ mod software_tests {
         carried.sort();
         assert_eq!(carried, vec!["host-foo".to_string(), "host-lifecycle".to_string(), "host-lint".to_string()],
             "carried = .host-software ∩ tools/ (excludes allium the external tool and host-reference the non-distributed component)");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The predicate alone, no git. The listing succeeds and lists nothing for a commit no
+    // remote has, so an exit-code reading passes exactly the case the rule exists to catch.
+    #[test]
+    fn a_commit_is_published_only_when_some_remote_branch_contains_it() {
+        assert!(commit_is_published(&["  origin/main".to_string()]));
+        assert!(commit_is_published(&["origin/main".to_string(), "upstream/main".to_string()]));
+        // The case the exit-code reading got wrong: the command succeeded, output was empty.
+        assert!(!commit_is_published(&[]));
+        // Whitespace is not a branch. `git branch` pads its output, and a naive line split
+        // over an empty result yields one blank entry that reads as a branch.
+        assert!(!commit_is_published(&["".to_string()]));
+        assert!(!commit_is_published(&["   ".to_string()]));
+    }
+
+    // The adapter, against a synthetic origin: a state this repository cannot exhibit,
+    // because every commit in it is published.
+    #[test]
+    fn the_pin_gate_hazards_a_commit_that_reached_no_remote() {
+        let base = std::env::temp_dir().join(format!("hl-pinpub-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let origin = base.join("origin");
+        let wt = base.join("software").join("demo").join("main");
+        fs::create_dir_all(&wt).unwrap();
+        let git = |dir: &Path, args: &[&str]| process::Command::new("git")
+            .arg("-C").arg(dir).args(args).status().map(|s| s.success()).unwrap_or(false);
+        fs::create_dir_all(&origin).unwrap();
+        assert!(git(&origin, &["init", "-q", "--bare"]));
+        assert!(git(&wt, &["init", "-q"]));
+        assert!(git(&wt, &["config", "user.email", "t@t"]) && git(&wt, &["config", "user.name", "t"]));
+        assert!(git(&wt, &["remote", "add", "origin", origin.to_str().unwrap()]));
+        assert!(git(&wt, &["commit", "-q", "--allow-empty", "-m", "published"]));
+        let published = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        assert!(git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]));
+        assert!(git(&wt, &["fetch", "-q", "origin"]));
+        assert!(git(&wt, &["commit", "-q", "--allow-empty", "-m", "local only"]));
+        let local = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        let mk = |pin: &str| Software {
+            name: "demo".into(), url: "u".into(), pin: pin.into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None, repro_exempt: None, hooks: None, deps_bundle: None, builds: vec![],
+        };
+        assert_eq!(pin_publication_problems(&base, &[mk(&published)]), 0, "a pushed pin is clean");
+        assert_eq!(pin_publication_problems(&base, &[mk(&local)]), 1, "a pin no remote carries hazards");
+
+        // Inert where the store tracks no remote at all. A bare clone creates no
+        // `refs/remotes/*`, and `--materialize` only configures that refspec on a store it
+        // cloned itself, so a migrated old-layout component tracks nothing and is skipped
+        // rather than failed.
+        for r in remote_branches_containing(&wt, &published) {
+            let _ = git(&wt, &["update-ref", "-d", &format!("refs/remotes/{}", r.trim())]);
+        }
+        assert!(git(&wt, &["remote", "remove", "origin"]));
+        assert_eq!(pin_publication_problems(&base, &[mk(&local)]), 0, "inert where the store tracks no remote");
         let _ = fs::remove_dir_all(&base);
     }
 
