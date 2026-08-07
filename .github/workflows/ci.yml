@@ -69,7 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install allium-cli (pinned 3.4.2)
-        run: cargo install allium-cli --version 3.4.2
+        run: cargo install --locked allium-cli --version 3.4.2
       - name: allium check
         run: allium check host-lifecycle.allium
       - name: allium analyse
