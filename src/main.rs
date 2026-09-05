@@ -5739,7 +5739,7 @@ fn upgrade_claim_problems(root: &Path) -> usize {
                 bad += 1;
             }
         }
-        if !e.verify.is_empty() && !nested && !run_verify(root, &e.verify) {
+        if !e.verify.is_empty() && !nested && !run_verify(root, &verify_command_after_rename(root, &e.verify)) {
             println!("HAZARD   upgrade {} claimed applied but its verify no longer holds: {}", short_id(&e.revision), e.verify);
             bad += 1;
         }
@@ -7545,6 +7545,31 @@ fn resolve_ledger_id(input: &str, ledger_ids: &[String]) -> Result<String, Strin
 /// Run an entry's `verify` post-condition (a shell command) in the repo root;
 /// `true` only on a zero exit. The maintainer-authored ledger command is trusted
 /// the way a CI step is.
+/// plan/0085 rename migration: a ledger `verify` written before the manual's
+/// rename names `CLAUDE.md`, which is now a one-line pointer to `AGENTS.md`.
+/// When both files exist at a named path's directory and the pointer signature
+/// holds (small file naming the manual), the condition is evaluated against the
+/// manual the pointer names — so an applied entry's post-condition follows the
+/// file it always meant, and the rename does not corrupt twenty-four applied
+/// claims at once.
+fn verify_command_after_rename(root: &Path, cmd: &str) -> String {
+    let is_pointer = |p: &Path| -> bool {
+        fs::read_to_string(p)
+            .map(|t| t.len() < 200 && t.contains("AGENTS.md"))
+            .unwrap_or(false)
+    };
+    let mut out = cmd.to_string();
+    // The longer path first, so the bare-name pass cannot re-replace its tail.
+    for (dir, token) in [("host-template", "host-template/CLAUDE.md"), ("", "CLAUDE.md")] {
+        let base = if dir.is_empty() { root.to_path_buf() } else { root.join(dir) };
+        if base.join("AGENTS.md").is_file() && is_pointer(&base.join("CLAUDE.md")) {
+            let replacement = if dir.is_empty() { "AGENTS.md".to_string() } else { format!("{dir}/AGENTS.md") };
+            out = out.replace(token, &replacement);
+        }
+    }
+    out
+}
+
 fn run_verify(root: &Path, cmd: &str) -> bool {
     let (sh, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
     process::Command::new(sh)
@@ -14496,4 +14521,33 @@ mod self_invoke_tests {
         let other = self_invoking("host-lint --all .");
         assert_eq!(other, "host-lint --all .");
     }
+}
+
+#[test]
+fn verify_conditions_follow_the_renamed_manual_through_the_pointer() {
+    let base = std::env::temp_dir().join(format!("hl-verify-rename-{}", process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("host-template")).unwrap();
+    // The pointer signature: a small file that names the manual.
+    fs::write(base.join("host-template/AGENTS.md"), "# The manual\n\nThe spine sentence lives here.\n").unwrap();
+    fs::write(base.join("host-template/CLAUDE.md"), "The operating manual is AGENTS.md. This file is a pointer.\n").unwrap();
+    fs::write(base.join("AGENTS.md"), "# Host manual\n\nA root spine sentence.\n").unwrap();
+    fs::write(base.join("CLAUDE.md"), "The operating manual is AGENTS.md. This file is a pointer.\n").unwrap();
+
+    // Both path shapes resolve to the manual the pointers name.
+    let migrated = verify_command_after_rename(&base, "grep -rqs \"sentence\" host-template/CLAUDE.md");
+    assert_eq!(migrated, "grep -rqs \"sentence\" host-template/AGENTS.md");
+    let migrated = verify_command_after_rename(&base, "grep -rqs \"sentence\" CLAUDE.md");
+    assert_eq!(migrated, "grep -rqs \"sentence\" AGENTS.md");
+    // A tree without the rename is evaluated verbatim.
+    let plain = std::env::temp_dir().join(format!("hl-verify-rename-plain-{}", process::id()));
+    fs::create_dir_all(&plain).unwrap();
+    let unchanged = verify_command_after_rename(&plain, "grep -rqs \"x\" CLAUDE.md");
+    assert_eq!(unchanged, "grep -rqs \"x\" CLAUDE.md");
+
+    // End to end at the shell: the migrated condition holds where the original
+    // would have failed.
+    assert!(run_verify(&base, &verify_command_after_rename(&base, "grep -rqs \"spine sentence\" host-template/CLAUDE.md")));
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&plain);
 }
