@@ -2,7 +2,7 @@
 //!
 //! Markdown-per-entry storage at `~/.host-memory/<project>/`, with a
 //! `MEMORY.md` index and `[[slug]]` cross-entry links. The repo `MEMORY.md`
-//! is the append-only tier (governed by CLAUDE.md section 6, read elsewhere);
+//! is the append-only tier (governed by the manual (AGENTS.md) section 6, read elsewhere);
 //! this module owns the editable per-user tier that `host-lifecycle dream`
 //! audits and that the MCP `memory_*` tools (plan/0065 + plan/0073) read and
 //! write.

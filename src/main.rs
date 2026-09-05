@@ -969,7 +969,7 @@ fn version(dir: Option<&String>) {
 }
 
 /// `classify <dir>` — print the migration case: `c` if the repo carries a stamp
-/// (ours, prior), `b` if it has a CLAUDE.md but no stamp (foreign governance),
+/// (ours, prior), `b` if it has a manual (AGENTS.md or the CLAUDE.md pointer) but no stamp (foreign governance),
 /// `a` if it has neither (greenfield).
 fn classify(dir: Option<&String>) {
     let Some(dir) = dir else {
@@ -983,7 +983,10 @@ fn classify(dir: Option<&String>) {
     }
     println!(
         "{}",
-        classify_case(root.join(STAMP).is_file(), root.join("CLAUDE.md").is_file())
+        classify_case(
+            root.join(STAMP).is_file(),
+            root.join("AGENTS.md").is_file() || root.join("CLAUDE.md").is_file(),
+        )
     );
 }
 
@@ -1296,7 +1299,7 @@ struct Rule {
 /// touched (no fabrication, no drift across files). `--check` reports the tells
 /// that would remain (undispositioned — they need a dictionary or allow entry);
 /// `--apply` writes the substitutions, refusing unless the git tree is clean so
-/// the prior commit is the verbatim archive (`CLAUDE.md` §6).
+/// the prior commit is the verbatim archive (the manual's append-only section).
 fn remap(args: &[String]) {
     let mut mode: Option<&str> = None;
     let mut dry = false;
@@ -1654,7 +1657,7 @@ fn remap_check_code(root: &Path, rules: &[Rule], allow: &[String], ignore: &[Str
 }
 
 /// `--apply`: write the substitutions. Refuses unless the git tree is clean, so
-/// the prior commit archives the originals verbatim (`CLAUDE.md` §6). `--dry-run`
+/// the prior commit archives the originals verbatim (the manual's append-only section). `--dry-run`
 /// previews without the guard and without writing.
 fn remap_apply(root: &Path, rules: &[Rule], ignore: &[String], dry: bool) {
     // An empty dictionary renames nothing, so it is a fail-safe no-op that writes nothing and
@@ -6121,7 +6124,7 @@ fn dangling_generated_links(root: &Path) -> Vec<String> {
 /// The recorded mode of every entry point this corpus invokes in place.
 ///
 /// No gate in this project read a file mode, and the cost was silent: `./bootstrap.sh`
-/// — the one command the host's own CLAUDE.md names for a fresh clone — was recorded
+/// — the one command the host's own manual names for a fresh clone — was recorded
 /// `100644` and exited 126, and the same defect landed on four other scripts. Every
 /// symptom arrived somewhere other than the cause (a CI step "failing", a documented
 /// command "not working"), and a filesystem with no executable bit re-introduces it on
@@ -6373,7 +6376,7 @@ fn remote_branches_containing(dir: &Path, commit: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every recorded pin names a commit some remote carries (the `CLAUDE.md` workflow rule:
+/// Every recorded pin names a commit some remote carries (the manual's workflow rule:
 /// never push a host commit whose software pin or submodule pointer is unpushed). A pin
 /// naming a commit only this machine holds is an anchor no other clone can resolve.
 ///
@@ -8376,7 +8379,9 @@ fn component_manifest_pin_problems(root: &Path, recipe: &[Software]) -> usize {
 
 /// Root-level `.md` files the book places in a specific room (so the catch-all
 /// Reference section does not list them twice).
-const PLACED_ROOT_MD: [&str; 7] = ["SUMMARY.md", "README.md", "MEMORY.md", "CLAUDE.md", "PLAN.md", "home.md", "index.md"];
+const PLACED_ROOT_MD: [&str; 8] = [
+    "SUMMARY.md", "README.md", "MEMORY.md", "AGENTS.md", "CLAUDE.md", "PLAN.md", "home.md", "index.md",
+];
 
 /// A published section of the book — one per room, emitted in lifecycle order
 /// (Who → What/When → Where → Why → How → Memory). A section with no content page
@@ -8646,11 +8651,21 @@ fn plan_software(root: &Path) -> Section {
     Section { title: "Software: where".to_string(), room: "software", required: !pages.is_empty(), pages }
 }
 
-/// The How room: `CLAUDE.md` (the operating manual), then a `reference/` dir if
-/// present, then any loose root `.md` not already placed in another room — so no
-/// existing top-level doc is silently dropped from the published record.
+/// The How room: `AGENTS.md` (the operating manual; the `CLAUDE.md` pointer is
+/// placed beside it for tools that look for the old name), then a `reference/`
+/// dir if present, then any loose root `.md` not already placed in another room
+/// — so no existing top-level doc is silently dropped from the published record.
 fn plan_reference(root: &Path) -> Section {
     let mut pages = Vec::new();
+    let agents = root.join("AGENTS.md");
+    if agents.is_file() {
+        pages.push(Page {
+            dest: "AGENTS.md".to_string(),
+            label: label_for(&agents, "AGENTS"),
+            depth: 0,
+            body: PageBody::Copy(agents),
+        });
+    }
     let claude = root.join("CLAUDE.md");
     if claude.is_file() {
         pages.push(Page {
@@ -13495,7 +13510,7 @@ mod software_tests {
         assert!(hz[0].contains("drift.md:3") && hz[0].contains("host-prove"), "hazard names file:line and the omission: {hz:?}");
         // a doc that QUOTES the marker in inline code is documentation, not a directive:
         // the placeholder kind would be unknown, but the backtick span suppresses it (the
-        // spine and every case-(a) adopter carry this example in their CLAUDE.md).
+        // spine and every case-(a) adopter carry this example in their manual).
         fs::write(base.join("ok.md"), "Develops host-lint, host-lifecycle, host-prove, host-grammar. <!-- host-reconcile: components -->\nIt carries an inline `<!-- host-reconcile: KIND -->` annotation.\n").unwrap();
         g(&["add", "-A"]);
         g(&["commit", "-qm", "doc"]);

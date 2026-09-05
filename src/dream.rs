@@ -1131,12 +1131,12 @@ fn detect_append_only_violations(path: &Path) -> (Vec<Finding>, bool) {
             state: String::new(),
             route: Route::Append,
             explanation: format!(
-                "section `{section}` has body removals in git history; the repo MEMORY.md is append-only (CLAUDE.md section 6); if the body changed, append a correction with a forward [[link]] instead"
+                "section `{section}` has body removals in git history; the repo MEMORY.md is append-only (the manual's append-only section); if the body changed, append a correction with a forward [[link]] instead"
             ),
             // Bespoke: an append-only violation is already an in-place edit; the
             // imperative is to restore and append, never to edit further.
             suggestion: format!(
-                "The repo MEMORY.md section `{section}` was edited in place — a CLAUDE.md §6 violation. Append a new dated correction that restores the removed text and names the violated section with a forward `[[link]]`; the restoration rides the append. Never edit repo entries in place."
+                "The repo MEMORY.md section `{section}` was edited in place — an append-only-rule violation. Append a new dated correction that restores the removed text and names the violated section with a forward `[[link]]`; the restoration rides the append. Never edit repo entries in place."
             ),
         });
     }
