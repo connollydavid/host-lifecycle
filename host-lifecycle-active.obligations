@@ -1,0 +1,64 @@
+# host-lifecycle-active.obligations — disposition for every `allium plan`
+# obligation of the declared active corpus (plan/0085). Checked with
+#   host-lifecycle obligations host-lifecycle-active.allium --tests src --tests tests --strict-discharge
+# The declared corpus is policy in host-lifecycle: the prose verb reads the
+# declaration, escalates warns to flags inside it, and discloses the non-ASCII
+# census. Detection is untouched in host-lint. `CensusRow.non_ascii` is an
+# accepted info: it is the disclosure's payload, a creation fact the emission
+# carries, never a rule-written field.
+
+# --- Spec-integrity (covered by the check/analyse lane) ---
+enum-comparable.ViolationKind                  => structural
+entity-fields.DeclaredFile                     => structural
+entity-fields.EngineVerdict                    => structural
+entity-fields.CensusRow                        => structural
+entity-fields.Violation                        => structural
+entity-fields.ActiveRun                        => structural
+# The two transition edges are the verdict rules' doing, so they are discharged
+# by the tests that drive each edge, not by the structural lane.
+transition-edge.ActiveRun.checking.clean       => test:the_census_discloses_non_ascii_without_flagging_it exercises=prose: clean
+transition-edge.ActiveRun.checking.flagged     => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=prose regression
+transition-rejected.ActiveRun.status           => structural
+transition-terminal.ActiveRun.status           => structural
+surface-actor.ActiveCorpusCheck                => structural
+surface-provides.ActiveCorpusCheck             => structural
+
+# --- The run lifecycle ---
+rule-success.StartActiveRun                    => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=prose
+
+# --- The strict tier ---
+rule-success.DetectEscalatedWarning            => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=strict: declared active corpus
+rule-failure.DetectEscalatedWarning.1          => test:an_undeclared_file_keeps_its_advisory_tier exercises=warning:
+rule-entity-creation.DetectEscalatedWarning.1  => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=strict: declared active corpus
+rule-success.DetectEngineFlag                  => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=declared active corpus
+rule-failure.DetectEngineFlag.1                => test:an_undeclared_file_keeps_its_advisory_tier exercises=warning:
+rule-entity-creation.DetectEngineFlag.1        => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=declared active corpus
+
+# --- The declaration's population ---
+rule-success.DetectMissingDeclared             => test:a_missing_declared_file_is_a_violation_never_a_smaller_corpus exercises=declared in the active corpus and absent
+rule-failure.DetectMissingDeclared.1           => test:a_missing_declared_file_is_a_violation_never_a_smaller_corpus exercises=declared in the active corpus and absent
+rule-entity-creation.DetectMissingDeclared.1   => test:a_missing_declared_file_is_a_violation_never_a_smaller_corpus exercises=declared in the active corpus and absent
+rule-success.DetectUnreadableDeclared          => test:an_unreadable_declared_file_gates exercises=unreadable
+rule-failure.DetectUnreadableDeclared.1        => test:an_unreadable_declared_file_gates exercises=unreadable
+rule-entity-creation.DetectUnreadableDeclared.1 => test:an_unreadable_declared_file_gates exercises=unreadable
+
+# --- The census: counted, disclosed, never judged ---
+rule-success.RecordCensus                      => test:the_census_discloses_non_ascii_without_flagging_it exercises=census:
+rule-failure.RecordCensus.1                    => test:the_census_discloses_non_ascii_without_flagging_it exercises=census:
+rule-success.RecordViolation                   => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=prose regression
+rule-failure.RecordViolation.1                 => test:the_census_discloses_non_ascii_without_flagging_it exercises=prose:
+rule-success.DiscloseCensus                    => test:the_census_discloses_non_ascii_without_flagging_it exercises=never on script
+rule-failure.DiscloseCensus.1                  => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=strict: declared active corpus
+
+# --- The verdict ---
+rule-success.VerdictFlagged                    => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=prose regression
+rule-failure.VerdictFlagged.1                  => test:the_census_discloses_non_ascii_without_flagging_it exercises=census:
+rule-success.VerdictClean                      => test:the_census_discloses_non_ascii_without_flagging_it exercises=prose: clean
+rule-failure.VerdictClean.1                    => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=prose regression
+rule-success.VerdictError                      => test:an_unreadable_declaration_fails_closed exercises=cannot be read
+rule-failure.VerdictError.1                    => test:an_unreadable_declaration_fails_closed exercises=cannot be read
+
+# --- Invariants ---
+invariant.CensusNamesPresentFiles              => test:the_census_discloses_non_ascii_without_flagging_it exercises=census:
+invariant.FlaggedSawViolation                  => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=prose regression
+invariant.CleanSawNoViolation                  => test:the_census_discloses_non_ascii_without_flagging_it exercises=prose: clean

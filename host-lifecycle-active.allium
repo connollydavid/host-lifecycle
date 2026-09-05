@@ -1,0 +1,196 @@
+-- allium: 3
+-- host-lifecycle active: the declared always-loaded corpus, the strict tier,
+-- and the non-ASCII census (plan/0085).
+--
+-- A project declares its always-loaded files in a `[corpus "active"]` stanza of
+-- the lifecycle manifest, one `file = <path>` entry each, explicit paths only.
+-- The prose verb reads the declaration and gives every declared file a stricter
+-- reading than any other document carries: a warning the engine would advise is
+-- a flag here, because the always-loaded text is the instruction every session
+-- reads, and advice to the instruction is a defect of the instruction.
+--
+-- The census counts non-ASCII bytes in the declared corpus and discloses the
+-- count on every verdict, gating nothing. Its expected populations are named in
+-- the plan (Chinese script awaiting the deferred translation, the IPA of the
+-- pronunciation lines); the count exists so a third population is news, never
+-- so that any of them is forbidden. The charset audit (2026-09-05) is the
+-- boundary: no surface outside host-lint gates character content, and this spec
+-- must not become one.
+--
+-- Detection is untouched in host-lint. The engine reports flags and warnings
+-- per file as it always has; this spec models the policy that reads those
+-- verdicts. The corpus is declared, never discovered: a declared file the walk
+-- cannot find is a violation, never a smaller corpus.
+
+-- Why a declared file landed in violations. `warning_escalated` is the strict
+-- tier itself: the engine advised, the declaration promotes. `engine_flag` is a
+-- flag the engine already carried. `missing` and `unreadable` are holes in the
+-- declaration's population, and a verdict over a corpus with a hole in it is a
+-- claim the run cannot make.
+enum ViolationKind {
+    warning_escalated
+    engine_flag
+    missing
+    unreadable
+}
+
+-- A document the recipe declares as always-loaded. Presence and readability are
+-- facts the walk observes, the way the record corpus observes them.
+entity DeclaredFile {
+    present: Boolean
+    readable: Boolean
+}
+
+-- The embedded engine's verdict for one declared file. The counts are creation
+-- facts the policy reads and never edits: detection lives in host-lint.
+entity EngineVerdict {
+    file: DeclaredFile
+    warns: Integer
+    flags: Integer
+}
+
+-- The census row for one declared file: its non-ASCII byte count, disclosed
+-- and never judged.
+entity CensusRow {
+    file: DeclaredFile
+    non_ascii: Integer
+}
+
+-- One violation on the declared corpus: one blocking line.
+entity Violation {
+    file: DeclaredFile
+    kind: ViolationKind
+}
+
+-- One `prose` run over a declared corpus. The census total is carried as its
+-- per-file rows; the run latches only that the census is non-empty, so the
+-- disclosure can fire without the spec doing arithmetic.
+entity ActiveRun {
+    status: checking | clean | flagged
+    saw_violation: Boolean
+    saw_census: Boolean
+    disclosed_census: Boolean
+    transitions status {
+        checking -> clean
+        checking -> flagged
+        terminal: clean, flagged
+    }
+}
+
+given {
+    run: ActiveRun
+}
+
+surface ActiveCorpusCheck {
+    facing project: Project
+    provides:
+        ActiveStarts(project)
+        ActiveCompletes(project)
+        ActiveFails(project)
+}
+
+-- === The rules ===
+
+rule StartActiveRun {
+    when: ActiveStarts(project)
+    ensures: run.status = checking
+    ensures: run.saw_violation = false
+    ensures: run.saw_census = false
+    ensures: run.disclosed_census = false
+}
+
+-- The strict tier (plan/0085): what the engine would advise anywhere else is a
+-- violation here, because the declared text is the instruction every session
+-- reads and a warn on it is advice to the instruction itself.
+rule DetectEscalatedWarning {
+    when: verdict: EngineVerdict.created
+    requires: verdict.warns > 0
+    ensures: Violation.created(file: verdict.file, kind: warning_escalated)
+}
+
+rule DetectEngineFlag {
+    when: verdict: EngineVerdict.created
+    requires: verdict.flags > 0
+    ensures: Violation.created(file: verdict.file, kind: engine_flag)
+}
+
+-- A declared file the walk cannot find is a hole, never a smaller corpus: the
+-- recipe named it, so its absence is a claim the run must block on.
+rule DetectMissingDeclared {
+    when: file: DeclaredFile.created
+    requires: not file.present
+    ensures: Violation.created(file: file, kind: missing)
+}
+
+rule DetectUnreadableDeclared {
+    when: file: DeclaredFile.created
+    requires: file.present and not file.readable
+    ensures: Violation.created(file: file, kind: unreadable)
+}
+
+-- The census counts; it never judges. A file whose only distinction is its
+-- non-ASCII bytes yields a census row and no violation, which is what makes the
+-- zh and IPA populations livable and a third population visible.
+rule RecordCensus {
+    when: row: CensusRow.created
+    requires: run.status = checking
+    ensures: run.saw_census = true
+}
+
+rule RecordViolation {
+    when: violation: Violation.created
+    requires: run.status = checking
+    ensures: run.saw_violation = true
+}
+
+-- The census is disclosed on every completed verdict, so the exempt populations
+-- stay measured and a new category announces itself instead of arriving
+-- unmeasured.
+rule DiscloseCensus {
+    when: ActiveCompletes(project)
+    requires: run.status = checking and run.saw_census
+    ensures: run.disclosed_census = true
+}
+
+rule VerdictFlagged {
+    when: ActiveCompletes(project)
+    requires: run.status = checking and run.saw_violation
+    ensures: run.status = flagged
+}
+
+rule VerdictClean {
+    when: ActiveCompletes(project)
+    requires: run.status = checking and not run.saw_violation
+    ensures: run.status = clean
+}
+
+rule VerdictError {
+    when: ActiveFails(project)
+    requires: run.status = checking
+    ensures: run.status = flagged
+}
+
+-- === Invariants ===
+
+-- The census counts only what was actually read: a row for a missing or
+-- unreadable file would be a count over a guess, which is how a verdict
+-- claims coverage it does not have.
+invariant CensusNamesPresentFiles {
+    for c in CensusRows:
+        c.file.present
+}
+
+-- A flagged verdict saw a violation; the latch and the init at StartActiveRun
+-- are what make this provable rather than asserted.
+invariant FlaggedSawViolation {
+    for r in ActiveRuns where r.status = flagged:
+        r.saw_violation
+}
+
+-- A clean verdict saw no violation, so zero stays zero exactly while nothing
+-- violates.
+invariant CleanSawNoViolation {
+    for r in ActiveRuns where r.status = clean:
+        not r.saw_violation
+}
+

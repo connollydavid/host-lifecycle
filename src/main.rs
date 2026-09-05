@@ -2080,6 +2080,18 @@ fn prose(args: &[String]) {
             process::exit(2);
         }
     };
+    // The declared always-loaded corpus (plan/0085). Absent declaration: every
+    // line below behaves exactly as it did before, because an empty declaration
+    // escalates nothing, censuses nothing, and misses nothing.
+    let declared = stamp_active_corpus(&root);
+    let is_declared = |m: &Match| -> bool {
+        declared
+            .iter()
+            .any(|f| f.to_string_lossy().replace('\\', "/") == m.file)
+    };
+    // A declared file that is not present is a hole, never a smaller corpus:
+    // the recipe named it, so its absence is a claim the run must block on.
+    let missing: Vec<&PathBuf> = declared.iter().filter(|f| !root.join(f).is_file()).collect();
     let matches = match prose_audit(&root) {
         Ok(m) => m,
         Err(e) => {
@@ -2087,8 +2099,37 @@ fn prose(args: &[String]) {
             process::exit(2);
         }
     };
-    let flags = matches.iter().filter(|m| m.severity == Severity::Flag).count();
+    // The strict tier (plan/0085): inside the declaration a warning is a flag.
+    // Detection is untouched in host-lint; the policy reads the engine's
+    // verdicts and promotes the tier for the files the recipe declared.
+    let mut matches = matches;
+    for m in matches.iter_mut() {
+        if m.severity == Severity::Warn && is_declared(m) {
+            m.severity = Severity::Flag;
+        }
+    }
+    let flags = matches.iter().filter(|m| m.severity == Severity::Flag).count() + missing.len();
     let warns = matches.iter().filter(|m| m.severity == Severity::Warn).count();
+    // The census counts the declared corpus's non-ASCII bytes and gates nothing:
+    // its expected populations (Chinese script awaiting the deferred full
+    // translation, the IPA of pronunciations) are disclosed so a third category
+    // is news on arrival instead of unmeasured.
+    let mut census_bytes = 0usize;
+    let mut census_files = 0usize;
+    for f in &declared {
+        if let Ok(bytes) = fs::read(root.join(f)) {
+            let n = bytes.iter().filter(|b| **b > 0x7F).count();
+            if n > 0 {
+                census_bytes += n;
+                census_files += 1;
+            }
+        }
+    }
+    if census_bytes > 0 {
+        println!(
+            "-- census: {census_bytes} non-ASCII byte(s) across {census_files} declared file(s); the corpus gates on tropes, never on script"
+        );
+    }
     if flags + warns == 0 {
         // The engine that spoke, named in the verdict. Two host-lints reach a project
         // (the pinned hook binary and this embedded library) and they can sit at
@@ -2102,12 +2143,24 @@ fn prose(args: &[String]) {
     }
     for m in &matches {
         match m.severity {
+            Severity::Flag if is_declared(m) => {
+                println!(
+                    "{}:{}: flag (strict: declared active corpus) {} ({})",
+                    m.file, m.line, m.text, m.term
+                )
+            }
             Severity::Flag => println!("{}:{}: {} ({})", m.file, m.line, m.text, m.term),
             Severity::Warn => println!("{}:{}: warning: {} ({})", m.file, m.line, m.text, m.term),
             Severity::Note => {}
         }
     }
-    eprintln!("host-lifecycle: prose regression — {flags} flag(s), {warns} warn(s) in authored docs");
+    for f in &missing {
+        println!("missing  {}: declared in the active corpus and absent", f.display());
+    }
+    eprintln!(
+        "host-lifecycle: prose regression — {flags} flag(s), {warns} warn(s), {} missing declared file(s) in authored docs",
+        missing.len()
+    );
     process::exit(if flags > 0 { 1 } else { 3 });
 }
 
@@ -8757,6 +8810,39 @@ fn stamp_book_mount(root: &Path) -> String {
         .and_then(|t| stamp_field(&t, "book-mount"))
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| "/".to_string())
+}
+
+/// The declared always-loaded corpus (plan/0085): the `.host` stamp's optional
+/// `active-corpus = <file>` key names a project-authored list, one tracked path
+/// per line, `#` comments allowed. Absent key: no declared corpus, and the prose
+/// verb behaves exactly as it did before plan/0085. The declaration lives in the
+/// instance stamp rather than in the template's manifest because the
+/// always-loaded set is project-authored policy, while the manifest is read by
+/// every adopter at the same shared revision (the book-mount precedent). The
+/// corpus is declared, never discovered: a named list that cannot be read fails
+/// closed instead of shrinking the corpus to whatever is present.
+fn stamp_active_corpus(root: &Path) -> Vec<PathBuf> {
+    let Some(file) = fs::read_to_string(root.join(STAMP))
+        .ok()
+        .and_then(|t| stamp_field(&t, "active-corpus"))
+        .filter(|m| !m.is_empty())
+    else {
+        return Vec::new();
+    };
+    match fs::read_to_string(root.join(&file)) {
+        Ok(text) => text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(PathBuf::from)
+            .collect(),
+        Err(_) => {
+            eprintln!(
+                "host-lifecycle: prose: the stamp names `active-corpus = {file}` and the list cannot be read"
+            );
+            process::exit(2);
+        }
+    }
 }
 
 /// The project name for the book title: the `.host` stamp's `name`, falling back to

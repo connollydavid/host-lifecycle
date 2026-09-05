@@ -1053,3 +1053,119 @@ fn the_check_counts_citations_on_every_exit() {
     assert!(text.contains("1 citation(s)"), "the count rides along: {text}");
     let _ = fs::remove_dir_all(&base);
 }
+
+// plan/0085: the declared active corpus. Inside the declaration a warning is a
+// flag; outside it today's tiers stand; the census counts non-ASCII bytes and
+// gates nothing; a declared file that is absent is a hole, never a smaller
+// corpus; and a declaration that cannot be read fails closed.
+fn prose_fixture(name: &str, corpus: Option<&str>) -> std::path::PathBuf {
+    let base = fixture(name);
+    git(&base, &["init", "-q", "-b", "main"]);
+    git(&base, &["config", "user.email", "t@t"]);
+    git(&base, &["config", "user.name", "t"]);
+    match corpus {
+        Some(list) => fs::write(
+            base.join(".host"),
+            format!("template = \"t\"\nname = \"t\"\nactive-corpus = {list}\n"),
+        )
+        .unwrap(),
+        None => fs::write(base.join(".host"), "template = \"t\"\nname = \"t\"\n").unwrap(),
+    }
+    base
+}
+
+#[test]
+fn the_declared_corpus_escalates_a_warning_to_a_flag() {
+    let base = prose_fixture("active-escalate", Some(".host-corpus"));
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join(".host-corpus"), "doc.md\n").unwrap();
+    fs::write(base.join("doc.md"), "# T\n\nWe shipped the feature \u{2014} and it works.\n").unwrap();
+    commit_all(&base);
+
+    let (code, text) = run(&["prose", &dir]);
+    assert_eq!(code, 1, "the strict tier flags what the engine would advise: {text}");
+    assert!(text.contains("strict: declared active corpus"), "the verdict names the escalation: {text}");
+    assert!(!text.contains("warning:"), "the escalated trope is not advised anywhere: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn an_undeclared_file_keeps_its_advisory_tier() {
+    let base = prose_fixture("active-undeclared", Some(".host-corpus"));
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join(".host-corpus"), "other.md\n").unwrap();
+    fs::write(base.join("other.md"), "# O\n\nPlain authored prose.\n").unwrap();
+    fs::write(base.join("doc.md"), "# T\n\nWe shipped the feature \u{2014} and it works.\n").unwrap();
+    commit_all(&base);
+
+    let (code, text) = run(&["prose", &dir]);
+    assert_eq!(code, 3, "outside the declaration the trope advises: {text}");
+    assert!(text.contains("warning:"), "the advisory tier is unchanged: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn the_census_discloses_non_ascii_without_flagging_it() {
+    let base = prose_fixture("active-census", Some(".host-corpus"));
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join(".host-corpus"), "doc.md\n").unwrap();
+    fs::write(base.join("doc.md"), "# T\n\nChinese: \u{83DC}\u{4E39} and IPA /l\u{025B}m/ stay measured.\n").unwrap();
+    commit_all(&base);
+
+    let (code, text) = run(&["prose", &dir]);
+    assert_eq!(code, 0, "script is never a violation: {text}");
+    assert!(text.contains("prose: clean"), "the verdict is clean: {text}");
+    assert!(text.contains("census:"), "the census discloses the bytes: {text}");
+    assert!(text.contains("never on script"), "and says what it does not do: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_missing_declared_file_is_a_violation_never_a_smaller_corpus() {
+    let base = prose_fixture("active-missing", Some(".host-corpus"));
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join(".host-corpus"), "doc.md\nabsent.md\n").unwrap();
+    fs::write(base.join("doc.md"), "# T\n\nPlain authored prose.\n").unwrap();
+    commit_all(&base);
+
+    let (code, text) = run(&["prose", &dir]);
+    assert_eq!(code, 1, "the declaration named it, so its absence gates: {text}");
+    assert!(
+        text.contains("declared in the active corpus and absent"),
+        "naming the hole: {text}"
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn an_unreadable_declaration_fails_closed() {
+    let base = prose_fixture("active-failclosed", Some("absent-list.md"));
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join("doc.md"), "# T\n\nPlain authored prose.\n").unwrap();
+    commit_all(&base);
+
+    let (code, text) = run(&["prose", &dir]);
+    assert_eq!(code, 2, "a named list that cannot be read is a failure, not silence: {text}");
+    assert!(text.contains("cannot be read"), "{text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+// The strict tier never trades coverage for a verdict: a declared file the walk
+// cannot read is fail-closed, the same hole-in-the-corpus rule the record sweep
+// carries, applied to the declaration.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_declared_file_gates() {
+    let base = prose_fixture("active-unreadable", Some(".host-corpus"));
+    let dir = base.to_string_lossy().to_string();
+    fs::write(base.join(".host-corpus"), "doc.md\n").unwrap();
+    fs::write(base.join("doc.md"), "# T\n\nPlain authored prose.\n").unwrap();
+    commit_all(&base);
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(base.join("doc.md"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (code, text) = run(&["prose", &dir]);
+    assert_eq!(code, 2, "an unread declared file is a hole, never a skip: {text}");
+    fs::set_permissions(base.join("doc.md"), fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = fs::remove_dir_all(&base);
+}
