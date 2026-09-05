@@ -14,6 +14,13 @@
 -- markdown and reports the references a reader cannot follow: a register
 -- reference that points at nothing, and an issue number written bare.
 --
+-- plan/0084 adds the accepted cross-project citation: a register reference
+-- inside a markdown link whose absolute target names the cited record under a
+-- repository other than the local one. The sweep cannot read another
+-- repository, so what is accepted is the FORM (the URL names the file the token
+-- claims, under a foreign slug), never the existence; a citation is counted and
+-- disclosed on every exit, and it is never a finding.
+--
 -- Scope: which references resolve, what a resolution emits, which findings the
 -- sweep reports, and the exit split. Excludes (implementation): the glob that
 -- matches a numbered entry, the git remote parse, the markdown walk, the
@@ -121,6 +128,13 @@ entity Reference {
     entry_matched: Boolean
     has_anchor: Boolean
     in_link: Boolean
+    -- An accepted citation of another project's register (plan/0084): the
+    -- reference sits in a markdown link whose target is an absolute URL that
+    -- names the record the token claims (the path carries the `room/NNNN`
+    -- segment) under a repository other than the local one, or with no local
+    -- origin to compare against. The sweep checks the form and cannot check
+    -- the existence, the same honesty limit a linked issue number carries.
+    foreign_citation: Boolean
     -- Quoted rather than referred: inside a fence, or inside inline code. A
     -- document that teaches the rule shows references, and showing is not
     -- referring.
@@ -145,6 +159,14 @@ entity Resolved {
 entity Finding {
     reference: Reference
     weight: Weight
+}
+
+-- One accepted cross-project citation (plan/0084). Counted and disclosed, and
+-- never a finding: the link is the author's claim about another repository,
+-- the sweep has verified only that the link names the file the token claims,
+-- and the disclosure says exactly that much.
+entity Citation {
+    reference: Reference
 }
 
 -- A listed document the walk could not open. Its own entity rather than a
@@ -176,6 +198,13 @@ entity Sweep {
     -- alone: a software repository almost always carries legibility debt, so a
     -- disclosure that printed only on the clean branch never printed at all.
     disclosed_uncovered: Boolean
+    -- An accepted cross-project citation was seen (plan/0084). It changes no
+    -- verdict: a tree whose only outcomes are citations is clean, and the
+    -- disclosure is what carries the count.
+    saw_citation: Boolean
+    -- The verdict said so. Printed on every exit the way the uncovered
+    -- disclosure is, as a count and never an enumeration (call/0048).
+    disclosed_citations: Boolean
     transitions status {
         sweeping -> clean
         sweeping -> advisory
@@ -276,11 +305,14 @@ rule ResolveIssueWithoutOrigin {
 -- === The sweep ===
 
 -- A register reference that resolves to nothing is a dead pointer: a record the
--- document claims exists and does not. Mechanically evidenced, so it gates.
+-- document claims exists and does not. Mechanically evidenced, so it gates. A
+-- citation of another project's register is judged by form instead
+-- (plan/0084) and never reports dead here.
 rule DetectDeadPointer {
     when: reference: Reference.created
     requires: reference.kind = register and reference.room_present
               and not reference.entry_matched
+              and not reference.foreign_citation
               and not reference.quoted and not reference.document.excluded
     ensures: Finding.created(reference: reference, weight: dead_pointer)
 }
@@ -294,6 +326,27 @@ rule DetectUnrenderedIssue {
               and not reference.quoted and not reference.document.excluded
               and (sweep.corpus = working_tree or reference.document.tracked)
     ensures: Finding.created(reference: reference, weight: unrendered)
+}
+
+-- === The accepted citation ===
+
+-- A citation of another project's register in the accepted form (plan/0084).
+-- Counted for the disclosure; the verdict neither gates on it nor enumerates
+-- it. The corpus condition matches the issue half: the gate judges the record,
+-- so a citation in an untracked draft is the operator's sweep to count.
+rule AcceptForeignCitation {
+    when: reference: Reference.created
+    requires: reference.kind = register and reference.foreign_citation
+              and not reference.quoted and not reference.document.excluded
+              and (sweep.corpus = working_tree or reference.document.tracked)
+    ensures: Citation.created(reference: reference)
+}
+
+-- Latched so the verdict can disclose the count on every exit.
+rule RecordCitation {
+    when: citation: Citation.created
+    requires: sweep.status = sweeping
+    ensures: sweep.saw_citation = true
 }
 
 -- A listed document the walk could not open. Reported and gating, because the
@@ -317,6 +370,8 @@ rule StartSweep {
     ensures: sweep.saw_unread = false
     ensures: sweep.uncovered = false
     ensures: sweep.disclosed_uncovered = false
+    ensures: sweep.saw_citation = false
+    ensures: sweep.disclosed_citations = false
 }
 
 -- The gate begins the same run over the record. Separate from StartSweep rather
@@ -331,6 +386,8 @@ rule StartGate {
     ensures: sweep.saw_unread = false
     ensures: sweep.uncovered = false
     ensures: sweep.disclosed_uncovered = false
+    ensures: sweep.saw_citation = false
+    ensures: sweep.disclosed_citations = false
 }
 
 rule RecordFinding {
@@ -360,11 +417,14 @@ rule RecordWithheldDocument {
 }
 
 -- A register reference naming a room this repository does not hold was not
--- checked against anything. The governing host holds the number.
+-- checked against anything. The governing host holds the number. An accepted
+-- citation is the different case: its form was checked, and the citation
+-- disclosure says what was not read.
 rule RecordUncheckedRegister {
     when: reference: Reference.created
     requires: sweep.status = sweeping and reference.kind = register
               and not reference.room_present
+              and not reference.foreign_citation
     ensures: sweep.uncovered = true
 }
 
@@ -372,6 +432,14 @@ rule DiscloseUncovered {
     when: SweepCompletes(project)
     requires: sweep.status = sweeping and sweep.uncovered
     ensures: sweep.disclosed_uncovered = true
+}
+
+-- The citation count is disclosed on every exit, the way the uncovered
+-- disclosure is, so the acceptance never reads as silence (plan/0084).
+rule DiscloseCitations {
+    when: SweepCompletes(project)
+    requires: sweep.status = sweeping and sweep.saw_citation
+    ensures: sweep.disclosed_citations = true
 }
 
 rule VerdictDead {
@@ -415,6 +483,14 @@ invariant ExcludedIsNeverReported {
 invariant QuotedIsNeverReported {
     for f in Findings:
         not f.reference.quoted
+}
+
+-- A citation of another project's register in the accepted form is never a
+-- finding (plan/0084). Its form was checked; its existence is another
+-- repository's to answer for.
+invariant CitationIsNeverReported {
+    for f in Findings:
+        not f.reference.foreign_citation
 }
 
 -- Only the room's owner can hold a dead pointer. A repository without the room

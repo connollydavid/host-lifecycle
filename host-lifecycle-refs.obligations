@@ -131,3 +131,18 @@ rule-success.StartGate                         => test:the_gate_judges_the_recor
 invariant.GateJudgesOnlyTheRecord              => test:the_gate_judges_the_record_and_the_sweep_the_working_tree exercises=draft.md
 invariant.GateNeverAdvises                     => test:the_gate_never_returns_the_advisory_code exercises=legibility debt
 invariant.UnreadGatesInEitherCorpus            => test:an_unread_document_gates_either_walk exercises=UNREAD
+
+# plan/0084, the accepted cross-project citation. The citation is counted and
+# disclosed and never a finding; each boundary case the cut README settled has a
+# test, and the DetectDeadPointer conjunct that spares a citation is killed by
+# the same test that accepts one (deleting the conjunct redden the acceptance
+# test with a DEAD line the disclosure replaced).
+entity-fields.Citation                         => structural
+rule-success.AcceptForeignCitation             => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=scan_document
+rule-failure.AcceptForeignCitation.1           => test:the_four_citation_forms_measure_as_the_issue_measured exercises=scan_document
+rule-entity-creation.AcceptForeignCitation.1   => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=scan_document
+rule-success.RecordCitation                    => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=saw_citation
+rule-failure.RecordCitation.1                  => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=saw_citation
+rule-success.DiscloseCitations                 => test:the_gate_discloses_citations_without_gating_on_them exercises=disclosed_citations
+rule-failure.DiscloseCitations.1               => test:refs_check_splits_clean_advisory_and_dead exercises=refs
+invariant.CitationIsNeverReported              => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=scan_document
