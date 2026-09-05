@@ -6055,6 +6055,10 @@ fn version_below(running: &str, floor: &str) -> bool {
 const CAPABILITIES: &[(&str, &str)] = &[
     ("refs-check", "refs"),
     ("refs-gate", "refs"),
+    // plan/0085: the prose verb reads the declared always-loaded corpus and holds
+    // it to the strict tier. An adopter whose binary predates it answers absent,
+    // which is what the ledger entry's verify needs to know.
+    ("active-corpus", "prose"),
     ("recipe-migration", "migrate-recipe"),
     ("receipt-migration", "migrate-receipts"),
     // The embedded engine carries the word-choice split (call/0051): the catalog's two
