@@ -141,8 +141,10 @@ entity-fields.Citation                         => structural
 rule-success.AcceptForeignCitation             => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=scan_document
 rule-failure.AcceptForeignCitation.1           => test:the_four_citation_forms_measure_as_the_issue_measured exercises=scan_document
 rule-entity-creation.AcceptForeignCitation.1   => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=scan_document
-rule-success.RecordCitation                    => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=saw_citation
-rule-failure.RecordCitation.1                  => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=saw_citation
-rule-success.DiscloseCitations                 => test:the_gate_discloses_citations_without_gating_on_them exercises=disclosed_citations
+# The latch and the print are killed end to end: deleting either removes the
+# count line from the gate's verdict, which the exit-path test asserts on.
+rule-success.RecordCitation                    => test:the_gate_discloses_citations_without_gating_on_them exercises=accepted on link form
+rule-failure.RecordCitation.1                  => test:the_gate_discloses_citations_without_gating_on_them exercises=accepted on link form
+rule-success.DiscloseCitations                 => test:the_gate_discloses_citations_without_gating_on_them exercises=accepted on link form
 rule-failure.DiscloseCitations.1               => test:refs_check_splits_clean_advisory_and_dead exercises=refs
 invariant.CitationIsNeverReported              => test:a_foreign_citation_in_a_link_is_accepted_and_counted exercises=scan_document

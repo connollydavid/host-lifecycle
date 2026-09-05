@@ -68,6 +68,11 @@ pub struct Reference {
     pub repo: String,
     pub number: String,
     pub anchor: Option<String>,
+    /// An accepted citation of another project's register (plan/0084): the
+    /// reference sits in a markdown link whose absolute target names the record
+    /// the token claims under a repository other than the local one. Counted
+    /// and disclosed, never reported.
+    pub foreign_citation: bool,
 }
 
 /// Parse a reference as written. `plan/0074`, `call/0045`, `plan/0074#write-spec`
@@ -92,6 +97,7 @@ pub fn parse_reference(text: &str) -> Option<Reference> {
                     repo: String::new(),
                     number: number.to_string(),
                     anchor,
+                    foreign_citation: false,
                 });
             }
             return None;
@@ -115,6 +121,7 @@ pub fn parse_reference(text: &str) -> Option<Reference> {
         repo: repo.to_string(),
         number: n.to_string(),
         anchor: None,
+        foreign_citation: false,
     })
 }
 
@@ -424,7 +431,7 @@ pub struct Finding {
 /// The references a line carries, with the document facts the sweep needs. A
 /// reference already inside a markdown link renders; one inside fenced code is an
 /// example rather than a reference.
-fn scan_line(line: &str) -> Vec<(Reference, bool)> {
+fn scan_line(line: &str, origin: Option<&str>) -> Vec<(Reference, bool)> {
     let mut out = Vec::new();
     let bytes: Vec<char> = line.chars().collect();
     let mut i = 0;
@@ -452,6 +459,22 @@ fn scan_line(line: &str) -> Vec<(Reference, bool)> {
                             anchor = Some(a);
                         }
                     }
+                    let target = enclosing_link_target(&bytes, i, end);
+                    let in_link = target.is_some();
+                    // The accepted citation (plan/0084): an absolute URL naming
+                    // the record the token claims, under a slug other than the
+                    // local one. No local origin makes every absolute target
+                    // foreign, because there is nothing to compare against; a
+                    // slug that will not parse is never foreign, because
+                    // foreignness could not be established.
+                    let foreign_citation = target
+                        .filter(|t| absolute_http_url(t) && url_names_record(t, room, &digits))
+                        .map(|t| match origin {
+                            None => true,
+                            Some(local) => url_repo_slug(&t)
+                                .is_some_and(|s| !s.eq_ignore_ascii_case(local)),
+                        })
+                        .unwrap_or(false);
                     out.push((
                         Reference {
                             kind: RefKind::Register,
@@ -459,8 +482,9 @@ fn scan_line(line: &str) -> Vec<(Reference, bool)> {
                             repo: String::new(),
                             number: digits,
                             anchor,
+                            foreign_citation,
                         },
-                        enclosing_link(&bytes, i, end),
+                        in_link,
                     ));
                     i = end;
                 }
@@ -512,6 +536,7 @@ fn scan_line(line: &str) -> Vec<(Reference, bool)> {
                         repo: written,
                         number: digits,
                         anchor: None,
+                        foreign_citation: false,
                     },
                     enclosing_link(&bytes, i, end),
                 ));
@@ -674,6 +699,83 @@ fn enclosing_link(line: &[char], start: usize, end: usize) -> bool {
     in_label || in_target
 }
 
+/// The link target when the span at `start..end` sits inside a markdown link,
+/// in its label or in its target; `None` when it does not sit in a link. The
+/// citation facts read the target whichever side the token is written on,
+/// because the link's destination is the author's claim about where the record
+/// lives (plan/0084). Detection mirrors `enclosing_link`; the two disagreeing
+/// would put the citation facts on a link the verdict thought was no link.
+fn enclosing_link_target(line: &[char], start: usize, end: usize) -> Option<String> {
+    let before: String = line[..start].iter().collect();
+    let after: String = line[end..].iter().collect();
+    let in_label = before.rfind('[').is_some_and(|b| {
+        before[b..].find(']').is_none() && after.find(']').is_some_and(|c| after[c..].starts_with("]("))
+    });
+    let in_target = before.rfind("](").is_some_and(|b| before[b..].find(')').is_none()) && after.contains(')');
+    if in_label {
+        let c = after.find("](")? + 2;
+        let rest = &after[c..];
+        let stop = rest.find([')', ' ']).unwrap_or(rest.len());
+        return Some(rest[..stop].to_string());
+    }
+    if in_target {
+        let b = before.rfind("](")? + 2;
+        let stop = after.find(')').unwrap_or(after.len());
+        // The token sits inside the URL, so the span the caller passed is part
+        // of the target and both neighbors omit it: `before` ends where the
+        // token begins and `after` begins where it ends.
+        let token: String = line[start..end].iter().collect();
+        return Some(format!("{}{}{}", &before[b..], token, &after[..stop]));
+    }
+    None
+}
+
+fn absolute_http_url(target: &str) -> bool {
+    target.starts_with("https://") || target.starts_with("http://")
+}
+
+/// The `owner/repo` a forge URL names, read from the path after the host.
+/// `None` when the shape is not one this check understands.
+fn url_repo_slug(target: &str) -> Option<String> {
+    let rest = target.split_once("://")?.1;
+    let (_, path) = rest.split_once('/')?;
+    let mut segs = path.split('/');
+    let owner = segs.next()?;
+    let repo = segs.next()?;
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
+}
+
+/// Whether a forge URL's path names the record the token claims: the segment
+/// pair `room/NNNN`, the number exact so `call/0039` does not match
+/// `call/00398`. The revision between the repository and the path (`main`, a
+/// commit, the `blob`/`tree` render prefix) is just segments this walk passes
+/// over: the check judges the file, never the revision, because form is the
+/// claim and existence is not checkable offline (plan/0084, gather-data).
+fn url_names_record(target: &str, room: &str, number: &str) -> bool {
+    let rest = match target.split_once("://") {
+        Some((_, r)) => r,
+        None => return false,
+    };
+    let path = match rest.split_once('/') {
+        Some((_, p)) => p,
+        None => return false,
+    };
+    let segs: Vec<&str> = path.split('/').collect();
+    for i in 2..segs.len().saturating_sub(1) {
+        if segs[i] == room
+            && segs[i + 1].starts_with(number)
+            && segs[i + 1][number.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Sweep one document. Fenced code is skipped: a fenced `#3` is an example, which
 /// is how the tell gate reads its own fixtures.
 /// The rooms this tree holds and the entry names each carries, read once per run.
@@ -723,20 +825,37 @@ impl RoomIndex {
 }
 
 pub fn scan_document(text: &str, file: &str, root: &Path) -> Vec<Finding> {
-    scan_document_with(text, file, &RoomIndex::read(root))
+    scan_document_with(text, file, &RoomIndex::read(root), origin_slug(root).as_deref()).0
 }
 
 /// The scan against a room index read once by the caller. The sweep resolves every
 /// reference in every document, so it reads the rooms once and passes them here.
-pub fn scan_document_with(text: &str, file: &str, rooms: &RoomIndex) -> Vec<Finding> {
+/// The scan against a room index read once by the caller. Returns the findings
+/// and the count of accepted cross-project citations, which the verdict
+/// discloses as a count and never reports (plan/0084).
+pub fn scan_document_with(
+    text: &str,
+    file: &str,
+    rooms: &RoomIndex,
+    origin: Option<&str>,
+) -> (Vec<Finding>, usize) {
     let mut out = Vec::new();
+    let mut citations = 0usize;
     // One reference per line per text: a markdown link writes the same reference
     // twice (its label and its target), and a reader sees one link. The text is
     // the reference AS WRITTEN, so two repositories citing the same number on one
-    // line stay two findings.
+    // line stay two findings. Citations dedup the same way, for the same reason.
     let mut seen: Vec<(usize, String)> = Vec::new();
     for (n, line) in prose_of(text) {
-        for (reference, in_link) in scan_line(&line) {
+        for (reference, in_link) in scan_line(&line, origin) {
+            if reference.kind == RefKind::Register && reference.foreign_citation {
+                let text = format!("{}/{}", reference.room, reference.number);
+                if !seen.contains(&(n, text.clone())) {
+                    seen.push((n, text));
+                    citations += 1;
+                }
+                continue;
+            }
             let (text, weight) = match reference.kind {
                 RefKind::Register
                     if rooms.owns(&reference.room)
@@ -761,7 +880,7 @@ pub fn scan_document_with(text: &str, file: &str, rooms: &RoomIndex) -> Vec<Find
             out.push(Finding { file: file.to_string(), line: n, text, weight });
         }
     }
-    out
+    (out, citations)
 }
 
 /// `refs --check <dir>`: sweep the authored markdown, report what a reader cannot
@@ -814,9 +933,11 @@ fn refs_run(root: &Path, gate: bool) -> i32 {
     }
     let rooms_here: Vec<&str> = ROOMS.iter().copied().filter(|r| root.join(r).is_dir()).collect();
     let mut findings: Vec<Finding> = Vec::new();
+    let mut citations = 0usize;
     let mut unchecked_registers = 0usize;
     let mut unread: Vec<String> = Vec::new();
     let rooms = RoomIndex::read(root);
+    let origin = origin_slug(root);
     for doc in &docs {
         // A listed document that will not open is a hole in the corpus, never a
         // silent skip: the run cannot say what was in it, and a dead pointer
@@ -825,8 +946,10 @@ fn refs_run(root: &Path, gate: bool) -> i32 {
             unread.push(doc.clone());
             continue;
         };
-        unchecked_registers += count_unowned_registers(&text, root);
-        findings.extend(scan_document_with(&text, doc, &rooms));
+        unchecked_registers += count_unowned_registers(&text, root, origin.as_deref());
+        let (found, cited) = scan_document_with(&text, doc, &rooms, origin.as_deref());
+        citations += cited;
+        findings.extend(found);
     }
     for doc in &unread {
         println!("UNREAD   {doc}: listed by the walk and could not be read");
@@ -861,6 +984,7 @@ fn refs_run(root: &Path, gate: bool) -> i32 {
     let corpus_name = if gate { "recorded" } else { "authored" };
     if !dead.is_empty() || !unread.is_empty() {
         println!("-- {swept} {corpus_name} doc(s) read of {} listed.", docs.len());
+        disclose_citations(citations);
         if let Some(first) = dead.first() {
             println!(
                 "   {} dead pointer(s): a reference naming a record that does not exist. Run `host-lifecycle resolve {} {}` to see where one points.",
@@ -885,6 +1009,7 @@ fn refs_run(root: &Path, gate: bool) -> i32 {
             "-- {swept} recorded doc(s) read; every register reference in them resolves. {} issue reference(s) carry legibility debt, which this gate does not judge; run `host-lifecycle refs --check` to see them.",
             debt.len()
         );
+        disclose_citations(citations);
         disclose_uncovered(corpus.excluded, unchecked_registers, &rooms_here);
         return 0;
     }
@@ -922,10 +1047,12 @@ fn refs_run(root: &Path, gate: bool) -> i32 {
                 "   Every one of them names no repository, so only you know which tracker each meant."
             ),
         }
+        disclose_citations(citations);
         disclose_uncovered(corpus.excluded, unchecked_registers, &rooms_here);
         return 3;
     }
     println!("-- {swept} doc(s) swept; every reference in them resolves and renders");
+    disclose_citations(citations);
     disclose_uncovered(corpus.excluded, unchecked_registers, &rooms_here);
     0
 }
@@ -933,6 +1060,17 @@ fn refs_run(root: &Path, gate: bool) -> i32 {
 /// What the sweep did not check, printed on every verdict it can reach. Printing
 /// it on the clean branch alone meant it never printed in a software repository,
 /// which carries legibility debt almost always and is the case it exists for.
+/// The accepted-citation count, disclosed as a count on every exit and never
+/// enumerated (call/0048): the acceptance is of the link's form, and the
+/// disclosure says exactly that much and nothing more (plan/0084).
+fn disclose_citations(citations: usize) {
+    if citations > 0 {
+        println!(
+            "   {citations} citation(s) of another project's register accepted on link form; their targets name another repository and were not read"
+        );
+    }
+}
+
 fn disclose_uncovered(excluded: usize, unchecked_registers: usize, rooms_here: &[&str]) {
     if excluded > 0 {
         println!(
@@ -964,7 +1102,7 @@ fn first_qualified_reference(root: &Path) -> Option<String> {
     for doc in crate::authored_docs(root) {
         let Ok(text) = fs::read_to_string(root.join(&doc)) else { continue };
         for (_, line) in prose_of(&text) {
-            for (reference, _) in scan_line(&line) {
+            for (reference, _) in scan_line(&line, None) {
                 // `owner/repo#N` only, for the reason the advisory summary gives: a bare
                 // component name needs a lookup to resolve, and a written range reads as
                 // a repository, so either could print a command that does not work.
@@ -979,12 +1117,18 @@ fn first_qualified_reference(root: &Path) -> Option<String> {
 
 /// References this repository cannot check, because it does not own their room.
 /// Counted rather than reported: they are somebody else's registers, and a clean
-/// line that did not mention them would claim coverage it does not have.
-fn count_unowned_registers(text: &str, root: &Path) -> usize {
+/// line that did not mention them would claim coverage it does not have. An
+/// accepted citation is the different case (plan/0084): its form was checked,
+/// and the citation disclosure says what was not read, so it is not counted
+/// here either.
+fn count_unowned_registers(text: &str, root: &Path, origin: Option<&str>) -> usize {
     let mut n = 0;
     for (_, line) in prose_of(text) {
-        for (reference, _) in scan_line(&line) {
-            if reference.kind == RefKind::Register && !owns_room(root, &reference) {
+        for (reference, _) in scan_line(&line, origin) {
+            if reference.kind == RefKind::Register
+                && !reference.foreign_citation
+                && !owns_room(root, &reference)
+            {
                 n += 1;
             }
         }
@@ -1252,7 +1396,7 @@ mod tests {
         // The linked issue on line 4 is not debt: `enclosing_link` reports it as
         // in_link, and a reference that renders is not reported.
         assert!(found.iter().all(|f| f.text != "#18"), "a linked issue renders: {found:?}");
-        let linked: Vec<(Reference, bool)> = scan_line("[#18](https://github.com/o/r/issues/18)");
+        let linked: Vec<(Reference, bool)> = scan_line("[#18](https://github.com/o/r/issues/18)", None);
         assert!(linked.iter().any(|(r, in_link)| r.number == "18" && *in_link));
         assert!(found.iter().all(|f| f.line != 6), "fenced references are examples, never findings");
 
@@ -1388,6 +1532,133 @@ mod tests {
         assert!(err.contains("origin"), "{err}");
         let issue = parse_reference("#17").unwrap();
         assert!(emit(&base, &issue, Emission::Path).unwrap_err().contains("forge"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0084: the accepted citation. A register reference inside a markdown
+    // link whose absolute target names the record the token claims, under a slug
+    // other than the local one, is counted and never reported. The count comes
+    // from `scan_document_with`, so this test runs it directly; the fixture has
+    // no `.git`, which is the origin-absent case only when no origin is passed.
+    #[test]
+    fn a_foreign_citation_in_a_link_is_accepted_and_counted() {
+        let base = fixture("citation");
+        let doc = "[plan/0097](https://github.com/connollydavid/agentic-host/blob/main/plan/0097-decision/README.md) settles it\n";
+        // The same document is dead under the local slug: the acceptance is of
+        // foreignness, and this link names a repository the local origin is not.
+        let (found, cited) = scan_document_with(
+            doc,
+            "doc.md",
+            &RoomIndex::read(&base),
+            Some("connollydavid/host-lifecycle"),
+        );
+        assert!(found.is_empty(), "a citation is never a finding: {found:?}");
+        assert_eq!(cited, 1, "label and target write the token once each; a reader sees one link: cited={cited}");
+
+        // The local slug is judged as today, citation or not: a dead local record
+        // stays dead in a link, so the acceptance cannot launder one.
+        let (found, cited) = scan_document_with(
+            doc,
+            "doc.md",
+            &RoomIndex::read(&base),
+            Some("connollydavid/agentic-host"),
+        );
+        assert_eq!(found.len(), 1, "a local dead record in a link is still dead: {found:?}");
+        assert_eq!(cited, 0, "and it is no citation: cited={cited}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The issue's four-form table, measured on the sweep: bare prose, a prose
+    // qualifier, and a markdown link to the other repository all report DEAD
+    // before this change; the code span is an example rather than a reference.
+    // Under the accepted form the link alone becomes a citation, and the prose
+    // shapes stay dead, one rule, link-or-nothing.
+    #[test]
+    fn the_four_citation_forms_measure_as_the_issue_measured() {
+        let base = fixture("four-forms");
+        let doc = "per agentic-host call/0039 the layout holds\n\
+                   recorded as agentic-host plan/0077\n\
+                   [agentic-host call/0039](https://github.com/connollydavid/agentic-host/blob/main/call/0039-bare-store-is-dot-bare-with-a-git-file.md)\n\
+                   an example: `call/0039`\n";
+        let (found, cited) = scan_document_with(
+            doc,
+            "doc.md",
+            &RoomIndex::read(&base),
+            Some("connollydavid/host-lifecycle"),
+        );
+        let dead: Vec<&Finding> = found.iter().filter(|f| f.weight == Weight::DeadPointer).collect();
+        assert_eq!(dead.len(), 2, "both prose forms stay dead: {found:?}");
+        assert_eq!(cited, 1, "the link form alone is the citation: cited={cited}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The boundary cases the cut README settled, each one the defect it exists to
+    // refuse: a citation that does not point where it claims is the false citation
+    // the sweep exists to catch.
+    #[test]
+    fn a_relative_target_stays_dead() {
+        let base = fixture("citation-relative");
+        let (found, cited) = scan_document_with(
+            "[plan/0097](plan/0097-decision/README.md)\n",
+            "doc.md",
+            &RoomIndex::read(&base),
+            None,
+        );
+        assert_eq!(found.len(), 1, "relative is what resolve --markdown emits, and it is judged as today: {found:?}");
+        assert_eq!(cited, 0, "a relative target is no citation: cited={cited}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_url_naming_another_file_stays_dead() {
+        let base = fixture("citation-wrong-file");
+        let doc = "[call/0039](https://github.com/connollydavid/agentic-host/blob/main/call/0044-prose-lexicon.md)\n";
+        let (found, cited) = scan_document_with(
+            doc,
+            "doc.md",
+            &RoomIndex::read(&base),
+            Some("connollydavid/host-lifecycle"),
+        );
+        // The label claims call/0039 and the URL names call/0044: the mismatch is
+        // dead, while the URL's own token names a record that really exists in the
+        // foreign register and is accepted as the citation it is.
+        assert!(
+            found.iter().any(|f| f.text == "call/0039" && f.weight == Weight::DeadPointer),
+            "the label stays dead: {found:?}"
+        );
+        assert_eq!(cited, 1, "the URL's own token is the citation: cited={cited}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_anchor_and_a_non_main_revision_still_name_the_record() {
+        let base = fixture("citation-shapes");
+        let doc = "[plan/0074](https://github.com/connollydavid/agentic-host/tree/66c24d6de0833b8bafc58c5c875ab23b9303c47a/plan/0074-host-lifecycle-materialize-receipt-and-envhash#write-spec)\n\
+                   [call/0045](https://gitlab.example.com/connollydavid/agentic-host/-/blob/next/call/0045-store-model.md)\n";
+        let (found, cited) = scan_document_with(
+            doc,
+            "doc.md",
+            &RoomIndex::read(&base),
+            Some("connollydavid/host-lifecycle"),
+        );
+        assert!(found.is_empty(), "the revision is irrelevant and the anchor is ignored: {found:?}");
+        assert_eq!(cited, 2, "tree and blob, any forge: cited={cited}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unparseable_url_is_never_a_citation() {
+        let base = fixture("citation-unparseable");
+        // Foreignness could not be established, so the reference is judged as
+        // today: fail closed, stay dead.
+        let (found, cited) = scan_document_with(
+            "[plan/0097](https://github.com/plan/0097-decision/README.md)\n",
+            "doc.md",
+            &RoomIndex::read(&base),
+            Some("connollydavid/host-lifecycle"),
+        );
+        assert_eq!(found.len(), 1, "no owner, no citation: {found:?}");
+        assert_eq!(cited, 0);
         let _ = fs::remove_dir_all(&base);
     }
 }

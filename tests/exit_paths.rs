@@ -1001,3 +1001,55 @@ fn every_arg_parser_refuses_an_undeclared_flag() {
     }
     let _ = fs::remove_dir_all(&base);
 }
+
+// plan/0084: the accepted citation is disclosed as a count on every exit and
+// never gates, so a tree whose cross-project citations are its only story is
+// clean, and a dead pointer still gates beside the count.
+#[test]
+fn the_gate_discloses_citations_without_gating_on_them() {
+    let base = refs_fixture("citation-gate");
+    let dir = base.to_string_lossy().to_string();
+    // A remote makes the local slug known, so a link to ANOTHER repository's
+    // register is foreign by comparison and not by default.
+    git(&base, &["remote", "add", "origin", "https://github.com/connollydavid/host-lifecycle"]);
+    fs::write(
+        base.join("PLAN.md"),
+        "# P\n\nRecorded as [agentic-host plan/0080](https://github.com/connollydavid/agentic-host/blob/main/plan/0080-commit-message-faults/README.md).\n",
+    )
+    .unwrap();
+    commit_all(&base);
+
+    let (gate, gate_text) = run(&["refs", "--gate", &dir]);
+    assert_eq!(gate, 0, "a citation never gates: {gate_text}");
+    assert!(
+        gate_text.contains("1 citation(s) of another project's register accepted on link form"),
+        "the count is disclosed: {gate_text}"
+    );
+    assert!(!gate_text.contains("agentic-host/blob"), "and never enumerated: {gate_text}");
+
+    let (sweep, sweep_text) = run(&["refs", "--check", &dir]);
+    assert_eq!(sweep, 0, "the sweep reads the same tree the same way: {sweep_text}");
+    assert!(sweep_text.contains("accepted on link form"), "{sweep_text}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn the_check_counts_citations_on_every_exit() {
+    let base = refs_fixture("citation-every-exit");
+    let dir = base.to_string_lossy().to_string();
+    git(&base, &["remote", "add", "origin", "https://github.com/connollydavid/host-lifecycle"]);
+    fs::write(
+        base.join("PLAN.md"),
+        "# P\n\n[agentic-host plan/0080](https://github.com/connollydavid/agentic-host/blob/main/plan/0080-commit-message-faults/README.md), and a dead one: plan/0099.\n",
+    )
+    .unwrap();
+    commit_all(&base);
+
+    // The dead pointer gates and the citation is counted on the same verdict:
+    // one exit, both facts, neither silent.
+    let (code, text) = run(&["refs", "--check", &dir]);
+    assert_eq!(code, 1, "the dead pointer still gates: {text}");
+    assert!(text.contains("DEAD"), "{text}");
+    assert!(text.contains("1 citation(s)"), "the count rides along: {text}");
+    let _ = fs::remove_dir_all(&base);
+}
