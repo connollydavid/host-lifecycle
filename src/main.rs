@@ -4726,26 +4726,39 @@ fn ci_lane_problems(root: &Path, recipe: &[Software]) -> usize {
     }
     let mut bad = 0usize;
     for (label, dir, lanes) in discover_ci_lanes(root, recipe) {
-        let expected = if label == "host" {
-            git_out(&dir, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
-        } else {
-            recipe
-                .iter()
-                .find(|s| worktree_label(&s.name, &s.branch) == label)
-                .map(|s| s.pin.clone())
-        };
-        let Some(expected) = expected else { continue };
+        // The host root's receipts commit postdates the run it records, so the parent
+        // discharges the host's own lanes too (plan/0096); components hold one
+        // revision, the recorded pin.
+        let mut expected: Vec<String> = Vec::new();
+        if label == "host" {
+            for rev in ["HEAD", "HEAD~1"] {
+                if let Some(s) = git_out(&dir, &["rev-parse", rev]).map(|s| s.trim().to_string()) {
+                    if !expected.contains(&s) {
+                        expected.push(s);
+                    }
+                }
+            }
+        } else if let Some(s) = recipe
+            .iter()
+            .find(|s| worktree_label(&s.name, &s.branch) == label)
+            .map(|s| s.pin.clone())
+        {
+            expected.push(s);
+        }
+        if expected.is_empty() {
+            continue;
+        }
         for lane in &lanes {
             let comp = format!("{label}/{lane}");
             let discharged = receipts.iter().rev().find(|r| {
                 r.phase == "ci"
                     && r.component.as_deref() == Some(comp.as_str())
-                    && r.revision.as_deref() == Some(expected.as_str())
+                    && r.revision.as_deref().is_some_and(|rev| expected.iter().any(|e| e == rev))
             });
             match discharged {
                 Some(r) if r.disposition == "done" && r.conclusion.as_deref() == Some("success") => {
                     let url = r.evidence.as_ref().map(|u| format!(" ({u})")).unwrap_or_default();
-                    println!("ok       ci {comp} — discharged at {}{url}", short_sha(&expected));
+                    println!("ok       ci {comp} — discharged at {}{url}", short_sha(r.revision.as_deref().unwrap_or("?")));
                 }
                 Some(r) => {
                     let url = r.evidence.as_ref().map(|u| format!(" ({u})")).unwrap_or_default();
@@ -4764,7 +4777,7 @@ fn ci_lane_problems(root: &Path, recipe: &[Software]) -> usize {
                             "HAZARD   ci {comp} — last discharged at {} ({}), not at the judged revision {}; remedy: host-lifecycle ci --record {comp} --run <run-url>",
                             short_sha(r.revision.as_deref().unwrap_or("?")),
                             r.conclusion.as_deref().unwrap_or("unknown"),
-                            short_sha(&expected)
+                            short_sha(&expected[0])
                         ),
                         None => println!(
                             "HAZARD   ci {comp} — declared, never discharged; remedy: host-lifecycle ci --record {comp} --run <run-url>"
