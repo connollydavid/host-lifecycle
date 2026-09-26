@@ -6173,7 +6173,11 @@ fn entry_point_mode_problems(root: &Path, recipe: &[Software]) -> (usize, usize)
         // `git grep -z -o` emits `<path>NUL<match>` per line, so the invoking document
         // is known and `./x` can be read the way a reader reads it — beside the document
         // first, then from the repository root, which is what a workflow at depth means.
-        let Some(hits) = git_out(&dir, &["grep", "-I", "-z", "-o", "-E", r"\./[A-Za-z0-9_][A-Za-z0-9_./-]*", "--", "."]) else {
+        // The anchor before `./` (line start, or one character that cannot continue a
+        // path) keeps a parent-relative `../x` and a redundant `a/./x` from reading as
+        // an in-place invocation: both were substring hits of the bare pattern, and the
+        // first HAZARDed a script an interpreter runs, where the exec bit is irrelevant.
+        let Some(hits) = git_out(&dir, &["grep", "-I", "-z", "-o", "-E", r"(^|[^A-Za-z0-9_./-])\./[A-Za-z0-9_][A-Za-z0-9_./-]*", "--", "."]) else {
             continue;
         };
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -6181,7 +6185,8 @@ fn entry_point_mode_problems(root: &Path, recipe: &[Software]) -> (usize, usize)
             let Some((from, invoked)) = line.split_once('\0') else {
                 continue;
             };
-            let rel = &invoked[2..];
+            // The anchor is part of the match when the invocation sits mid-line.
+            let rel = if invoked.starts_with("./") { &invoked[2..] } else { &invoked[3..] };
             let beside = match from.rsplit_once('/') {
                 Some((d, _)) => format!("{d}/{rel}"),
                 None => rel.to_string(),
@@ -11067,6 +11072,35 @@ mod tests {
         // And the one reached through the invoking document's own directory.
         assert!(git_ok(&base, &["update-index", "--chmod=-x", "sub/run.sh"]));
         assert_eq!(entry_point_mode_problems(&base, &[]).0, 2, "`./run.sh` resolves beside sub/doc.md");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The gate reads an invocation the way a reader does: `python3 ../scripts/x.py`
+    // hands the script to an interpreter and the exec bit is irrelevant, and
+    // `configs/./tool.sh` is a path with a redundant member, not an invocation of
+    // `./tool.sh`. Only a genuine in-place `./tool.sh` is judged (host-lifecycle#29).
+    #[test]
+    fn entry_point_mode_gate_never_reads_a_parent_relative_path_as_in_place() {
+        let base = std::env::temp_dir().join(format!("hl-execdotdot-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("scripts")).unwrap();
+        fs::create_dir_all(base.join("configs")).unwrap();
+        fs::create_dir_all(base.join("sub")).unwrap();
+        // Shebang-bearing and recorded 100644: the exact shape the reporter hazarded.
+        fs::write(base.join("scripts/remote.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(base.join("tool.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(base.join("sub/wf.md"), "python3 ../scripts/remote.sh metrics.log\n").unwrap();
+        fs::write(
+            base.join("doc.md"),
+            "hand configs/./tool.sh the flag\nthen run ./tool.sh directly\n",
+        )
+        .unwrap();
+        assert!(git_ok(&base, &["init", "-q"]), "fixture repo");
+        assert!(git_ok(&base, &["add", "-A"]));
+
+        let (bad, seen) = entry_point_mode_problems(&base, &[]);
+        assert_eq!(bad, 1, "only the genuine in-place invocation is judged");
+        assert_eq!(seen, 1, "the parent-relative and redundant-member shapes are not entry points");
         let _ = fs::remove_dir_all(&base);
     }
 
