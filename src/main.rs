@@ -114,6 +114,7 @@ fn main() {
         Some("init") => init(&args[2..]),
         Some("scaffold") => scaffold(&args[2..]),
         Some("mcp") => mcp::mcp(&args[2..]),
+        Some("ci") => ci_command(&args[2..]),
         // `--version` is this BINARY's identity; `version <dir>` is the adopted
         // TEMPLATE revision. Two different questions that read alike, which is half of
         // why the binary's own version had no answer (host-lifecycle#24).
@@ -174,6 +175,7 @@ fn main() {
             eprintln!("  receipt --record <phase> ...  — append a phase receipt (done|skip); --list prints the current set");
             eprintln!("  release <component> ...       — the gated, tool-carried release sequence (verify -> build -> tag -> receipt)");
             eprintln!("  env --check <dir>             — which local-environment dimensions moved since the fingerprint was recorded (advisory)");
+    eprintln!("  ci <dir>                       — judge the lanes\' ci receipts offline (lanes discovered from .github/workflows); --record <label>/<lane> --run <url> writes one");
             eprintln!("  bootstrap <dir>               — run the fresh-clone setup sequence (submodules, materialize, skills, build, hooks, re-deriver), then the completeness gate");
             eprintln!("  resolve <ref> [--markdown|--url] — where a plan/NNNN, call/NNNN or #N reference points");
             eprintln!("  refs --check <dir>            — references the site cannot render: dead register pointers (gates) and bare issue numbers (advisory)");
@@ -4383,6 +4385,9 @@ fn software(args: &[String]) {
         "check" => {
             let mut owed: Vec<String> = Vec::new();
             let bad = software_check_owed(&root, &recipe, &mut owed);
+            // The CI clause (plan/0095): a lane discovered from the tree must have a
+            // receipted success at the revision under judgment; absence is a finding.
+            let bad = bad + ci_lane_problems(&root, &recipe);
             if bad > 0 {
                 eprintln!("-- {bad} item(s) need attention");
                 process::exit(1);
@@ -4667,6 +4672,186 @@ fn container_runtime() -> Option<&'static str> {
     })
 }
 
+/// Lanes discovered from the tree (plan/0095): `.github/workflows/*` at the host root
+/// and each materialized component worktree. Discovery is name-presence; the `ci`
+/// receipt provides the discharge, so a lane that has never run is a finding, never a
+/// default. A repository with no workflows is reported by the caller as a named
+/// absence, never silence.
+fn discover_ci_lanes(root: &Path, recipe: &[Software]) -> Vec<(String, PathBuf, Vec<String>)> {
+    let mut out: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+    fn push_dir(out: &mut Vec<(String, PathBuf, Vec<String>)>, label: String, dir: &Path) {
+        let Ok(rd) = fs::read_dir(dir.join(".github").join("workflows")) else {
+            return;
+        };
+        let mut lanes: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+            .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .collect();
+        lanes.sort();
+        lanes.dedup();
+        if !lanes.is_empty() {
+            out.push((label, dir.to_path_buf(), lanes));
+        }
+    }
+    push_dir(&mut out, "host".to_string(), root);
+    for s in recipe {
+        let wt = worktree_dir(root, &s.name, &s.branch);
+        if wt.is_dir() {
+            push_dir(&mut out, worktree_label(&s.name, &s.branch), &wt);
+        }
+    }
+    out
+}
+
+fn short_sha(s: &str) -> &str {
+    s.get(..7).unwrap_or(s)
+}
+
+/// The CI clause (plan/0095): every lane discovered from the tree must carry a `ci`
+/// receipt at the revision under judgment — the host root at HEAD, each component at
+/// its recorded pin — with a success conclusion. Absence, failure, and a stale
+/// revision are each a HAZARD. The receipt is judged offline, never the network, and
+/// the run URL is printed for the one-command read-back.
+fn ci_lane_problems(root: &Path, recipe: &[Software]) -> usize {
+    let receipts = read_all_receipts(root);
+    // The named absence (plan/0095 D5): a component with no workflows states it, so
+    // a component whose tests never ran anywhere is a printed fact, never silence.
+    for s in recipe {
+        let wt = worktree_dir(root, &s.name, &s.branch);
+        if wt.is_dir() && !wt.join(".github").join("workflows").is_dir() {
+            println!("note     {} — no lanes declared (no .github/workflows): no spec-driven lane is owed, and this component's tests run where a developer runs them", worktree_label(&s.name, &s.branch));
+        }
+    }
+    let mut bad = 0usize;
+    for (label, dir, lanes) in discover_ci_lanes(root, recipe) {
+        let expected = if label == "host" {
+            git_out(&dir, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
+        } else {
+            recipe
+                .iter()
+                .find(|s| worktree_label(&s.name, &s.branch) == label)
+                .map(|s| s.pin.clone())
+        };
+        let Some(expected) = expected else { continue };
+        for lane in &lanes {
+            let comp = format!("{label}/{lane}");
+            let discharged = receipts.iter().rev().find(|r| {
+                r.phase == "ci"
+                    && r.component.as_deref() == Some(comp.as_str())
+                    && r.revision.as_deref() == Some(expected.as_str())
+            });
+            match discharged {
+                Some(r) if r.disposition == "done" && r.conclusion.as_deref() == Some("success") => {
+                    let url = r.evidence.as_ref().map(|u| format!(" ({u})")).unwrap_or_default();
+                    println!("ok       ci {comp} — discharged at {}{url}", short_sha(&expected));
+                }
+                Some(r) => {
+                    let url = r.evidence.as_ref().map(|u| format!(" ({u})")).unwrap_or_default();
+                    println!(
+                        "HAZARD   ci {comp} — recorded {} at the judged revision{url}; remedy: re-run the lane, then record the outcome",
+                        r.conclusion.as_deref().unwrap_or("unknown")
+                    );
+                    bad += 1;
+                }
+                None => {
+                    let last = receipts.iter().rev().find(|r| {
+                        r.phase == "ci" && r.component.as_deref() == Some(comp.as_str())
+                    });
+                    match last {
+                        Some(r) => println!(
+                            "HAZARD   ci {comp} — last discharged at {} ({}), not at the judged revision {}; remedy: host-lifecycle ci --record {comp} --run <run-url>",
+                            short_sha(r.revision.as_deref().unwrap_or("?")),
+                            r.conclusion.as_deref().unwrap_or("unknown"),
+                            short_sha(&expected)
+                        ),
+                        None => println!(
+                            "HAZARD   ci {comp} — declared, never discharged; remedy: host-lifecycle ci --record {comp} --run <run-url>"
+                        ),
+                    }
+                    bad += 1;
+                }
+            }
+        }
+    }
+    bad
+}
+
+/// `host-lifecycle ci <dir>`: judge (default) or record. The record writes one `ci`
+/// receipt; `--record <label>/<lane> --run <url>` with `--conclusion` defaulting to
+/// success and `--revision` to the lane's judged revision. The writer runs where
+/// network exists; the judge never touches it.
+fn ci_command(args: &[String]) {
+    let mut dir = String::from(".");
+    let (mut record, mut run, mut revision, mut conclusion) = (None, None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--record" => record = args.get(i + 1).cloned(),
+            "--run" => run = args.get(i + 1).cloned(),
+            "--revision" => revision = args.get(i + 1).cloned(),
+            "--conclusion" => conclusion = args.get(i + 1).cloned(),
+            s if !s.starts_with('-') && dir == "." => dir = s.to_string(),
+            other => {
+                eprintln!("host-lifecycle: unknown ci argument `{other}`");
+                process::exit(2);
+            }
+        }
+        i += match args[i].as_str() {
+            "--record" | "--run" | "--revision" | "--conclusion" => 2,
+            _ => 1,
+        };
+    }
+    let root = match fs::canonicalize(Path::new(&dir)) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("host-lifecycle: not a directory: {dir}");
+            process::exit(2);
+        }
+    };
+    let recipe = load_software(&root);
+    let Some(comp) = record else {
+        let bad = ci_lane_problems(&root, &recipe);
+        process::exit(if bad > 0 { 1 } else { 0 });
+    };
+    let Some(run) = run else {
+        eprintln!("host-lifecycle: ci --record needs --run <run-url> (the receipt cites the evidence it attests)");
+        process::exit(2);
+    };
+    // The judged revision for this lane: the component's recorded pin, or the host
+    // root's HEAD — the same revision the judge will demand the receipt at.
+    let (label, _lane) = comp.split_once('/').unwrap_or((comp.as_str(), comp.as_str()));
+    let expected = if label == "host" {
+        git_out(&root, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
+    } else {
+        recipe
+            .iter()
+            .find(|s| worktree_label(&s.name, &s.branch) == label)
+            .map(|s| s.pin.clone())
+    };
+    let revision = revision.or(expected);
+    let r = Receipt {
+        phase: "ci".to_string(),
+        component: Some(comp.clone()),
+        disposition: "done".to_string(),
+        evidence: Some(run),
+        reason: None,
+        authorization: None,
+        tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
+        recorded: Some(today()),
+        revision,
+        conclusion: Some(conclusion.unwrap_or_else(|| "success".to_string())),
+    };
+    match append_receipt(&root, &r) {
+        Ok(()) => println!(
+            "recorded receipt: phase ci ({comp}) = done at {}",
+            short_sha(r.revision.as_deref().unwrap_or("?"))
+        ),
+        Err(e) => eprintln!("host-lifecycle: cannot record the ci receipt for {comp}: {e}"),
+    }
+}
+
 /// Merge a `cargo vendor` `[source.*]` config snippet into an existing
 /// `.cargo/config.toml` body, preserving the existing content (e.g. the reproducible
 /// build-id rustflags). Pure so it is unit-testable; the staging step writes the result.
@@ -4931,6 +5116,16 @@ fn software_verify_build(root: &Path, recipe: &[Software]) {
                 match artifact_reproduces(rebuilt.as_deref(), sha) {
                     Ok(()) => {
                         println!("ok       {tag} rebuild reproduces {path} @ {} (in {image})", short(sha));
+                        // Run-anchored evidence (plan/0095 D4): cite the run that
+                        // discharged this component's lanes at this pin, beside the digest.
+                        if let Some(run) = read_all_receipts(root).iter().rev().find(|r| {
+                            r.phase == "ci"
+                                && r.revision.as_deref() == Some(s.pin.as_str())
+                                && r.evidence.is_some()
+                                && r.component.as_deref().is_some_and(|c| c.starts_with(&format!("{}/", s.name)))
+                        }) {
+                            println!("           discharged by {}", run.evidence.as_deref().unwrap_or("?"));
+                        }
                         verified += 1;
                     }
                     Err(reason) => {
@@ -5452,6 +5647,8 @@ fn append_materialize_receipt(root: &Path, s: &Software, items: usize) {
         authorization: None,
         tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
         recorded: Some(today()),
+        revision: None,
+        conclusion: None,
     };
     match append_receipt(root, &r) {
         Ok(()) => println!("receipt  materialize ({})", s.name),
@@ -9399,6 +9596,11 @@ struct Receipt {
     authorization: Option<String>,
     tool: Option<String>,
     recorded: Option<String>,
+    /// `ci` receipts only (plan/0095): the revision the run judged and the run's own
+    /// conclusion, so the offline judge can require a success at the revision under
+    /// judgment instead of trusting name-presence.
+    revision: Option<String>,
+    conclusion: Option<String>,
 }
 
 /// The release that introduced `--authorized`, and with it the `authorization` field.
@@ -9482,6 +9684,8 @@ fn parse_receipts(text: &str) -> Vec<Receipt> {
                 authorization: None,
                 tool: None,
                 recorded: None,
+                revision: None,
+                conclusion: None,
             });
             continue;
         }
@@ -9495,6 +9699,8 @@ fn parse_receipts(text: &str) -> Vec<Receipt> {
             "authorization" => cur.authorization = Some(val.to_string()),
             "tool" => cur.tool = Some(val.to_string()),
             "recorded" => cur.recorded = Some(val.to_string()),
+            "revision" => cur.revision = Some(val.to_string()),
+            "conclusion" => cur.conclusion = Some(val.to_string()),
             _ => {}
         }
     }
@@ -9519,6 +9725,8 @@ fn receipt_stanza(r: &Receipt) -> String {
         ("authorization", &r.authorization),
         ("tool", &r.tool),
         ("recorded", &r.recorded),
+        ("revision", &r.revision),
+        ("conclusion", &r.conclusion),
     ] {
         if let Some(v) = v {
             s.push_str(&format!("    {k} = {v}\n"));
@@ -9973,6 +10181,8 @@ fn receipt_record(args: &[String]) {
         authorization,
         tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
         recorded: Some(today()),
+        revision: None,
+        conclusion: None,
     };
     if let Err(e) = append_receipt(root, &r) {
         eprintln!("host-lifecycle: cannot write {RECEIPTS}: {e}");
@@ -10708,6 +10918,8 @@ fn release_record_skip(args: &[String]) {
         authorization: None,
         tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
         recorded: Some(today()),
+        revision: None,
+        conclusion: None,
     };
     if let Err(e) = append_receipt(root, &r) {
         eprintln!("host-lifecycle: cannot write {RECEIPTS}: {e}");
@@ -11154,6 +11366,8 @@ mod tests {
             authorization: None,
             tool: tool.map(str::to_string),
             recorded: Some("2026-07-28".to_string()),
+            revision: None,
+            conclusion: None,
         };
         assert!(!owes_authorization(&rel(Some("host-lifecycle@0.47.2"))), "predates the field");
         assert!(owes_authorization(&rel(Some("host-lifecycle@0.48.0"))), "the release that added it");
@@ -11214,6 +11428,8 @@ mod tests {
             authorization: Some("plan/0071#ship-it".to_string()),
             tool: Some("host-lifecycle@0.48.0".to_string()),
             recorded: Some("2026-07-28".to_string()),
+            revision: None,
+            conclusion: None,
         };
         let back = parse_receipts(&receipt_stanza(&r));
         assert_eq!(back.len(), 1);
@@ -14430,6 +14646,73 @@ mod book_tests {
         // merges to one copy.
         let poisoned = merge_vendor_config("", snippet);
         assert_eq!(merge_vendor_config(&poisoned, snippet), poisoned);
+    }
+
+    // The CI clause (plan/0095, plan/0096): a lane discovered from the tree must carry
+    // a `ci` receipt at the judged revision with a success conclusion; absence, a
+    // stale revision, and a failure each hazard. The judge is offline: git and the
+    // receipts, never the network.
+    #[test]
+    fn ci_clause_judges_discovered_lanes_offline() {
+        let base = std::env::temp_dir().join(format!("hl-ci-judge-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".github/workflows")).unwrap();
+        fs::write(base.join(".github/workflows/site.yml"), "on: push\n").unwrap();
+        assert!(git_ok(&base, &["init", "-q"]));
+        assert!(git_ok(&base, &["add", "-A"]));
+        assert!(git_ok(&base, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]));
+        let head = {
+            let o = process::Command::new("git")
+                .arg("-C").arg(&base).args(["rev-parse", "HEAD"]).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        // Two components: one with a workflow, one without (the named absence).
+        let wt = base.join("software/comp/main");
+        fs::create_dir_all(wt.join(".github/workflows")).unwrap();
+        fs::write(wt.join(".github/workflows/test.yml"), "on: push\n").unwrap();
+        let bare = base.join("software/bare/main");
+        fs::create_dir_all(&bare).unwrap();
+        let pin = "b9cace10c07b1e6316f835d21b131be9d5a07c01";
+        let recipe = parse_software(&format!(
+            "[software \"comp\"]\n url=u\n pin={pin}\n[software \"bare\"]\n url=u\n pin=p\n"
+        ));
+        let write_receipt = |component: &str, revision: &str, conclusion: &str| {
+            append_receipt(&base, &Receipt {
+                phase: "ci".to_string(),
+                component: Some(component.to_string()),
+                disposition: "done".to_string(),
+                evidence: Some(format!("https://run.test/{component}")),
+                reason: None,
+                authorization: None,
+                tool: Some("host-lifecycle@test".to_string()),
+                recorded: Some("2026-09-26".to_string()),
+                revision: Some(revision.to_string()),
+                conclusion: Some(conclusion.to_string()),
+            }).unwrap();
+        };
+
+        // Absence: both discovered lanes are undeclared-and-undischarged.
+        assert_eq!(ci_lane_problems(&base, &recipe), 2, "host/site and comp/test are undischarged");
+
+        // The host lane discharges at HEAD; the component still owes its pin.
+        write_receipt("host/site", &head, "success");
+        assert_eq!(ci_lane_problems(&base, &recipe), 1, "comp/test is still undischarged");
+
+        // A stale revision: the component's only receipt is at another revision, so
+        // the judged revision is not discharged and the last one is named.
+        write_receipt("software/comp/main/test", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "success");
+        assert_eq!(ci_lane_problems(&base, &recipe), 1, "a stale discharge re-lists");
+
+        // Discharged at the judged revisions: both lanes read ok, and the lane-less
+        // component is a note, never a hazard.
+        write_receipt("software/comp/main/test", pin, "success");
+        assert_eq!(ci_lane_problems(&base, &recipe), 0, "both lanes discharged");
+
+        // A failure at the pin, recorded after the success: last-wins at the
+        // revision, so the failure is what the judge sees.
+        write_receipt("software/comp/main/test", pin, "failure");
+        assert_eq!(ci_lane_problems(&base, &recipe), 1, "a failed discharge is a hazard");
+        let _ = fs::remove_dir_all(&base);
     }
 
     // plan/0032 hermeticity gate (DetectDepsBundleDrift): a component pinning a bundle is
