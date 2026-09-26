@@ -26,7 +26,7 @@ dependencies = [
 [[package]]
 name = "host-grammar"
 version = "0.7.0"
-source = "git+https://github.com/connollydavid/host-grammar?rev=b9cace10c07b1e6316f835d21b131be9d5a07c01#b9cace10c07b1e6316f835d21b131be9d5a07c01"
+source = "git+https://github.com/connollydavid/host-grammar?rev=6cd41c37f06a62652d9fb767cae675225cea5d01#6cd41c37f06a62652d9fb767cae675225cea5d01"
 dependencies = [
  "pulldown-cmark",
  "unicode-segmentation",
@@ -44,8 +44,8 @@ dependencies = [
 
 [[package]]
 name = "host-lint"
-version = "0.22.0"
-source = "git+https://github.com/connollydavid/host-lint?rev=0eeabc20fdae1c283d0d9d284178be6488bb431d#0eeabc20fdae1c283d0d9d284178be6488bb431d"
+version = "0.22.2"
+source = "git+https://github.com/connollydavid/host-lint?rev=54f267f24a4e56e33e8f56ed260b40b2629a5d03#54f267f24a4e56e33e8f56ed260b40b2629a5d03"
 dependencies = [
  "host-grammar",
  "serde_json",

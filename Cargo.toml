@@ -6,8 +6,8 @@ description = "Token-free lifecycle tool for an agentic project — scaffolds mi
 license = "Unlicense"
 
 [dependencies]
-host-grammar = { git = "https://github.com/connollydavid/host-grammar", rev = "b9cace10c07b1e6316f835d21b131be9d5a07c01" }
-host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "0eeabc20fdae1c283d0d9d284178be6488bb431d" }
+host-grammar = { git = "https://github.com/connollydavid/host-grammar", rev = "6cd41c37f06a62652d9fb767cae675225cea5d01" }
+host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "54f267f24a4e56e33e8f56ed260b40b2629a5d03" }
 # The MCP stdio surface (plan/0065, call/0042): hand-rolled JSON-RPC on tokio + serde_json.
 # tokio is required (operator directive); features are held to a current-thread stdio server
 # (no net, no multi-thread) to keep the vendored reproducible-build set as small as the surface allows.
