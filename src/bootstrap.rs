@@ -174,9 +174,17 @@ pub fn skill_sources_checked(root: &Path, recipe: &[Software]) -> (Vec<(String, 
         found.sort();
         out.extend(found);
     }
-    out.sort();
-    out.dedup();
-    (out, unreadable)
+    // One skill name is one offer. A repository present both as a referenced
+    // submodule and as an embedded component enumerates its skill from two trees,
+    // and a `.claude/skills/<name>` link resolves to one of them: the census that
+    // kept both entries demanded one link satisfy two canonical paths at once, so
+    // one of the two always hazarded (host-lifecycle#28). The recipe's entries are
+    // inserted first and the embedded copy is the tree under test, so it wins.
+    let mut best: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for (name, path) in out {
+        best.entry(name).or_insert(path);
+    }
+    (best.into_iter().collect(), unreadable)
 }
 
 /// The components whose artifact this tree needs locally: the commit gate installs
@@ -563,6 +571,31 @@ mod tests {
         assert!(base.join(".claude/skills/tend").exists(), "the link resolves to the worktree's skill");
         let plan_after = plan_steps(&base, &recipe);
         assert!(plan_after.iter().find(|s| s.kind == StepKind::LinkSkills).unwrap().satisfied);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // One tool offered from two trees is one offer: a repository present both as a
+    // referenced submodule and as an embedded component used to enumerate twice, and
+    // the gate demanded one link resolve to two canonical paths at once
+    // (host-lifecycle#28). The embedded copy wins, being the tree under test.
+    #[test]
+    fn a_tool_both_submodule_and_embed_offers_its_skills_once() {
+        let base = std::env::temp_dir().join(format!("hl-boot-dupe-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software").join("demo").join("main");
+        fs::create_dir_all(wt.join("skills").join("tend")).unwrap();
+        let sub = base.join("tools").join("demo");
+        fs::create_dir_all(sub.join("skills").join("tend")).unwrap();
+        fs::write(
+            base.join(".gitmodules"),
+            "[submodule \"tools/demo\"]\n\tpath = tools/demo\n\turl = https://example.invalid/demo\n",
+        )
+        .unwrap();
+        let recipe = [comp("demo")];
+        let sources = skill_sources(&base, &recipe);
+        assert_eq!(sources.len(), 1, "one skill name, one offer");
+        assert_eq!(sources[0].0, "tend");
+        assert_eq!(sources[0].1, wt.join("skills").join("tend"), "the embedded tree wins");
         let _ = fs::remove_dir_all(&base);
     }
 
