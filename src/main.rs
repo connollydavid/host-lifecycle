@@ -4671,7 +4671,32 @@ fn container_runtime() -> Option<&'static str> {
 /// `.cargo/config.toml` body, preserving the existing content (e.g. the reproducible
 /// build-id rustflags). Pure so it is unit-testable; the staging step writes the result.
 fn merge_vendor_config(existing: &str, snippet: &str) -> String {
-    let mut out = existing.trim_end().to_string();
+    // Idempotent by section: a killed release leaves the previous merge in the
+    // tracked config (the staging guard covers panics, not kills), and a second
+    // plain append duplicated `[source.crates-io]`, which cargo refuses. Sections
+    // the snippet defines replace what the config holds; everything else (the
+    // rustflags block, project tuning) survives (plan/0082's carried release-path
+    // defect, reproduced live before this fix).
+    let snippet_sections: Vec<&str> = snippet
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('[') && l.ends_with(']'))
+        .collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in existing.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            skipping = snippet_sections.contains(&t);
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    let mut out = kept.join("\n");
+    while out.ends_with('\n') || out.ends_with(' ') {
+        out.pop();
+    }
     if !out.is_empty() {
         out.push_str("\n\n");
     }
@@ -14385,6 +14410,26 @@ mod book_tests {
         // an empty existing config yields just the snippet (no leading blank line)
         let fresh = merge_vendor_config("", snippet);
         assert!(fresh.starts_with("[source.crates-io]"));
+    }
+
+    // A kill between staging and the guard's restore leaves the first merge in the
+    // tracked config; the next release's staging merges onto that. The merge is
+    // idempotent by section, so the re-run repairs the residue instead of
+    // duplicating the block cargo refuses (plan/0082's carried release-path defect,
+    // reproduced live before this fix).
+    #[test]
+    fn merge_vendor_config_is_idempotent_across_a_killed_release() {
+        let existing = "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-Wl,--build-id=none\"]\n";
+        let snippet = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"\n";
+        let once = merge_vendor_config(existing, snippet);
+        let twice = merge_vendor_config(&once, snippet);
+        assert_eq!(once, twice, "a second staging does not duplicate the source block");
+        assert_eq!(twice.matches("[source.crates-io]").count(), 1);
+        assert!(twice.contains("--build-id=none"), "rustflags survive the re-merge");
+        // The kill-only shape: the config carries the vendor block alone, and still
+        // merges to one copy.
+        let poisoned = merge_vendor_config("", snippet);
+        assert_eq!(merge_vendor_config(&poisoned, snippet), poisoned);
     }
 
     // plan/0032 hermeticity gate (DetectDepsBundleDrift): a component pinning a bundle is
