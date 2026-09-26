@@ -6186,7 +6186,10 @@ fn entry_point_mode_problems(root: &Path, recipe: &[Software]) -> (usize, usize)
                 continue;
             };
             // The anchor is part of the match when the invocation sits mid-line.
-            let rel = if invoked.starts_with("./") { &invoked[2..] } else { &invoked[3..] };
+            let rel = match invoked.strip_prefix("./") {
+                Some(r) => r,
+                None => &invoked[3..],
+            };
             let beside = match from.rsplit_once('/') {
                 Some((d, _)) => format!("{d}/{rel}"),
                 None => rel.to_string(),
