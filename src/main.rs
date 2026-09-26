@@ -7577,6 +7577,10 @@ fn verify_command_after_rename(root: &Path, cmd: &str) -> String {
 
 fn run_verify(root: &Path, cmd: &str) -> bool {
     let (sh, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    // The condition is judged by the binary running the gate, the manifest
+    // recheck's rule: a claim recorded true stayed true, and a machine-local PATH
+    // copy answers for it otherwise (connollydavid/host#23).
+    let cmd = self_invoking(cmd);
     process::Command::new(sh)
         .arg(flag)
         .arg(cmd)
@@ -7769,7 +7773,11 @@ fn upgrade(args: &[String]) {
             }
         }
         let via = if !entry.verify.is_empty() {
-            if !run_verify(&root, &entry.verify) {
+            // The same translation the claim recheck applies: record time and recheck
+            // time judge one condition, so an entry whose verify names the moved file
+            // cannot record-and-fail, or hold at recheck while never having recorded
+            // (connollydavid/host#22).
+            if !run_verify(&root, &verify_command_after_rename(&root, &entry.verify)) {
                 eprintln!("host-lifecycle: refuse — the verify post-condition for {} failed: {}", short_id(&id), entry.verify);
                 process::exit(1);
             }
@@ -14584,4 +14592,21 @@ fn verify_conditions_follow_the_renamed_manual_through_the_pointer() {
     assert!(run_verify(&base, &verify_command_after_rename(&base, "grep -rqs \"spine sentence\" host-template/CLAUDE.md")));
     let _ = fs::remove_dir_all(&base);
     let _ = fs::remove_dir_all(&plain);
+}
+
+// A bare `host-lifecycle` token in a verify condition names the binary running the
+// gate, never whatever a machine-local PATH offers (connollydavid/host#23): with the
+// tool invoked by absolute path and absent from PATH, as a CI runner sees it, four
+// true claims hazarded on a condition that had nothing to do with them.
+#[test]
+fn a_verify_condition_names_this_binary_rather_than_the_path_copy() {
+    let base = std::env::temp_dir().join(format!("hl-verify-selfinvoke-{}", process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    // `--list` is accepted by the binary under test (the test harness lists and
+    // exits clean) and rejected by any released host-lifecycle on PATH, so a pass
+    // here is the rewrite working, and a pass without it would be the PATH copy
+    // answering for the condition.
+    assert!(run_verify(&base, "host-lifecycle --list"));
+    let _ = fs::remove_dir_all(&base);
 }
