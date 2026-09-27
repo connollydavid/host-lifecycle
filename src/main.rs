@@ -4716,7 +4716,12 @@ fn short_sha(s: &str) -> &str {
 /// its recorded pin — with a success conclusion. Absence, failure, and a stale
 /// revision are each a HAZARD. The receipt is judged offline, never the network, and
 /// the run URL is printed for the one-command read-back.
-fn ci_lane_problems(root: &Path, recipe: &[Software]) -> usize {
+/// Gate mode (plan/0098): the stop-gate counts only lanes without a receipt at the
+/// judged revision — absence and staleness block, because an unreceipted lane is
+/// the silent state the contract refuses. A RECEIPTED failure passes the gate:
+/// the receipt is the blocker record, the fix rides the next turn, and the
+/// session-start context carries it until then.
+fn ci_lane_problems_mode(root: &Path, recipe: &[Software], gate: bool) -> usize {
     let receipts = read_all_receipts(root);
     // The named absence (plan/0095 D5): a component with no workflows states it, so
     // a component whose tests never ran anywhere is a printed fact, never silence.
@@ -4784,11 +4789,18 @@ fn ci_lane_problems(root: &Path, recipe: &[Software]) -> usize {
                 }
                 Some(r) => {
                     let url = r.evidence.as_ref().map(|u| format!(" ({u})")).unwrap_or_default();
-                    println!(
-                        "HAZARD   ci {comp} — recorded {} at the judged revision{url}; remedy: re-run the lane, then record the outcome",
-                        r.conclusion.as_deref().unwrap_or("unknown")
-                    );
-                    bad += 1;
+                    if gate {
+                        println!(
+                            "note     ci {comp} — recorded {} at the judged revision{url}; the receipt is the blocker record, the fix rides the next turn",
+                            r.conclusion.as_deref().unwrap_or("unknown")
+                        );
+                    } else {
+                        println!(
+                            "HAZARD   ci {comp} — recorded {} at the judged revision{url}; remedy: re-run the lane, then record the outcome",
+                            r.conclusion.as_deref().unwrap_or("unknown")
+                        );
+                        bad += 1;
+                    }
                 }
                 None => {
                     let last = receipts.iter().rev().find(|r| {
@@ -4820,6 +4832,7 @@ fn ci_lane_problems(root: &Path, recipe: &[Software]) -> usize {
 fn ci_command(args: &[String]) {
     let mut dir = String::from(".");
     let (mut record, mut run, mut revision, mut conclusion) = (None, None, None, None);
+    let mut gate = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -4827,6 +4840,7 @@ fn ci_command(args: &[String]) {
             "--run" => run = args.get(i + 1).cloned(),
             "--revision" => revision = args.get(i + 1).cloned(),
             "--conclusion" => conclusion = args.get(i + 1).cloned(),
+            "--gate" => gate = true,
             s if !s.starts_with('-') && dir == "." => dir = s.to_string(),
             other => {
                 eprintln!("host-lifecycle: unknown ci argument `{other}`");
@@ -4847,7 +4861,7 @@ fn ci_command(args: &[String]) {
     };
     let recipe = load_software(&root);
     let Some(comp) = record else {
-        let bad = ci_lane_problems(&root, &recipe);
+        let bad = ci_lane_problems_mode(&root, &recipe, gate);
         process::exit(if bad > 0 { 1 } else { 0 });
     };
     let Some(run) = run else {
@@ -14727,26 +14741,38 @@ mod book_tests {
         };
 
         // Absence: both discovered lanes are undeclared-and-undischarged.
-        assert_eq!(ci_lane_problems(&base, &recipe), 2, "host/site and comp/test are undischarged");
+        assert_eq!(ci_lane_problems_mode(&base, &recipe, false), 2, "host/site and comp/test are undischarged");
 
         // The host lane discharges at HEAD; the component still owes its pin.
         write_receipt("host/site", &head, "success");
-        assert_eq!(ci_lane_problems(&base, &recipe), 1, "comp/test is still undischarged");
+        assert_eq!(ci_lane_problems_mode(&base, &recipe, false), 1, "comp/test is still undischarged");
 
         // A stale revision: the component's only receipt is at another revision, so
         // the judged revision is not discharged and the last one is named.
         write_receipt("software/comp/main/test", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "success");
-        assert_eq!(ci_lane_problems(&base, &recipe), 1, "a stale discharge re-lists");
+        assert_eq!(ci_lane_problems_mode(&base, &recipe, false), 1, "a stale discharge re-lists");
 
         // Discharged at the judged revisions: both lanes read ok, and the lane-less
         // component is a note, never a hazard.
         write_receipt("software/comp/main/test", pin, "success");
-        assert_eq!(ci_lane_problems(&base, &recipe), 0, "both lanes discharged");
+        assert_eq!(ci_lane_problems_mode(&base, &recipe, false), 0, "both lanes discharged");
 
         // A failure at the pin, recorded after the success: last-wins at the
         // revision, so the failure is what the judge sees.
         write_receipt("software/comp/main/test", pin, "failure");
-        assert_eq!(ci_lane_problems(&base, &recipe), 1, "a failed discharge is a hazard");
+        assert_eq!(ci_lane_problems_mode(&base, &recipe, false), 1, "a failed discharge is a hazard");
+
+        // Gate mode (plan/0098): a RECEIPTED failure passes the stop-gate — the
+        // receipt is the blocker record, the fix rides the next turn — while the
+        // full judge still names it.
+        assert_eq!(ci_lane_problems_mode(&base, &recipe, true), 0, "the receipted failure does not block the gate");
+        assert_eq!(ci_lane_problems_mode(&base, &recipe, false), 1, "the judge still names it");
+
+        // Absence blocks the gate: a newly discovered lane with no receipt at all
+        // is the finding, in both modes — silence is the state the contract refuses.
+        fs::write(base.join(".github/workflows/second.yml"), "on: push\n").unwrap();
+        assert_eq!(ci_lane_problems_mode(&base, &recipe, true), 1, "an unreceipted lane blocks the gate");
+        assert_eq!(ci_lane_problems_mode(&base, &recipe, false), 2, "the judge names it beside the receipted failure");
         let _ = fs::remove_dir_all(&base);
     }
 
