@@ -4306,6 +4306,7 @@ fn software(args: &[String]) {
     // from the recorded pin and drives its release (plan/0057). The name is the flag's
     // value, not a positional, so it never collides with the `<dir>` positional.
     let mut lock_name: Option<&str> = None;
+    let mut delta_refs: Option<(&str, &str)> = None;
     let mut authorized: Option<String> = None;
     // `--teardown` removes a component's materialized worktrees + bare store;
     // `--force` overrides the unsaved-work guard (plan/0029).
@@ -4325,6 +4326,15 @@ fn software(args: &[String]) {
             "--verify-setup" => mode = Some("verify-setup"),
             "--teardown" => mode = Some("teardown"),
             "--partial" => partial = true,
+            "--artifact-delta" => {
+                mode = Some("artifact-delta");
+                let (Some(a), Some(b)) = (args.get(i + 1), args.get(i + 2)) else {
+                    eprintln!("host-lifecycle: --artifact-delta needs <refA> <refB>");
+                    process::exit(2);
+                };
+                delta_refs = Some((a.as_str(), b.as_str()));
+                i += 2;
+            }
             "--lock" => {
                 mode = Some("lock");
                 let Some(v) = args.get(i + 1) else {
@@ -4424,6 +4434,13 @@ fn software(args: &[String]) {
             println!("-- setup completeness is a different question; run: host-lifecycle software --verify-setup {dir}");
         }
         "verify-build" => software_verify_build(&root, &recipe),
+        "artifact-delta" => {
+            let Some((ref_a, ref_b)) = delta_refs else {
+                eprintln!("host-lifecycle: --artifact-delta needs <refA> <refB>");
+                process::exit(2);
+            };
+            process::exit(artifact_delta(&root, &recipe, ref_a, ref_b));
+        }
         "install-hooks" => software_install_hooks(&root, &recipe),
         "verify-setup" => process::exit(setup::verify_setup(&root, &recipe)),
         "teardown" => software_teardown(&root, &recipe, force),
@@ -5066,6 +5083,85 @@ fn run_build_in_container(runtime: &str, image: &str, build: &str, src: &Path, o
 /// rust), hash the `artifact`, and compare to the recorded sha. A `repro-exempt`
 /// component citing a real decision is reported (warn) and its rebuild skipped — the
 /// escape clause for not-yet-reproducible migrated software (issue #10).
+/// The artifact delta (host#24, plan/0099): rebuild `<refA>` and `<refB>` of one
+/// component in the recorded toolchain and report identical-or-not. A pass that
+/// claims to change nothing proves it by producing the same bytes; a comment-only
+/// diff that moves `file:line:column` panic locations is caught here, not by a
+/// human reading the diff. Exit 0 = identical, 1 = differ or build failure,
+/// 2 = usage.
+fn artifact_delta(root: &Path, recipe: &[Software], ref_a: &str, ref_b: &str) -> i32 {
+    let Some(s) = recipe.first() else {
+        eprintln!("host-lifecycle: --artifact-delta needs one component in the recipe");
+        return 2;
+    };
+    let Some(runtime) = container_runtime() else {
+        eprintln!("host-lifecycle: no container runtime (docker/podman); cannot rebuild in the recorded toolchain");
+        return 2;
+    };
+    let Some(build) = s.builds.first().and_then(|b| b.build.clone()) else {
+        eprintln!("host-lifecycle: the component records no `build` recipe to rebuild with");
+        return 2;
+    };
+    let Some(image) = s.builds.first().and_then(|b| b.toolchain.clone()) else {
+        eprintln!("host-lifecycle: the component records no `toolchain` image to rebuild in");
+        return 2;
+    };
+    let offline = s.deps_bundle.is_some();
+    let bare = store_dir(root, &s.name);
+    if !bare.is_dir() {
+        eprintln!("host-lifecycle: the component store is not materialized (run software --materialize)");
+        return 2;
+    }
+    let mut hashes: Vec<(String, String)> = Vec::new();
+    for (idx, rf) in [ref_a, ref_b].into_iter().enumerate() {
+        let work = component_dir(root, &s.name).join(format!(".host-delta-{idx}"));
+        let _ = fs::remove_dir_all(&work);
+        let work_s = work.to_string_lossy().to_string();
+        if !git_ok(&bare, &["worktree", "add", "--detach", &work_s, rf]) {
+            eprintln!("host-lifecycle: cannot create a worktree at {rf}");
+            return 2;
+        }
+        if let Some((url, want)) = &s.deps_bundle {
+            if let Err(e) = stage_deps_bundle(&work, url, want) {
+                let _ = git_ok(&bare, &["worktree", "remove", "--force", &work_s]);
+                eprintln!("host-lifecycle: deps-bundle: {e}");
+                return 2;
+            }
+        }
+        run_build_in_container(runtime, &image, build.as_str(), &work, offline);
+        let path = s
+            .builds
+            .first()
+            .and_then(|b| b.artifact.as_ref())
+            .map(|(p, _)| p.clone())
+            .unwrap_or_else(|| "target/x86_64-unknown-linux-musl/release/host-lifecycle".into());
+        let bin = work.join(&path);
+        let Some(h) = sha256_file(&bin) else {
+            eprintln!("host-lifecycle: the build produced no artifact at {path}");
+            let _ = git_ok(&bare, &["worktree", "remove", "--force", &work_s]);
+            return 2;
+        };
+        println!("delta    {rf} builds {path} @ {}", short(&h));
+        hashes.push((rf.to_string(), h));
+        let _ = git_ok(&bare, &["worktree", "remove", "--force", &work_s]);
+        let _ = fs::remove_dir_all(&work);
+    }
+    let identical = hashes.len() == 2 && hashes[0].1 == hashes[1].1;
+    println!(
+        "delta verdict: {}",
+        if identical {
+            "identical: the pass between the two refs moved no bytes"
+        } else {
+            "the artifact moved between the refs"
+        }
+    );
+    if identical {
+        0
+    } else {
+        1
+    }
+}
+
 fn software_verify_build(root: &Path, recipe: &[Software]) {
     let mut bad = 0usize;
     // plan/0052 (no-hollow-green): three states the summary and the exit code must agree
