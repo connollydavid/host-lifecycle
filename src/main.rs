@@ -4385,9 +4385,11 @@ fn software(args: &[String]) {
         "check" => {
             let mut owed: Vec<String> = Vec::new();
             let bad = software_check_owed(&root, &recipe, &mut owed);
-            // The CI clause (plan/0095): a lane discovered from the tree must have a
-            // receipted success at the revision under judgment; absence is a finding.
-            let bad = bad + ci_lane_problems(&root, &recipe);
+            // The CI clause judges in the `ci` verb, not here (plan/0096 addendum 3):
+            // inside this check the clause gated the lane that produces its own
+            // evidence, and a recorded failure re-reddened every later run forever.
+            // The judge witnesses from `host-lifecycle ci <dir>`; the per-turn duty
+            // acts on what it finds.
             if bad > 0 {
                 eprintln!("-- {bad} item(s) need attention");
                 process::exit(1);
