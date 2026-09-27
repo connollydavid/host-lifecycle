@@ -4385,6 +4385,9 @@ fn software(args: &[String]) {
         "check" => {
             let mut owed: Vec<String> = Vec::new();
             let bad = software_check_owed(&root, &recipe, &mut owed);
+            // The cfg placement (host#24): kani-gated code that no obligation
+            // declares is invisible twice over — name it in the same sweep.
+            let bad = bad + cfg_kani_problems(&root, &recipe);
             // The CI clause judges in the `ci` verb, not here (plan/0096 addendum 3):
             // inside this check the clause gated the lane that produces its own
             // evidence, and a recorded failure re-reddened every later run forever.
@@ -6839,6 +6842,66 @@ fn provenance_problems_owed(root: &Path, s: &Software, owed: &mut Vec<String>) -
 /// `allium check` + `allium analyse`; any `.tla` MUST have a TLC lane. Returns the
 /// count of components with a present spec but a missing lane (a HAZARD). An
 /// un-materialized worktree is skipped (the specs cannot be seen).
+/// The cfg-declaration placement (host#24, plan/0099): kani-gated code that no
+/// lane compiles and no obligation declares is invisible twice over. A component
+/// whose sources carry `#[cfg(kani)]` must declare the `kani:` rung in its
+/// obligations manifest — the two-way remedy: declare the rung and a lane exists,
+/// or remove the code with a recorded reason.
+fn cfg_kani_problems(root: &Path, recipe: &[Software]) -> usize {
+    let mut bad = 0usize;
+    for s in recipe {
+        let worktree = worktree_dir(root, &s.name, &s.branch);
+        if !worktree.is_dir() {
+            continue;
+        }
+        let mut gated = false;
+        let mut has_cfg_kani = false;
+        let mut stack = vec![worktree.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for e in rd.filter_map(|e| e.ok()) {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if p.is_dir() {
+                    if name != "target" && name != ".git" {
+                        stack.push(p);
+                    }
+                    continue;
+                }
+                if name.ends_with(".obligations") {
+                    if let Ok(text) = fs::read_to_string(&p) {
+                        if text.lines().any(|l| {
+                            let t = l.trim();
+                            t.starts_with("kani:") || t.starts_with("- kani:")
+                        }) {
+                            gated = true;
+                        }
+                    }
+                    continue;
+                }
+                if name.ends_with(".rs") {
+                    if let Ok(text) = fs::read_to_string(&p) {
+                        if text.contains("#[cfg(kani)]") {
+                            has_cfg_kani = true;
+                        }
+                    }
+                }
+            }
+        }
+        if has_cfg_kani && !gated {
+            println!(
+                "HAZARD   {} — sources carry #[cfg(kani)] code but the manifest declares no kani: rung; nothing compiles it and nothing declares it, invisible twice over",
+                worktree_label(&s.name, &s.branch)
+            );
+            println!(
+                "           remedy: declare a `kani:` disposition in the component's obligations manifest, or remove the gated code with a recorded reason"
+            );
+            bad += 1;
+        }
+    }
+    bad
+}
+
 fn spec_lane_problems(root: &Path, s: &Software) -> usize {
     let worktree = worktree_dir(root, &s.name, &s.branch);
     if !worktree.is_dir() {
@@ -14485,6 +14548,30 @@ mod book_tests {
         assert!(s.contains("b217881"));
         assert!(s.contains("host-lifecycle software --materialize ."));
         assert!(s.contains("perf/256k @ a0506f2deadb"));
+    }
+
+    // The cfg placement (host#24): kani-gated code that no lane compiles and no
+    // obligation declares is invisible twice over. Declaring the rung clears it;
+    // ordinary cfg gates stay invisible, as they always were.
+    #[test]
+    fn cfg_kani_code_owes_a_declared_rung() {
+        let base = std::env::temp_dir().join(format!("hl-cfgkani-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software/comp/main");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(
+            wt.join("obs.rs"),
+            "#[cfg(kani)]\nfn proof_hook() {}\n",
+        ).unwrap();
+        let recipe = parse_software("[software \"comp\"]\n url=u\n pin=p\n");
+        assert_eq!(cfg_kani_problems(&base, &recipe), 1, "gated code with no declared rung is a hazard");
+
+        // Declaring the rung in an obligations manifest clears it: the two-way
+        // remedy the placement promises.
+        fs::create_dir_all(wt.join("tests")).unwrap();
+        fs::write(wt.join("tests/comp.obligations"), "kani: proof_hook\n").unwrap();
+        assert_eq!(cfg_kani_problems(&base, &recipe), 0, "the declared rung discharges the code");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
