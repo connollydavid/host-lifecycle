@@ -6870,9 +6870,12 @@ fn cfg_kani_problems(root: &Path, recipe: &[Software]) -> usize {
                 }
                 if name.ends_with(".obligations") {
                     if let Ok(text) = fs::read_to_string(&p) {
+                        // The disposition rides mid-line (`<id> => kani:<harness>`),
+                        // so the match is on the token, never the line head; a
+                        // comment's mention declares nothing.
                         if text.lines().any(|l| {
                             let t = l.trim();
-                            t.starts_with("kani:") || t.starts_with("- kani:")
+                            !t.starts_with('#') && t.contains("kani:")
                         }) {
                             gated = true;
                         }
