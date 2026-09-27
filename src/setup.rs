@@ -44,6 +44,7 @@ pub enum RequirementKind {
     RederiverOnPath,
     SkillSourceReadable,
     SkillLinked,
+    CommitGateDeclared,
 }
 
 impl RequirementKind {
@@ -59,6 +60,7 @@ impl RequirementKind {
             RequirementKind::RederiverOnPath => "re-deriver runnable",
             RequirementKind::SkillSourceReadable => "skill source readable",
             RequirementKind::SkillLinked => "skill linked",
+            RequirementKind::CommitGateDeclared => "a commit gate is declared",
         }
     }
 
@@ -90,6 +92,11 @@ impl RequirementKind {
             },
             RequirementKind::SkillSourceReadable => format!("host-lifecycle software --materialize {dir}"),
             RequirementKind::SkillLinked => format!("host-lifecycle bootstrap {dir}"),
+            // The gate a host never declared cannot be installed or verified:
+            // declare `hooks = <script>` on a gate-provider component first.
+            RequirementKind::CommitGateDeclared => {
+                format!("declare `hooks = <script>` on a component (the gate provider), then host-lifecycle software --install-hooks {dir}")
+            }
         }
     }
 }
@@ -266,6 +273,21 @@ pub fn setup_requirements(root: &Path, recipe: &[Software]) -> Vec<Requirement> 
             _ => false,
         };
         reqs.push(need(RequirementKind::SkillLinked, skill, linked));
+    }
+
+    // The hollow-green placement (host#24, plan/0098): a recipe that declares
+    // components but no gate provider leaves every commit ungated while the
+    // completeness gate reads green. The absence of a gate is itself the gap —
+    // required here, never satisfied, so the verdict is a named HAZARD with the
+    // declaration as its remedy.
+    if !recipe.is_empty() && recipe.iter().all(|s| s.hooks.is_none()) {
+        reqs.push(Requirement {
+            kind: RequirementKind::CommitGateDeclared,
+            target: "host".to_string(),
+            required: true,
+            present: false,
+            note: String::new(),
+        });
     }
 
     // The gate providers: a component declaring a hooks script gates every commit
@@ -471,7 +493,6 @@ mod tests {
             wt_hooks[0].target
         );
         assert_eq!(verify_setup(&base, &recipe), 1, "and the run says so");
-
         // Host-role awareness, through the real requirement builder: a build the
         // recipe defers to another attest host is not required here. Deleting the
         // `built_here` conjunct left every prior test green.
@@ -506,6 +527,46 @@ mod tests {
         assert_eq!(verify_setup(&base, &no_artifact), 1, "and it never reads as complete");
         let _ = fs::remove_dir_all(&base);
     }
+
+    // The hollow-green placement (host#24, plan/0098): a recipe that declares
+    // components but no gate provider leaves every commit ungated while the gate
+    // reads green. The absence of a gate is itself the gap, required and never
+    // satisfied, so the verdict names it instead of implying it away.
+    #[test]
+    fn setup_requires_a_declared_gate_when_components_exist() {
+        let base = std::env::temp_dir().join(format!("hl-setup-nogate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let mut recipe = gate_provider_fixture(&base, false);
+        for s in &mut recipe {
+            s.hooks = None;
+        }
+        let reqs = setup_requirements(&base, &recipe);
+        let gate: Vec<&Requirement> =
+            reqs.iter().filter(|r| r.kind == RequirementKind::CommitGateDeclared).collect();
+        assert_eq!(gate.len(), 1, "one gap: the recipe declares components and no gate");
+        assert!(gate[0].is_gap(), "the absence of a declared gate is required and absent");
+        assert!(gate[0].kind.remedy(Path::new(&base), None).contains("hooks = <script>"));
+        assert_eq!(verify_setup(&base, &recipe), 1, "the run says so, never a bare green");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A gate provider declared elsewhere in the recipe satisfies the placement: the
+    // existing per-surface requirements take over, and no extra gap is added.
+    #[test]
+    fn a_declared_gate_provider_leaves_no_commit_gate_gap() {
+        let base = std::env::temp_dir().join(format!("hl-setup-gate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let recipe = gate_provider_fixture(&base, false);
+        let reqs = setup_requirements(&base, &recipe);
+        assert!(
+            !reqs.iter().any(|r| r.kind == RequirementKind::CommitGateDeclared),
+            "a declared gate provider owes no extra gap"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
 
     // A hooks gap is detected per commit surface, and a complete setup therefore
     // implies every materialized worktree is gated (the coverage invariant). The
@@ -567,11 +628,13 @@ mod tests {
             deps_bundle: None,
             builds: vec![],
         }];
-        // Nothing is materialized, so the worktree requirement gaps and the verdict
-        // is hazarded.
+        // Two causes, two gaps, no cascade: the worktree is unmaterialized, and the
+        // recipe declares no gate provider (the hollow-green placement, host#24) —
+        // the run hazards both and still reports incomplete, never one masking the
+        // other.
         assert_eq!(verify_setup(&base, &recipe), 1);
         let reqs = setup_requirements(&base, &recipe);
-        assert_eq!(reqs.iter().filter(|r| r.is_gap()).count(), 1, "one cause, one gap, no cascade");
+        assert_eq!(reqs.iter().filter(|r| r.is_gap()).count(), 2, "both causes stand alone, no cascade");
         // An empty recipe requires nothing of this host, so it is complete.
         assert_eq!(verify_setup(&base, &[]), 0);
         let _ = fs::remove_dir_all(&base);

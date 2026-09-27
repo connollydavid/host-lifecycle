@@ -52,6 +52,7 @@ fn seed_source(base: &Path) -> (std::path::PathBuf, String) {
     git(&src, &["config", "user.email", "t@t"]);
     git(&src, &["config", "user.name", "t"]);
     fs::write(src.join("readme.txt"), "seed").unwrap();
+    fs::write(src.join("hooks-script"), "#!/bin/sh\nexit 0\n").unwrap();
     git(&src, &["add", "-A"]);
     git(&src, &["commit", "-qm", "seed"]);
     let out = Command::new("git").arg("-C").arg(&src).args(["rev-parse", "HEAD"]).output().unwrap();
@@ -218,9 +219,10 @@ fn bootstrap_completion_starts_the_gate() {
     let (src, pin) = seed_source(&base);
     let host = base.join("host");
     fs::create_dir_all(&host).unwrap();
+    git(&host, &["init", "-q", "-b", "main"]);
     fs::write(
         host.join(".host-software"),
-        format!("[software \"demo\"]\n\turl = {}\n\tpin = {pin}\n", src.to_string_lossy()),
+        format!("[software \"demo\"]\n\turl = {}\n\tpin = {pin}\n\thooks = hooks-script\n\tartifact = hooks-script 306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb\n", src.to_string_lossy()),
     )
     .unwrap();
     let dir = host.to_string_lossy().to_string();
