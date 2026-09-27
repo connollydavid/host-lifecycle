@@ -135,3 +135,7 @@ rule-failure.RecordRepoStoreFinding.1          => test:dream_no_false_error_verd
 rule-success.VerdictFixRefusedOnRepoStore      => test:dream_transition_dreaming_to_error exercises=dream_outcome
 rule-failure.VerdictFixRefusedOnRepoStore.1    => test:dream_no_false_error_verdict exercises=dream_outcome
 invariant.FixNeverSettlesARepoStoreFinding     => test:dream_verdict_error_on_fail_signal exercises=dream_outcome
+
+# The kani rung (host#24 placement): the load-bearing routing proof, declared so
+# the cfg(kani) harness is compiled by a lane instead of invisible to every gate.
+kani: route_for_repo_always_appends

@@ -62,3 +62,9 @@ rule-failure.VerdictError.1                    => test:an_unreadable_declaration
 invariant.CensusNamesPresentFiles              => test:the_census_discloses_non_ascii_without_flagging_it exercises=census:
 invariant.FlaggedSawViolation                  => test:the_declared_corpus_escalates_a_warning_to_a_flag exercises=prose regression
 invariant.CleanSawNoViolation                  => test:the_census_discloses_non_ascii_without_flagging_it exercises=prose: clean
+
+# The kani rung (host#24 placement): the envhash fingerprint harnesses, declared
+# so the cfg(kani) proofs compile under a lane instead of invisible to every gate.
+kani: fact_of
+kani: the_two_artifacts_share_no_fact
+kani: facts_covers_every_recorded_fact
