@@ -177,6 +177,9 @@ pub struct DetectorInput<'a> {
     pub known_slugs: &'a BTreeSet<String>,
     /// The per-user tier's declared state, from the repo-side marker.
     pub tier: TierState,
+    /// The project root, where the rooms live: the room-touching cross-check
+    /// resolves a cited record's Status line against it (host-lifecycle#23).
+    pub repo_root: Option<&'a Path>,
     /// The tier marker's provenance line (stamp or retirement date and author),
     /// empty when the marker is absent; travels into finding explanations.
     pub tier_provenance: &'a str,
@@ -382,26 +385,78 @@ pub fn detect_dangling_link(input: &DetectorInput) -> Option<Finding> {
 /// the full cross-check is in scope for plan/0073 or a named follow-up.
 pub fn detect_room_touching(input: &DetectorInput) -> Option<Finding> {
     if let Some(room_ref) = extract_room_refs(&input.body).into_iter().next() {
+        // The cross-check (host-lifecycle#23): the cited record's own Status line
+        // is the evidence. A superseded record confirms the finding at exit-1
+        // weight; a current record is silent; an unresolvable citation stays a
+        // review prompt, because missing evidence is disclosed, never invented.
+        let status = input
+            .repo_root
+            .and_then(|root| resolve_record_status(root, &room_ref));
+        // A current record yields no finding: the cross-check exists to catch
+        // citations of superseded records, and a healthy citation is silence.
+        if let Some(s) = status.as_deref() {
+            if !s.to_lowercase().contains("superseded") {
+                return None;
+            }
+        }
+        let (confidence, state, explanation, suggestion) = match status.as_deref() {
+            Some(s) if s.to_lowercase().contains("superseded") => (
+                Confidence::Confirmed,
+                "superseded".to_string(),
+                format!(
+                    "confirmed: the body cites `{room_ref}`, whose Status line reads `{s}`; the cross-check resolved it against the record itself"
+                ),
+                "Re-point the entry at the superseding record, or retire the entry via an audited MADR commit. Do not edit the memory entry or append to the log on this finding alone."
+                    .to_string(),
+            ),
+            // A current record: silence, handled above.
+            Some(_) => return None,
+            None => (
+                Confidence::ReviewPrompt,
+                String::new(),
+                format!(
+                    "review prompt: body cites `{room_ref}`; the record could not be resolved in the repo's rooms, so supersession is unverified"
+                ),
+                format!(
+                    "Leave a review note: confirm whether the cited record `{room_ref}` is still current. Only after operator confirmation is the record marked `Status: superseded` via an audited MADR commit; do not act on this prompt alone. Do not edit the memory entry or append to the log."
+                ),
+            ),
+        };
         return Some(Finding {
             entry_slug: input.slug.clone(),
             store: input.store,
             kind: "room-touching".to_string(),
             route: DetectorInput::route_for(input.store),
-            // Review prompt (call/0045): until the applied-receipts cross-check
-            // lands, the supersession is an unverified hypothesis. The label and
-            // the softened lead remedy travel in the prose, because the prose is
-            // what a weak agent obeys (W1).
-            confidence: Confidence::ReviewPrompt,
-            state: String::new(),
-            explanation: format!(
-                "review prompt: body cites `{room_ref}`; whether the spine superseded it is unverified until the applied-receipts cross-check lands"
-            ),
-            suggestion: format!(
-                "Leave a review note: confirm whether the cited record `{room_ref}` is still current. Only after operator confirmation is the record marked `Status: superseded` via an audited MADR commit; do not act on this prompt alone. Do not edit the memory entry or append to the log."
-            ),
+            confidence,
+            state,
+            explanation,
+            suggestion,
         });
     }
     None
+}
+
+/// The cited record's Status line, when the record resolves in the repo's own
+/// rooms: `plan/NNNN*/README.md` or `call/NNNN*.md`. The Status line is the
+/// record's own testimony about itself; nothing else confirms supersession.
+fn resolve_record_status(repo_root: &Path, room_ref: &str) -> Option<String> {
+    let (room, num) = room_ref.split_once('/')?;
+    let dir = Path::new(repo_root).join(room);
+    let entry = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().starts_with(num))?;
+    let text = if room == "plan" {
+        fs::read_to_string(entry.path().join("README.md")).ok()?
+    } else {
+        fs::read_to_string(entry.path()).ok()?
+    };
+    let line = text.lines().find(|l| {
+        let t = l.trim();
+        (t.starts_with("Status:") || t.starts_with("- Status:"))
+            && !t.to_lowercase().contains("status: use records")
+    })?;
+    Some(line.trim().trim_start_matches("- ").trim().to_string())
 }
 
 /// Description-body-drift: HEURISTIC. The entry's `description:` (what recall
@@ -990,6 +1045,7 @@ pub fn run_audit_with_home(project_dir: &Path, home: Option<&Path>) -> Audit {
             entry_type: entry.entry_type.clone(),
             store: StoreLoc::PerUser,
             store_dir: per_user_store.as_ref().map(|s| s.dir()),
+            repo_root: Some(project_dir),
             known_slugs: &union_slugs,
             tier: marker.state,
             tier_provenance: &marker.provenance,
@@ -1012,6 +1068,7 @@ pub fn run_audit_with_home(project_dir: &Path, home: Option<&Path>) -> Audit {
             entry_type: EntryType::Fact,
             store: StoreLoc::Repo,
             store_dir: None,
+            repo_root: Some(project_dir),
             known_slugs: &union_slugs,
             tier: marker.state,
             tier_provenance: &marker.provenance,
@@ -1385,6 +1442,7 @@ mod tests {
             entry_type: EntryType::Fact,
             store: StoreLoc::PerUser,
             store_dir: None,
+            repo_root: None,
             known_slugs: slugs,
             tier: TierState::Stamped,
             tier_provenance: "",
@@ -1893,6 +1951,74 @@ mod tests {
         let body = "as recorded in call/0017 and revisited in plan/0042; call/0017 again";
         let refs = extract_room_refs(body);
         assert_eq!(refs, vec!["call/0017", "plan/0042", "call/0017"]);
+    }
+
+    // The cross-check (host-lifecycle#23): the cited record's own Status line is
+    // the evidence. Superseded confirms at exit-1 weight; current is silence; an
+    // unresolvable citation stays a review prompt.
+    #[test]
+    fn room_touching_cross_checks_the_cited_record_status() {
+        let root = std::env::temp_dir().join(format!("hl-room-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("plan/0001-old")).unwrap();
+        fs::write(
+            root.join("plan/0001-old/README.md"),
+            "# plan/0001 old\n\n- Status: superseded by call/0002\n",
+        ).unwrap();
+        let slugs = std::sync::Arc::new({
+            let mut s = std::collections::BTreeSet::new();
+            s.insert("entry".to_string());
+            s
+        });
+        fn mk<'a>(
+            body: &str,
+            root: Option<&'a std::path::Path>,
+            slugs: &'a std::collections::BTreeSet<String>,
+        ) -> DetectorInput<'a> {
+            DetectorInput {
+                slug: "entry".to_string(),
+                description: String::new(),
+                body: body.to_string(),
+                superseded_by: String::new(),
+                entry_type: EntryType::Fact,
+                store: StoreLoc::Repo,
+                store_dir: None,
+                repo_root: root,
+                known_slugs: slugs,
+                tier: TierState::Stamped,
+                tier_provenance: "",
+                store_present: true,
+            }
+        }
+
+        // Superseded: the cross-check confirms at exit-1 weight.
+        let f = detect_room_touching(&mk(
+            "as recorded in plan/0001",
+            Some(&root),
+            &slugs,
+        )).unwrap();
+        assert_eq!(f.confidence, Confidence::Confirmed, "a superseded citation confirms");
+        assert!(f.explanation.contains("Status line"), "the evidence is named");
+
+        // Current: the record's Status is accepted, so the citation is silence.
+        fs::create_dir_all(root.join("plan/0002-new")).unwrap();
+        fs::write(
+            root.join("plan/0002-new/README.md"),
+            "# plan/0002 new\n\n- Status: accepted\n",
+        ).unwrap();
+        assert!(detect_room_touching(&mk(
+            "as recorded in plan/0002",
+            Some(&root),
+            &slugs,
+        )).is_none(), "a current citation is silence");
+
+        // Unresolvable: no repo root, no evidence, the review prompt stands.
+        assert!(detect_room_touching(&mk(
+            "as recorded in plan/0099",
+            Some(&root),
+            &slugs,
+        )).is_some(), "missing evidence stays a review prompt");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
