@@ -7,7 +7,7 @@ license = "Unlicense"
 
 [dependencies]
 host-grammar = { git = "https://github.com/connollydavid/host-grammar", rev = "6cd41c37f06a62652d9fb767cae675225cea5d01" }
-host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "54f267f24a4e56e33e8f56ed260b40b2629a5d03" }
+host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "d140d398d60a32de02045c76acd1c3c3611fe323" }
 # The MCP stdio surface (plan/0065, call/0042): hand-rolled JSON-RPC on tokio + serde_json.
 # tokio is required (operator directive); features are held to a current-thread stdio server
 # (no net, no multi-thread) to keep the vendored reproducible-build set as small as the surface allows.
