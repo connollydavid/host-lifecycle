@@ -4306,7 +4306,7 @@ fn software(args: &[String]) {
     // from the recorded pin and drives its release (plan/0057). The name is the flag's
     // value, not a positional, so it never collides with the `<dir>` positional.
     let mut lock_name: Option<&str> = None;
-    let mut delta_refs: Option<(&str, &str)> = None;
+
     let mut authorized: Option<String> = None;
     // `--teardown` removes a component's materialized worktrees + bare store;
     // `--force` overrides the unsaved-work guard (plan/0029).
@@ -4326,15 +4326,7 @@ fn software(args: &[String]) {
             "--verify-setup" => mode = Some("verify-setup"),
             "--teardown" => mode = Some("teardown"),
             "--partial" => partial = true,
-            "--artifact-delta" => {
-                mode = Some("artifact-delta");
-                let (Some(a), Some(b)) = (args.get(i + 1), args.get(i + 2)) else {
-                    eprintln!("host-lifecycle: --artifact-delta needs <refA> <refB>");
-                    process::exit(2);
-                };
-                delta_refs = Some((a.as_str(), b.as_str()));
-                i += 2;
-            }
+            "--artifact-delta" => mode = Some("artifact-delta"),
             "--lock" => {
                 mode = Some("lock");
                 let Some(v) = args.get(i + 1) else {
@@ -4434,12 +4426,21 @@ fn software(args: &[String]) {
             println!("-- setup completeness is a different question; run: host-lifecycle software --verify-setup {dir}");
         }
         "verify-build" => software_verify_build(&root, &recipe),
+        // The usage: `<component> <refA> <refB> <dir>` — the component named first,
+        // the two refs, the host root last.
         "artifact-delta" => {
-            let Some((ref_a, ref_b)) = delta_refs else {
-                eprintln!("host-lifecycle: --artifact-delta needs <refA> <refB>");
+            if pos.len() != 4 {
+                eprintln!("host-lifecycle: usage: software --artifact-delta <component> <refA> <refB> <dir>");
+                return;
+            }
+            let component = pos[0].as_str();
+            let ref_a = pos[1].as_str();
+            let ref_b = pos[2].as_str();
+            let Some(s) = recipe.iter().find(|s| s.name == component) else {
+                eprintln!("host-lifecycle: no component `{component}` in the recipe");
                 process::exit(2);
             };
-            process::exit(artifact_delta(&root, &recipe, ref_a, ref_b));
+            process::exit(artifact_delta_pair(&root, s, ref_a, ref_b));
         }
         "install-hooks" => software_install_hooks(&root, &recipe),
         "verify-setup" => process::exit(setup::verify_setup(&root, &recipe)),
@@ -5089,11 +5090,9 @@ fn run_build_in_container(runtime: &str, image: &str, build: &str, src: &Path, o
 /// diff that moves `file:line:column` panic locations is caught here, not by a
 /// human reading the diff. Exit 0 = identical, 1 = differ or build failure,
 /// 2 = usage.
-fn artifact_delta(root: &Path, recipe: &[Software], ref_a: &str, ref_b: &str) -> i32 {
-    let Some(s) = recipe.first() else {
-        eprintln!("host-lifecycle: --artifact-delta needs one component in the recipe");
-        return 2;
-    };
+/// The variant bound to one component: `recipe.first()` in the generic caller,
+/// the named component here.
+fn artifact_delta_pair(root: &Path, s: &Software, ref_a: &str, ref_b: &str) -> i32 {
     let Some(runtime) = container_runtime() else {
         eprintln!("host-lifecycle: no container runtime (docker/podman); cannot rebuild in the recorded toolchain");
         return 2;
