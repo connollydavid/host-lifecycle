@@ -451,12 +451,24 @@ fn resolve_record_status(repo_root: &Path, room_ref: &str) -> Option<String> {
     } else {
         fs::read_to_string(entry.path()).ok()?
     };
+    // The Status line travels bolded in rendered records (`**Status: ...**`) and
+    // plain in decisions (`- Status: ...`): strip the emphasis wrappers, then read.
     let line = text.lines().find(|l| {
-        let t = l.trim();
-        (t.starts_with("Status:") || t.starts_with("- Status:"))
-            && !t.to_lowercase().contains("status: use records")
+        let t = l
+            .trim()
+            .trim_start_matches(['*', '_', '-'])
+            .trim()
+            .to_lowercase();
+        t.starts_with("status:") && !t.contains("status: use records")
     })?;
-    Some(line.trim().trim_start_matches("- ").trim().to_string())
+    let value = line
+        .trim()
+        .trim_start_matches(['*', '_', '-'])
+        .trim()
+        .trim_start_matches("Status:")
+        .trim()
+        .to_string();
+    Some(format!("Status:{value}"))
 }
 
 /// Description-body-drift: HEURISTIC. The entry's `description:` (what recall
