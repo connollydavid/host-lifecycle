@@ -4359,9 +4359,22 @@ fn software(args: &[String]) {
         }
         i += 1;
     }
-    let Some(dir) = pos.first() else {
-        eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--verify-setup|--install-hooks|--teardown|--lock <name>> [--item <name>[@<branch>]] [--force] [--partial] <dir>");
-        process::exit(2);
+    // The artifact-delta mode carries four positionals (component, refA, refB, dir):
+    // the dir rides LAST there, while every other mode takes it first.
+    let dir = if mode == Some("artifact-delta") {
+        let Some(d) = pos.last() else {
+            eprintln!("host-lifecycle: --artifact-delta needs <component> <refA> <refB> <dir>");
+            process::exit(2);
+        };
+        d
+    } else {
+        match pos.first() {
+            Some(d) => d,
+            None => {
+                eprintln!("host-lifecycle software <--materialize|--check|--verify-build|--verify-setup|--install-hooks|--teardown|--lock <name>> [--item <name>[@<branch>]] [--force] [--partial] <dir>");
+                process::exit(2);
+            }
+        }
     };
     let Some(mode) = mode else {
         eprintln!("host-lifecycle software needs --materialize, --check, --verify-build, --verify-setup, --install-hooks, --teardown, or --lock <name>");
