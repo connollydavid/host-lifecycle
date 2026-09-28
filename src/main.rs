@@ -4403,6 +4403,9 @@ fn software(args: &[String]) {
             // The cfg placement (host#24): kani-gated code that no obligation
             // declares is invisible twice over — name it in the same sweep.
             let bad = bad + cfg_kani_problems(&root, &recipe);
+            // The derived inventory (host#24): a source file in no task's
+            // inputs and no exclusion is work no task was ever assigned.
+            let bad = bad + inventory_coverage_problems(&root, &recipe);
             // The CI clause judges in the `ci` verb, not here (plan/0096 addendum 3):
             // inside this check the clause gated the lane that produces its own
             // evidence, and a recorded failure re-reddened every later run forever.
@@ -7006,6 +7009,99 @@ fn cfg_kani_problems(root: &Path, recipe: &[Software]) -> usize {
             );
             println!(
                 "           remedy: declare a `kani:` disposition in the component's obligations manifest, or remove the gated code with a recorded reason"
+            );
+            bad += 1;
+        }
+    }
+    bad
+}
+
+// The derived inventory (host#24): a milestone module list typed by hand was
+// truncated, and five modules of twenty-two were never assigned work. The
+// inventory is derived instead: every Rust source under a materialized
+// component's `src/` must appear in some task's `inputs` (the plan room's task
+// graphs) or in an explicit exclusion carrying a reason (.host-inventory), so
+// a dropped file fails by absence — the failure mode a hand-typed list cannot
+// have. The reconcile coverage check is the model.
+fn inventory_coverage_problems(root: &Path, recipe: &[Software]) -> usize {
+    let mut bad = 0usize;
+    // Task inputs: `- inputs: <path>` lines in the tracked plan READMEs,
+    // repo-root relative; a directory input covers everything under it.
+    let mut covered: Vec<String> = Vec::new();
+    if let Ok(rd) = fs::read_dir(root.join("plan")) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let Ok(text) = fs::read_to_string(e.path().join("README.md")) else { continue };
+            for line in text.lines() {
+                let Some(rest) = line.trim().strip_prefix("- inputs:") else { continue };
+                let p = rest.trim().trim_start_matches("./").trim_end_matches('/');
+                if !p.is_empty() {
+                    covered.push(p.to_string());
+                }
+            }
+        }
+    }
+    // The exclusion ledger: `<path> <reason>` per line. The reason is what
+    // makes it an exclusion; a bare path is its own HAZARD, never a cover.
+    let mut excluded: Vec<String> = Vec::new();
+    if let Ok(text) = fs::read_to_string(root.join(".host-inventory")) {
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            match t.split_once(char::is_whitespace) {
+                Some((p, r)) if !r.trim().is_empty() => excluded.push(p.to_string()),
+                _ => {
+                    println!(
+                        "HAZARD   .host-inventory — `{t}` carries no reason; a stated reason is what makes an exclusion one"
+                    );
+                    bad += 1;
+                }
+            }
+        }
+    }
+    let is_covered = |rel: &str| {
+        covered.iter().any(|c| rel == c || rel.starts_with(&format!("{c}/")))
+            || excluded.iter().any(|x| rel == x || rel.starts_with(&format!("{x}/")))
+    };
+    for s in recipe {
+        let worktree = worktree_dir(root, &s.name, &s.branch);
+        let src = worktree.join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut uncovered: Vec<String> = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for e in rd.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let Ok(rel) = p.strip_prefix(root) else { continue };
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if !is_covered(&rel) {
+                    uncovered.push(rel);
+                }
+            }
+        }
+        if !uncovered.is_empty() {
+            uncovered.sort();
+            println!(
+                "HAZARD   {} — {} source file(s) in no task's inputs and no exclusion; the derived inventory dropped them by absence",
+                worktree_label(&s.name, &s.branch),
+                uncovered.len()
+            );
+            for f in &uncovered {
+                println!("           {f}");
+            }
+            println!(
+                "           remedy: cite the file in some task's `- inputs:` line, or record `<path> <reason>` in .host-inventory"
             );
             bad += 1;
         }
@@ -14682,6 +14778,59 @@ mod book_tests {
         fs::create_dir_all(wt.join("tests")).unwrap();
         fs::write(wt.join("tests/comp.obligations"), "kani: proof_hook\n").unwrap();
         assert_eq!(cfg_kani_problems(&base, &recipe), 0, "the declared rung discharges the code");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The derived inventory (host#24): the module list is derived, never typed.
+    // A source file covered by a task input or a reasoned exclusion passes; a
+    // dropped file fails by absence; an exclusion without a reason is its own
+    // hazard, never a silent cover.
+    #[test]
+    fn derived_inventory_covers_every_source_or_names_the_drop() {
+        let base = std::env::temp_dir().join(format!("hl-inventory-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software/comp/main/src");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("kept.rs"), "pub fn kept() {}\n").unwrap();
+        fs::write(wt.join("dropped.rs"), "pub fn dropped() {}\n").unwrap();
+        fs::create_dir_all(base.join("plan/0001-x")).unwrap();
+        fs::write(
+            base.join("plan/0001-x/README.md"),
+            "### task {#t}\n- verify: attested operator\n- inputs: software/comp/main/src/kept.rs\n",
+        )
+        .unwrap();
+        let recipe = parse_software("[software \"comp\"]\n url=u\n pin=p\n");
+        assert_eq!(
+            inventory_coverage_problems(&base, &recipe),
+            1,
+            "the file in no task's inputs fails by absence"
+        );
+
+        // A reasoned exclusion covers the dropped file; a directory input
+        // covers everything under it; a reasonless exclusion is its own hazard.
+        fs::write(
+            base.join(".host-inventory"),
+            "# the ledger\nsoftware/comp/main/src/dropped.rs predates the convention; receipted under plan/0001\n",
+        )
+        .unwrap();
+        assert_eq!(inventory_coverage_problems(&base, &recipe), 0, "the reasoned exclusion covers");
+        fs::write(base.join(".host-inventory"), "software/comp/main/src/dropped.rs\n").unwrap();
+        assert_eq!(
+            inventory_coverage_problems(&base, &recipe),
+            2,
+            "an exclusion without a reason is its own hazard AND no longer covers the file"
+        );
+        fs::write(base.join(".host-inventory"), "").unwrap();
+        fs::write(
+            base.join("plan/0001-x/README.md"),
+            "### task {#t}\n- inputs: software/comp/main/src\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inventory_coverage_problems(&base, &recipe),
+            0,
+            "a directory input covers everything under it"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
