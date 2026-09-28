@@ -4866,6 +4866,9 @@ fn ci_lane_problems_mode(root: &Path, recipe: &[Software], gate: bool) -> usize 
 /// receipt; `--record <label>/<lane> --run <url>` with `--conclusion` defaulting to
 /// success and `--revision` to the lane's judged revision. The writer runs where
 /// network exists; the judge never touches it.
+fn lane_label(comp: &str) -> (&str, &str) {
+    comp.rsplit_once('/').unwrap_or((comp, ""))
+}
 fn ci_command(args: &[String]) {
     let mut dir = String::from(".");
     let (mut record, mut run, mut revision, mut conclusion) = (None, None, None, None);
@@ -4906,8 +4909,12 @@ fn ci_command(args: &[String]) {
         process::exit(2);
     };
     // The judged revision for this lane: the component's recorded pin, or the host
-    // root's HEAD — the same revision the judge will demand the receipt at.
-    let (label, _lane) = comp.split_once('/').unwrap_or((comp.as_str(), comp.as_str()));
+    // root's HEAD — the same revision the judge will demand the receipt at. The
+    // label is everything before the LANE (the last segment): a component's comp
+    // is `software/<name>/<branch>/<lane>`, and a first-segment split yields
+    // `software`, which matches no worktree label, so the default revision came
+    // out empty for every component lane (plan/0099).
+    let (label, _lane) = lane_label(&comp);
     let expected = if label == "host" {
         git_out(&root, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
     } else {
@@ -14832,6 +14839,17 @@ mod book_tests {
             "a directory input covers everything under it"
         );
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lane_label_takes_everything_before_the_lane() {
+        // The judge's comp strings: `software/<name>/<branch>/<lane>` for a
+        // component, `host/<lane>` for the host root. The label that resolves a
+        // judged revision is the worktree label (or `host`), never the first
+        // path segment.
+        assert_eq!(lane_label("software/host-lint/main/ci"), ("software/host-lint/main", "ci"));
+        assert_eq!(lane_label("host/reproducible-build"), ("host", "reproducible-build"));
+        assert_eq!(lane_label("barelane"), ("barelane", ""));
     }
 
     #[test]
