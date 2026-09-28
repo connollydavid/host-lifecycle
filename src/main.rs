@@ -5110,11 +5110,11 @@ fn artifact_delta_pair(root: &Path, s: &Software, ref_a: &str, ref_b: &str) -> i
         eprintln!("host-lifecycle: no container runtime (docker/podman); cannot rebuild in the recorded toolchain");
         return 2;
     };
-    let Some(build) = s.builds.first().and_then(|b| b.build.clone()) else {
+    let Some(build) = s.builds_view().first().and_then(|v| v.build).map(str::to_string) else {
         eprintln!("host-lifecycle: the component records no `build` recipe to rebuild with");
         return 2;
     };
-    let Some(image) = s.builds.first().and_then(|b| b.toolchain.clone()) else {
+    let Some(image) = s.builds_view().first().and_then(|v| v.toolchain).map(str::to_string) else {
         eprintln!("host-lifecycle: the component records no `toolchain` image to rebuild in");
         return 2;
     };
@@ -5140,7 +5140,7 @@ fn artifact_delta_pair(root: &Path, s: &Software, ref_a: &str, ref_b: &str) -> i
                 return 2;
             }
         }
-        run_build_in_container(runtime, &image, build.as_str(), &work, offline);
+        run_build_in_container(runtime, &image, &build, &work, offline);
         let path = s
             .builds
             .first()
