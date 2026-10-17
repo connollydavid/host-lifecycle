@@ -4810,7 +4810,7 @@ fn ci_lane_problems_mode(root: &Path, recipe: &[Software], gate: bool) -> usize 
                     && r
                         .revision
                         .as_deref()
-                        .is_some_and(&on_current_line)
+                        .is_some_and(on_current_line)
             });
             match discharged {
                 Some(r) if r.disposition == "done" && r.conclusion.as_deref() == Some("success") => {
