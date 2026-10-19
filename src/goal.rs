@@ -646,10 +646,11 @@ fn door_path(root: &Path, harness: &str, name: &str) -> PathBuf {
     root.join(dir).join(format!("{name}.md"))
 }
 
-/// `host-lifecycle seam <dir> [--check]` — emit (or verify) the door family's
-/// per-harness renderings from the one source above. Generated artifacts: a
+/// `host-lifecycle install <dir> [--check]` — install (or verify) the door family's
+/// per-harness renderings from the one source above. The concept: the tool's
+/// interface, installed into the harness's own command surface. Generated artifacts: a
 /// mismatch is a HAZARD naming the regenerate command, the `book --check` shape.
-pub fn seam(args: &[String]) {
+pub fn install(args: &[String]) {
     let check = args.iter().any(|a| a == "--check");
     let root = args
         .iter()
@@ -666,7 +667,7 @@ pub fn seam(args: &[String]) {
                 let have = std::fs::read_to_string(&path).unwrap_or_default();
                 if have != want {
                     println!("HAZARD   {harness}/{} — the door is absent or hand-edited", d.name);
-                    println!("           remedy: host-lifecycle seam .");
+                    println!("           remedy: host-lifecycle install .");
                     bad += 1;
                 }
             } else {
@@ -674,7 +675,7 @@ pub fn seam(args: &[String]) {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 if let Err(e) = std::fs::write(&path, &want) {
-                    eprintln!("host-lifecycle: seam: cannot write {}: {e}", path.display());
+                    eprintln!("host-lifecycle: install: cannot write {}: {e}", path.display());
                     process::exit(2);
                 }
                 println!("door     {harness}/{} (injects: {})", d.name, d.injection);
@@ -685,7 +686,7 @@ pub fn seam(args: &[String]) {
         process::exit(1);
     }
     if !check {
-        println!("seam: {} door(s) x 2 harnesses emitted; verify with: host-lifecycle seam --check .", DOORS.len());
+        println!("install: {} door(s) x 2 harnesses emitted; verify with: host-lifecycle install --check .", DOORS.len());
     }
 }
 
@@ -1058,12 +1059,12 @@ mod tests {
     }
 
     #[test]
-    fn seam_emits_idempotently_and_check_guards_hand_edits() {
-        let root = temp_root("seam");
+    fn install_emits_idempotently_and_check_guards_hand_edits() {
+        let root = temp_root("install");
         let dir = root.to_string_lossy().to_string();
-        seam(std::slice::from_ref(&dir));
+        install(std::slice::from_ref(&dir));
         let first = std::fs::read_to_string(door_path(&root, "opencode", "host-goal")).unwrap();
-        seam(&[dir]);
+        install(&[dir]);
         let second = std::fs::read_to_string(door_path(&root, "opencode", "host-goal")).unwrap();
         assert_eq!(first, second);
         assert!(first.contains("!`host-lifecycle goal show .`"));

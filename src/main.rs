@@ -140,7 +140,7 @@ fn main() {
         Some("migrate-recipe") => migrate_recipe(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
         Some("goal") => goal::goal(&args[2..]),
-        Some("seam") => goal::seam(&args[2..]),
+        Some("install") => goal::install(&args[2..]),
         Some("dream") => dream::dream(&args[2..]),
         Some("env") => envhash::env(&args[2..]),
         Some("bootstrap") => bootstrap::bootstrap(&args[2..]),
@@ -148,7 +148,7 @@ fn main() {
         Some("refs") => refs::refs(&args[2..]),
         Some("capability") => capability(&args[2..]),
         _ => {
-            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|bootstrap|env|resolve|refs|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|migrate-recipe|tasks|goal|seam|dream> ...");
+            eprintln!("usage: host-lifecycle <validate|next|adopt|init|scaffold|mcp|version|classify|remap|software|bootstrap|env|resolve|refs|upgrade|book|obligations|manifest|receipt|release|prose|reconcile|entrance|migrate-receipts|migrate-recipe|tasks|goal|install|dream> ...");
             eprintln!("  validate <dir>                — every NNNN-slug entry is well-formed");
             eprintln!("  next <dir>                    — print the next zero-padded number");
             eprintln!("  scaffold <dir> <rev> [--dry-run] — scaffold rooms + write the stamp (the primitive; call/0041)");
