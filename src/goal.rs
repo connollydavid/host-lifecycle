@@ -511,7 +511,10 @@ fn complete_gate(root: &Path, target: &str) -> Vec<Hazard> {
         if let Ok(o) = cmd.output() {
             if !o.status.success() {
                 let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-                for line in text.lines().filter(|l| !l.trim().is_empty()).take(4) {
+                // Pass through the child's own hazard lines only: a failing
+                // sweep still prints ok lines, and an ok line is never a
+                // hazard whatever wrapped it.
+                for line in text.lines().filter(|l| l.contains("HAZARD")) {
                     hazards.push(Hazard {
                         label: label.into(),
                         note: line.trim().to_string(),
@@ -767,7 +770,11 @@ fn show(root: &Path) {
         Ok(text) => print!("{text}"),
         Err(e) => {
             eprintln!("host-lifecycle: goal: REFUSING TO EMIT. {e}");
-            eprintln!("host-lifecycle: goal repair .");
+            // The refusal shares the emission's shape (the first convening's
+            // ruling): the move rides the last line, NEXT-labeled, so the
+            // weak model reads one form everywhere. Measured: the bare
+            // unlabeled command was ignored 4 of 4 times.
+            eprintln!("NEXT: host-lifecycle goal repair .");
             process::exit(2);
         }
     }
