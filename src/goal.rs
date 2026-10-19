@@ -179,31 +179,49 @@ fn valid_target(root: &Path, target: &str) -> bool {
 }
 
 /// The first sentence of the milestone's Why section: the purpose line, human
-/// and short. Falls back to the title when no Why section exists.
+/// and short. Hard-wrapped paragraphs are joined before the sentence is cut.
+/// Falls back to the title when no Why section exists.
 fn purpose_of(readme: &str) -> String {
     let mut in_why = false;
+    let mut para: Vec<String> = Vec::new();
     for line in readme.lines() {
         let t = line.trim();
         if t.starts_with("## ") {
+            if in_why && !para.is_empty() {
+                break;
+            }
             in_why = t == "## Why";
             continue;
         }
-        if in_why && !t.is_empty() {
-            let sentence: String = t.chars().take_while(|&c| c != '.' && c != '\n').collect();
-            let clean = sentence
-                .trim_start_matches("- ")
-                .replace(['`', '*', '[', ']'], "");
-            let s = clean.trim();
-            if !s.is_empty() {
-                return truncate(s, 120);
+        if !in_why {
+            continue;
+        }
+        if t.is_empty() {
+            if !para.is_empty() {
+                break;
             }
+        } else {
+            para.push(t.to_string());
         }
     }
-    readme
-        .lines()
-        .next()
-        .map(|l| truncate(l.trim_start_matches("# ").trim(), 120))
-        .unwrap_or_else(|| "(none stated)".to_string())
+    if para.is_empty() {
+        return readme
+            .lines()
+            .next()
+            .map(|l| truncate(l.trim_start_matches("# ").trim(), 120))
+            .unwrap_or_else(|| "(none stated)".to_string());
+    }
+    let joined = para.join(" ");
+    let sentence: String = joined.chars().take_while(|&c| c != '.').collect();
+    let clean = sentence
+        .trim_start_matches("- ")
+        .replace(['`', '*', '[', ']'], "");
+    let s = clean.trim();
+    if s.is_empty() {
+        "(none stated)".to_string()
+    } else {
+        truncate(s, 120)
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -871,8 +889,8 @@ mod tests {
     }
 
     #[test]
-    fn purpose_takes_the_first_sentence_of_why() {
-        let readme = "# plan/0100: x\n\n## Why\n\nLand the thing without breaking the box. More context follows.\n";
+    fn purpose_joins_wrapped_lines_before_the_sentence_cut() {
+        let readme = "# plan/0100: x\n\n## Why\n\nLand the thing\nwithout breaking the box. More context follows.\n";
         assert_eq!(purpose_of(readme), "Land the thing without breaking the box");
     }
 
