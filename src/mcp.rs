@@ -79,6 +79,22 @@ fn tool_defs() -> Value {
             "name": "memory_consolidate",
             "description": "Run the dream audit over both memory stores (repo MEMORY.md + per-user) and return the findings. Read-only; the advisory memory-consolidation pass.",
             "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "goal_show",
+            "description": "The orientation emission (plan/0101): purpose, position, needs-you, CI, frontier, tree, and the suggested next move on the last line. Read-only; the loop's whole interface.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "goal_propose",
+            "description": "Print the exact goal set command for the operator to run. Writes nothing: this is the agent-side path; the control verbs stay in the operator's hand, their authority the audited commit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "the plan/NNNN-slug milestone to propose as the active goal"}
+                },
+                "required": ["target"]
+            }
         }
     ])
 }
@@ -427,6 +443,30 @@ where
         return handle_memory_call(verb, &args, project_dir);
     }
 
+    // Goal tools (plan/0101): the read and the agent path, driven through the
+    // CLI subprocess like init/adopt. The control verbs stay CLI-only.
+    if matches!(verb, "goal_show" | "goal_propose") {
+        let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let mut argv = vec!["goal".to_string()];
+        match verb {
+            "goal_show" => argv.push("show".into()),
+            _ => {
+                let t = args
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let Some(t) = t else {
+                    return tool_result("goal_propose requires `target` (a plan/NNNN-slug)", true);
+                };
+                argv.push("propose".into());
+                argv.push(t.to_string());
+            }
+        }
+        let (text, code) = run_verb(&argv);
+        return tool_result(&text, code != 0);
+    }
+
     if verb != "init" && verb != "adopt" {
         return tool_result(&format!("unknown tool: {verb}"), true);
     }
@@ -469,7 +509,7 @@ mod tests {
         assert_eq!(initialize_result()["protocolVersion"], PROTOCOL_VERSION);
         assert!(initialize_result()["capabilities"]["tools"].is_object());
         let tools = tool_defs();
-        assert_eq!(tools.as_array().unwrap().len(), 6);
+        assert_eq!(tools.as_array().unwrap().len(), 8);
         assert_eq!(tools[0]["name"], "init");
         assert_eq!(tools[1]["name"], "adopt");
         assert_eq!(tools[2]["name"], "memory_list");
@@ -554,6 +594,26 @@ mod tests {
         assert!(text.contains("elicitation/create"), "the server elicited the name");
         assert!(text.contains("host-path: ./agentic-acme"), "the re-run handoff is the tool result");
         assert!(text.contains("--name acme"), "the re-run passed the elicited name");
+    }
+
+    // The goal tools ride the same subprocess path as init/adopt (plan/0101):
+    // the read takes no arguments, and the agent path requires its target.
+    #[tokio::test]
+    async fn goal_tools_list_and_call() {
+        let mut out: Vec<u8> = Vec::new();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"goal_show","arguments":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"goal_propose","arguments":{"target":"plan/0100-fixture"}}}"#, "\n",
+        );
+        let run = |argv: &[String]| (format!("argv: {}\n", argv.join(" ")), 0);
+        serve(BufReader::new(input.as_bytes()), &mut out, run, std::path::PathBuf::from(".")).await;
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("goal_show"), "tools/list carried the goal read");
+        assert!(text.contains("goal_propose"), "tools/list carried the agent path");
+        assert!(text.contains("argv: goal show"), "the read rode the CLI subprocess");
+        assert!(text.contains("argv: goal propose plan/0100-fixture"), "the propose carried its target");
     }
 
     // Without the elicitation capability, a nameless call returns the name-required text as an

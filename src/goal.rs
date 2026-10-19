@@ -329,6 +329,11 @@ fn tree_line(root: &Path) -> String {
 /// same-tree-same-bytes.
 fn emission(root: &Path) -> Result<String, String> {
     let receipts = read_goal_receipts(root);
+    if let Some((target, kind)) = unresolved_closure(root, &receipts) {
+        return Ok(format!(
+            "GOAL: {target}\nNEEDS YOU: the closure pair is incomplete (the {kind} receipt landed without the Status transition); reconcile it\nNEXT: host-lifecycle goal repair .\n"
+        ));
+    }
     let state = goal_state(&receipts);
     let mut out = Vec::new();
     match &state {
@@ -766,6 +771,35 @@ pub fn goal(args: &[String]) {
     }
 }
 
+/// The closure pair check (the freeze bench's crash window): a complete or
+/// abandon receipt whose Status-line transition never landed is an UNRESOLVED
+/// closure, never a false green. The reader surface reports it and routes to
+/// repair; repair finishes the interrupted write.
+fn unresolved_closure(root: &Path, receipts: &[Receipt]) -> Option<(String, &'static str)> {
+    let last = receipts
+        .iter()
+        .rev()
+        .find(|r| r.phase == "goal" && matches!(r.component.as_deref(), Some("complete") | Some("abandon")));
+    let r = last?;
+    let target = r.target.clone()?;
+    let wanted = match r.component.as_deref() {
+        Some("complete") => " — complete 2",
+        _ => " — abandoned 2",
+    };
+    let readme = std::fs::read_to_string(readme_path(root, &target)).ok()?;
+    let status_landed = readme
+        .lines()
+        .any(|l| l.trim_start().starts_with("**Status:") && l.contains(wanted));
+    if status_landed {
+        None
+    } else {
+        Some((target, match r.component.as_deref() {
+            Some("complete") => "complete",
+            _ => "abandoned",
+        }))
+    }
+}
+
 fn show(root: &Path) {
     match emission(root) {
         Ok(text) => print!("{text}"),
@@ -894,7 +928,19 @@ fn abandon(root: &Path, reason: Option<&str>) {
 }
 
 fn repair(root: &Path) {
-    match goal_state(&read_goal_receipts(root)) {
+    let receipts = read_goal_receipts(root);
+    if let Some((target, kind)) = unresolved_closure(root, &receipts) {
+        let today = today();
+        let suffix = match kind {
+            "complete" => format!("complete {today}"),
+            _ => format!("abandoned {today} (owed; see PLAN.md)"),
+        };
+        write_readme_status(root, &target, Some(&suffix));
+        write_claim(root, None);
+        println!("goal repair: the interrupted {kind} closure was finished ({target}); the pair now agrees");
+        return;
+    }
+    match goal_state(&receipts) {
         GoalState::Active(t) | GoalState::Parked(t, _) => {
             if !valid_target(root, &t) {
                 eprintln!("host-lifecycle: goal: HAZARD   moved — the tracked goal names {t}, which is not a directory here");
@@ -1044,6 +1090,20 @@ mod tests {
         assert!(a.contains("POSITION: 0 of 2 milestone tasks receipted; PLAN.md row MISSING"));
         assert!(a.contains("FRONTIER: ready (deps satisfied, may run in parallel): plan/0100#first"));
         assert!(a.ends_with("NEXT: work plan/0100#first\n"));
+    }
+
+    #[test]
+    fn an_interrupted_closure_reads_unresolved_and_repair_finishes_it() {
+        let root = fixture("pair");
+        append_receipt(&root, &goal_receipt("set", "plan/0100-fixture", "done", &[])).unwrap();
+        // The crash window: the complete receipt landed, the Status rewrite did not.
+        append_receipt(&root, &goal_receipt("complete", "plan/0100-fixture", "done", &[])).unwrap();
+        let text = emission(&root).unwrap();
+        assert!(text.contains("NEEDS YOU: the closure pair is incomplete"), "{text}");
+        assert!(text.ends_with("NEXT: host-lifecycle goal repair .\n"));
+        repair(&root);
+        let after = emission(&root).unwrap();
+        assert!(!after.contains("closure pair is incomplete"), "{after}");
     }
 
     #[test]
