@@ -455,6 +455,18 @@ struct Hazard {
 /// Nothing is written unless every gate passes.
 fn complete_gate(root: &Path, target: &str) -> Vec<Hazard> {
     let mut hazards = Vec::new();
+    // A present-but-divergent sidecar must not sail through (the cold-read
+    // ruling): absent is fine (no claim), a claim on another goal is a lie
+    // that looks healthy. The tracked record is the authority.
+    if let Some(claim) = read_claim(root) {
+        if claim != target {
+            hazards.push(Hazard {
+                label: "sidecar".into(),
+                note: format!("this worktree claims {claim} while the closure names {target}"),
+                remedy: Some("host-lifecycle goal repair .".into()),
+            });
+        }
+    }
     if !valid_target(root, target) {
         hazards.push(Hazard {
             label: "goal-plan".into(),
@@ -933,7 +945,7 @@ fn complete(root: &Path, target: &str) {
     write_readme_status(root, target, Some(&format!("complete {}", today())));
     write_claim(root, None);
     println!("goal complete: {target} (closure receipt appended; Status line updated)");
-    println!("NEXT: (no active goal) PLAN.md's queue names what is owed");
+    println!("changed: {LEDGER}, {target}/README.md — commit and push the closure, then run: host-lifecycle goal show .");
 }
 
 #[cfg(test)]
