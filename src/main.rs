@@ -29,6 +29,7 @@ mod bootstrap;
 mod refs;
 mod envhash;
 mod setup;
+mod goal;
 
 /// The canonical template a project adopts from; recorded in the stamp.
 const TEMPLATE_URL: &str = "https://github.com/connollydavid/host-template";
@@ -138,6 +139,7 @@ fn main() {
         Some("migrate-receipts") => migrate_receipts(&args[2..]),
         Some("migrate-recipe") => migrate_recipe(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
+        Some("goal") => goal::goal(&args[2..]),
         Some("dream") => dream::dream(&args[2..]),
         Some("env") => envhash::env(&args[2..]),
         Some("bootstrap") => bootstrap::bootstrap(&args[2..]),
@@ -4935,6 +4937,7 @@ fn ci_command(args: &[String]) {
         recorded: Some(today()),
         revision,
         conclusion: Some(conclusion.unwrap_or_else(|| "success".to_string())),
+        target: None,
     };
     match append_receipt(&root, &r) {
         Ok(()) => println!(
@@ -5819,6 +5822,7 @@ fn append_materialize_receipt(root: &Path, s: &Software, items: usize) {
         recorded: Some(today()),
         revision: None,
         conclusion: None,
+        target: None,
     };
     match append_receipt(root, &r) {
         Ok(()) => println!("receipt  materialize ({})", s.name),
@@ -9927,6 +9931,9 @@ struct Receipt {
     /// judgment instead of trusting name-presence.
     revision: Option<String>,
     conclusion: Option<String>,
+    /// `goal` receipts only (plan/0101): the `plan/NNNN-slug` the transition acts
+    /// on, so the goal state folds from the log without reading any sidecar.
+    target: Option<String>,
 }
 
 /// The release that introduced `--authorized`, and with it the `authorization` field.
@@ -10012,6 +10019,7 @@ fn parse_receipts(text: &str) -> Vec<Receipt> {
                 recorded: None,
                 revision: None,
                 conclusion: None,
+                target: None,
             });
             continue;
         }
@@ -10027,6 +10035,7 @@ fn parse_receipts(text: &str) -> Vec<Receipt> {
             "recorded" => cur.recorded = Some(val.to_string()),
             "revision" => cur.revision = Some(val.to_string()),
             "conclusion" => cur.conclusion = Some(val.to_string()),
+            "target" => cur.target = Some(val.to_string()),
             _ => {}
         }
     }
@@ -10053,6 +10062,7 @@ fn receipt_stanza(r: &Receipt) -> String {
         ("recorded", &r.recorded),
         ("revision", &r.revision),
         ("conclusion", &r.conclusion),
+        ("target", &r.target),
     ] {
         if let Some(v) = v {
             s.push_str(&format!("    {k} = {v}\n"));
@@ -10509,6 +10519,7 @@ fn receipt_record(args: &[String]) {
         recorded: Some(today()),
         revision: None,
         conclusion: None,
+        target: None,
     };
     if let Err(e) = append_receipt(root, &r) {
         eprintln!("host-lifecycle: cannot write {RECEIPTS}: {e}");
@@ -11246,6 +11257,7 @@ fn release_record_skip(args: &[String]) {
         recorded: Some(today()),
         revision: None,
         conclusion: None,
+        target: None,
     };
     if let Err(e) = append_receipt(root, &r) {
         eprintln!("host-lifecycle: cannot write {RECEIPTS}: {e}");
@@ -11694,6 +11706,7 @@ mod tests {
             recorded: Some("2026-07-28".to_string()),
             revision: None,
             conclusion: None,
+            target: None,
         };
         assert!(!owes_authorization(&rel(Some("host-lifecycle@0.47.2"))), "predates the field");
         assert!(owes_authorization(&rel(Some("host-lifecycle@0.48.0"))), "the release that added it");
@@ -11756,6 +11769,7 @@ mod tests {
             recorded: Some("2026-07-28".to_string()),
             revision: None,
             conclusion: None,
+            target: None,
         };
         let back = parse_receipts(&receipt_stanza(&r));
         assert_eq!(back.len(), 1);
@@ -15102,6 +15116,7 @@ mod book_tests {
                 recorded: Some("2026-09-26".to_string()),
                 revision: Some(revision.to_string()),
                 conclusion: Some(conclusion.to_string()),
+                target: None,
             }).unwrap();
         };
 
