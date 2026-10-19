@@ -425,6 +425,24 @@ fn ci_line(root: &Path) -> String {
     }
 }
 
+/// The composed gate set equals the verify sweep (the fold-in ruling): the
+/// software gate, the ci judge, book --check, the refs gate, and obligations
+/// per discovered spec, each invoked as a subprocess of this same binary.
+fn gate_verbs(root: &Path) -> Vec<(&'static str, Vec<String>)> {
+    let mut gates: Vec<(&'static str, Vec<String>)> = vec![
+        ("software-check", vec!["software".into(), "--check".into()]),
+        ("ci", vec!["ci".into()]),
+        ("book", vec!["book".into(), "--check".into()]),
+        ("refs", vec!["refs".into(), "--gate".into()]),
+    ];
+    if let Some(out) = git_out(root, &["ls-files", "--", "*.allium"]) {
+        for spec in out.lines().filter(|l| !l.trim().is_empty()) {
+            gates.push(("obligations", vec!["obligations".into(), spec.to_string()]));
+        }
+    }
+    gates
+}
+
 /// A gate hazard: label, note, remedy command. The verify-setup shape.
 struct Hazard {
     label: String,
@@ -474,7 +492,7 @@ fn complete_gate(root: &Path, target: &str) -> Vec<Hazard> {
             remedy: Some("host-lifecycle tasks .".into()),
         });
     }
-    for (label, verb) in [("software-check", vec!["software", "--check"]), ("ci", vec!["ci"])] {
+    for (label, verb) in gate_verbs(root) {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("host-lifecycle"));
         let mut cmd = process::Command::new(&exe);
         cmd.args(&verb).arg(root);
@@ -563,6 +581,97 @@ fn append_owed_row(root: &Path, target: &str, reason: &str) -> Result<(), String
         out.push('\n');
     }
     std::fs::write(&path, out).map_err(|e| format!("PLAN.md unwritable: {e}"))
+}
+
+/// One front-door definition. The door family is generated, never hand-written
+/// (the host#26 fold-in): one source in this binary, per-harness renderings,
+/// both flat and hyphenated, `/host-<verb>` fronting the verb it names.
+struct Door {
+    name: &'static str,
+    description: &'static str,
+    injection: &'static str,
+    doctrine: &'static str,
+}
+
+const DOORS: &[Door] = &[
+    Door {
+        name: "host-goal",
+        description: "Orient on the active goal (plan/0101)",
+        injection: "host-lifecycle goal show .",
+        doctrine: "The block above is the orientation emission. Work the NEXT line. If NEEDS YOU is not none, stop and put the question to the operator before anything else. The verbs own the state: never hand-edit .host-goal, the Status line, or any receipt file.",
+    },
+    Door {
+        name: "host-tasks",
+        description: "The receipted task graph and its ready frontier",
+        injection: "host-lifecycle tasks .",
+        doctrine: "The block above is the task graph. Claim from the ready frontier. Record each done with the tasks verb the graph names; a done receipt requires the task's declared verify.",
+    },
+    Door {
+        name: "host-ci",
+        description: "The offline CI judge with remedies",
+        injection: "host-lifecycle ci .",
+        doctrine: "The block above is the CI verdict. Fix the remedies it names, in order; nothing else clears a red lane.",
+    },
+];
+
+/// The door body is the prompt: the injected emission, the doctrine, and the
+/// re-orient link that closes the loop (door to emission to verb to door).
+fn door_body(d: &Door) -> String {
+    format!(
+        "---\ndescription: {}\n---\n!`{}`\n\n{}\n\nThen re-orient: /host-goal\n",
+        d.description, d.injection, d.doctrine
+    )
+}
+
+fn door_path(root: &Path, harness: &str, name: &str) -> PathBuf {
+    let dir = match harness {
+        "opencode" => ".opencode/commands",
+        _ => ".claude/commands",
+    };
+    root.join(dir).join(format!("{name}.md"))
+}
+
+/// `host-lifecycle seam <dir> [--check]` — emit (or verify) the door family's
+/// per-harness renderings from the one source above. Generated artifacts: a
+/// mismatch is a HAZARD naming the regenerate command, the `book --check` shape.
+pub fn seam(args: &[String]) {
+    let check = args.iter().any(|a| a == "--check");
+    let root = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .cloned()
+        .unwrap_or_else(|| ".".to_string());
+    let root = PathBuf::from(root);
+    let mut bad = 0;
+    for harness in ["opencode", "claude"] {
+        for d in DOORS {
+            let path = door_path(&root, harness, d.name);
+            let want = door_body(d);
+            if check {
+                let have = std::fs::read_to_string(&path).unwrap_or_default();
+                if have != want {
+                    println!("HAZARD   {harness}/{} — the door is absent or hand-edited", d.name);
+                    println!("           remedy: host-lifecycle seam .");
+                    bad += 1;
+                }
+            } else {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&path, &want) {
+                    eprintln!("host-lifecycle: seam: cannot write {}: {e}", path.display());
+                    process::exit(2);
+                }
+                println!("door     {harness}/{} (injects: {})", d.name, d.injection);
+            }
+        }
+    }
+    if check && bad > 0 {
+        process::exit(1);
+    }
+    if !check {
+        println!("seam: {} door(s) x 2 harnesses emitted; verify with: host-lifecycle seam --check .", DOORS.len());
+    }
 }
 
 fn usage() -> ! {
@@ -927,5 +1036,24 @@ mod tests {
         assert!(!hazards.is_empty());
         // The refusal banked nothing: no goal-complete receipt exists.
         assert!(read_goal_receipts(&root).iter().all(|r| r.component.as_deref() != Some("complete")));
+    }
+
+    #[test]
+    fn seam_emits_idempotently_and_check_guards_hand_edits() {
+        let root = temp_root("seam");
+        let dir = root.to_string_lossy().to_string();
+        seam(std::slice::from_ref(&dir));
+        let first = std::fs::read_to_string(door_path(&root, "opencode", "host-goal")).unwrap();
+        seam(&[dir]);
+        let second = std::fs::read_to_string(door_path(&root, "opencode", "host-goal")).unwrap();
+        assert_eq!(first, second);
+        assert!(first.contains("!`host-lifecycle goal show .`"));
+        assert!(std::fs::read_to_string(door_path(&root, "claude", "host-ci")).unwrap().contains("Then re-orient: /host-goal"));
+        std::fs::write(door_path(&root, "claude", "host-ci"), "hand edit\n").unwrap();
+        // A hand edit no longer matches the one source: --check's comparison basis.
+        let path = door_path(&root, "claude", "host-ci");
+        let want = door_body(&DOORS[2]);
+        let mismatch = std::fs::read_to_string(&path).unwrap() != want;
+        assert!(mismatch, "the hand edit must not match the source");
     }
 }
