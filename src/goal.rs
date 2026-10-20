@@ -331,7 +331,7 @@ fn emission(root: &Path) -> Result<String, String> {
     let receipts = read_goal_receipts(root);
     if let Some((target, kind)) = unresolved_closure(root, &receipts) {
         return Ok(format!(
-            "GOAL: {target}\nNEEDS YOU: the closure pair is incomplete (the {kind} receipt landed without the Status transition); reconcile it\nNEXT: host-lifecycle goal repair .\n"
+            "GOAL: {target}\nNEEDS YOU: the {kind} closure is incomplete (the receipt landed, the Status line did not); reconcile it\nNEXT: host-lifecycle goal repair .\n"
         ));
     }
     let state = goal_state(&receipts);
@@ -339,15 +339,15 @@ fn emission(root: &Path) -> Result<String, String> {
     match &state {
         GoalState::None => {
             out.push("GOAL: (none)".to_string());
-            out.push("NEEDS YOU: none".to_string());
-            out.push("NEXT: cut a milestone, then run: host-lifecycle goal propose plan/NNNN-slug .".to_string());
+            out.push("NEEDS YOU: no goal is set; cut a milestone, then propose it".to_string());
+            out.push("NEXT: host-lifecycle goal propose plan/NNNN-slug .".to_string());
         }
         GoalState::Parked(target, reason) => {
             out.push(purpose_line(root, target)?);
             out.push(format!("GOAL: {target}"));
             out.push(position_line(root, target));
             out.push(format!(
-                "NEEDS YOU: the goal is parked ({reason}); unpark it or re-queue it"
+                "NEEDS YOU: the goal is parked ({reason}); resume with unpark, or exit with abandon"
             ));
             out.push(ci_line(root));
             out.push("FRONTIER: (held while parked)".to_string());
@@ -618,13 +618,13 @@ const DOORS: &[Door] = &[
         name: "host-goal",
         description: "Orient on the active goal (plan/0101)",
         injection: "host-lifecycle goal show .",
-        doctrine: "The block above is the orientation emission. Work the NEXT line. If NEEDS YOU is not none, stop and put the question to the operator before anything else. The verbs own the state: never hand-edit .host-goal, the Status line, or any receipt file.",
+        doctrine: "The block above is the orientation emission. Work the NEXT line. If NEEDS YOU is not none, ask the operator first; nothing else runs. The verbs own the state: never hand-edit a state file.",
     },
     Door {
         name: "host-tasks",
         description: "The receipted task graph and its ready frontier",
         injection: "host-lifecycle tasks .",
-        doctrine: "The block above is the task graph. Claim from the ready frontier. Record each done with the tasks verb the graph names; a done receipt requires the task's declared verify.",
+        doctrine: "The block above is the task graph. Claim from the ready frontier. Record each done task with the tasks verb; a done receipt needs the task's declared verify.",
     },
     Door {
         name: "host-ci",
