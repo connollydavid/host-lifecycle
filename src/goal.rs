@@ -237,6 +237,7 @@ struct MilestoneStanding {
     total: usize,
     discharged: usize,
     frontier: Vec<String>,
+    open: Vec<String>,
 }
 
 fn milestone_standing(root: &Path, target: &str) -> Result<MilestoneStanding, String> {
@@ -260,10 +261,16 @@ fn milestone_standing(root: &Path, target: &str) -> Result<MilestoneStanding, St
         })
         .map(|t| t.key.clone())
         .collect();
+    let open = mine
+        .iter()
+        .filter(|t| !discharged_set.contains(&t.key))
+        .map(|t| t.key.clone())
+        .collect();
     Ok(MilestoneStanding {
         total: mine.len(),
         discharged: discharged_set.len(),
         frontier,
+        open,
     })
 }
 
@@ -489,12 +496,16 @@ fn complete_gate(root: &Path, target: &str) -> Vec<Hazard> {
     }
     if let Ok(standing) = milestone_standing(root, target) {
         if standing.discharged < standing.total {
+            let open: Vec<String> = standing.open.iter().take(3).cloned().collect();
+            let more = if standing.open.len() > 3 { format!(", +{} more", standing.open.len() - 3) } else { String::new() };
             hazards.push(Hazard {
                 label: "tasks".into(),
                 note: format!(
-                    "{} of {} milestone tasks carry no done receipt",
+                    "{} of {} milestone tasks carry no done receipt (open: {}{})",
                     standing.total - standing.discharged,
-                    standing.total
+                    standing.total,
+                    open.join(", "),
+                    more
                 ),
                 remedy: Some(
                     "host-lifecycle tasks --record <plan/NNNN#anchor> --disposition done --evidence <e> (or re-cut the milestone)"
