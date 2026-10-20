@@ -112,7 +112,7 @@ fn write_goal_surface(root: &Path, receipts: &[Receipt]) {
             let purpose = std::fs::read_to_string(readme_path(root, &t))
                 .map(|r| purpose_of(&r))
                 .unwrap_or_else(|_| "(unreadable)".to_string());
-            format!("# The active goal\n\n{t} — {purpose}.\n\nOrient with: host-lifecycle goal show .\n")
+            format!("# The active goal\n\n{t}: {purpose}.\n\nOrient with: host-lifecycle goal show .\n")
         }
         GoalState::Parked(t, reason) => {
             format!("# The active goal\n\n{t} is parked: {reason}.\n\nResume with: host-lifecycle goal unpark .\n")
