@@ -347,7 +347,7 @@ fn emission(root: &Path) -> Result<String, String> {
         GoalState::None => {
             out.push("GOAL: (none)".to_string());
             out.push("NEEDS YOU: no goal is set; cut a milestone, then propose it".to_string());
-            out.push("NEXT: host-lifecycle goal propose plan/NNNN-slug .".to_string());
+            out.push("NEXT: ask the operator to set the goal".to_string());
         }
         GoalState::Parked(target, reason) => {
             out.push(purpose_line(root, target)?);
@@ -507,10 +507,9 @@ fn complete_gate(root: &Path, target: &str) -> Vec<Hazard> {
                     open.join(", "),
                     more
                 ),
-                remedy: Some(
-                    "host-lifecycle tasks --record <plan/NNNN#anchor> --disposition done --evidence <e> (or re-cut the milestone)"
-                        .to_string(),
-                ),
+                remedy: standing.open.first().map(|first| {
+                    format!("host-lifecycle tasks --record {first} --disposition done --evidence <what you did> (or re-cut the milestone)")
+                }),
             });
         }
     } else {
