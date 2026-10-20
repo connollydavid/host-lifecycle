@@ -102,6 +102,29 @@ fn write_claim(root: &Path, target: Option<&str>) {
     }
 }
 
+/// The corpus surface (plan/0101, the standalone-minimal ruling): every goal
+/// mutator rewrites the tracked `GOAL.md` from the receipt fold, so every
+/// session and every harness loads the active-goal declaration with no
+/// plugin. Declared in `.host-corpus`; deterministic in the tracked state.
+fn write_goal_surface(root: &Path, receipts: &[Receipt]) {
+    let body = match goal_state(receipts) {
+        GoalState::Active(t) => {
+            let purpose = std::fs::read_to_string(readme_path(root, &t))
+                .map(|r| purpose_of(&r))
+                .unwrap_or_else(|_| "(unreadable)".to_string());
+            format!("# The active goal\n\n{t} — {purpose}.\n\nOrient with: host-lifecycle goal show .\n")
+        }
+        GoalState::Parked(t, reason) => {
+            format!("# The active goal\n\n{t} is parked: {reason}.\n\nResume with: host-lifecycle goal unpark .\n")
+        }
+        GoalState::None => "# The active goal\n\nNo goal is set. Cut a milestone, then propose it.\n".to_string(),
+    };
+    if let Err(e) = std::fs::write(root.join("GOAL.md"), body) {
+        eprintln!("host-lifecycle: goal: cannot write GOAL.md: {e}");
+        process::exit(2);
+    }
+}
+
 /// Maintain the milestone README's Status line: strip any goal suffix the tool
 /// previously appended, then append the new one (None leaves the line bare).
 /// The operator's own status prose is never touched: only the ` — ` marker
@@ -849,6 +872,7 @@ fn set(root: &Path, target: &str) {
     }
     write_readme_status(root, target, Some(&format!("active goal since {}", today())));
     write_claim(root, Some(target));
+    write_goal_surface(root, &read_goal_receipts(root));
     println!("goal set: {target} (receipt appended; Status line and sidecar written)");
     println!("NEXT: host-lifecycle goal show .");
 }
@@ -876,6 +900,7 @@ fn park(root: &Path, reason: Option<&str>) {
                 process::exit(2);
             }
             write_readme_status(root, &t, Some(&format!("parked ({reason}) since {}", today())));
+            write_goal_surface(root, &read_goal_receipts(root));
             println!("goal park: {t} re-queued ({reason}); the receipt and Status line carry it");
         }
         GoalState::None => {
@@ -899,6 +924,7 @@ fn unpark(root: &Path) {
             }
             write_readme_status(root, &t, Some(&format!("active goal since {}", today())));
             write_claim(root, Some(&t));
+            write_goal_surface(root, &read_goal_receipts(root));
             println!("goal unpark: {t} resumed");
         }
         GoalState::None => {
@@ -928,6 +954,7 @@ fn abandon(root: &Path, reason: Option<&str>) {
             }
             write_readme_status(root, &t, Some(&format!("abandoned {} (owed; see PLAN.md)", today())));
             write_claim(root, None);
+            write_goal_surface(root, &read_goal_receipts(root));
             println!("goal abandon: {t} ({reason}); the OWED row in PLAN.md carries the debt");
         }
         GoalState::None => {
@@ -947,6 +974,7 @@ fn repair(root: &Path) {
         };
         write_readme_status(root, &target, Some(&suffix));
         write_claim(root, None);
+        write_goal_surface(root, &receipts);
         println!("goal repair: the interrupted {kind} closure was finished ({target}); the pair now agrees");
         return;
     }
@@ -959,6 +987,7 @@ fn repair(root: &Path) {
             }
             let prior = read_claim(root);
             write_claim(root, Some(&t));
+            write_goal_surface(root, &receipts);
             match prior {
                 Some(p) if p != t => {
                     println!("goal repair: drifted claim ({p}) reconciled to the tracked record ({t})")
@@ -968,6 +997,7 @@ fn repair(root: &Path) {
         }
         GoalState::None => {
             write_claim(root, None);
+            write_goal_surface(root, &receipts);
             println!("goal repair: no tracked goal; any stale sidecar claim was cleared");
         }
     }
@@ -1008,6 +1038,7 @@ fn complete(root: &Path, target: &str) {
     }
     write_readme_status(root, target, Some(&format!("complete {}", today())));
     write_claim(root, None);
+    write_goal_surface(root, &read_goal_receipts(root));
     println!("goal complete: {target} (closure receipt appended; Status line updated)");
     println!("changed: {LEDGER}, {target}/README.md — commit and push the closure, then run: host-lifecycle goal show .");
 }
@@ -1114,6 +1145,20 @@ mod tests {
         repair(&root);
         let after = emission(&root).unwrap();
         assert!(!after.contains("closure pair is incomplete"), "{after}");
+    }
+
+    #[test]
+    fn the_surface_follows_the_goal_state() {
+        let root = fixture("surface");
+        append_receipt(&root, &goal_receipt("set", "plan/0100-fixture", "done", &[])).unwrap();
+        write_goal_surface(&root, &read_goal_receipts(&root));
+        let a = std::fs::read_to_string(root.join("GOAL.md")).unwrap();
+        assert!(a.contains("plan/0100-fixture"), "{a}");
+        assert!(a.contains("Land the thing without breaking the box"), "{a}");
+        append_receipt(&root, &goal_receipt("abandon", "plan/0100-fixture", "done", &[("reason", "scope moved".into())])).unwrap();
+        write_goal_surface(&root, &read_goal_receipts(&root));
+        let b = std::fs::read_to_string(root.join("GOAL.md")).unwrap();
+        assert!(b.contains("No goal is set"));
     }
 
     #[test]
