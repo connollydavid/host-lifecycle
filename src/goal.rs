@@ -1099,7 +1099,7 @@ mod tests {
         // The crash window: the complete receipt landed, the Status rewrite did not.
         append_receipt(&root, &goal_receipt("complete", "plan/0100-fixture", "done", &[])).unwrap();
         let text = emission(&root).unwrap();
-        assert!(text.contains("NEEDS YOU: the closure pair is incomplete"), "{text}");
+        assert!(text.contains("NEEDS YOU: the complete closure is incomplete"), "{text}");
         assert!(text.ends_with("NEXT: host-lifecycle goal repair .\n"));
         repair(&root);
         let after = emission(&root).unwrap();
