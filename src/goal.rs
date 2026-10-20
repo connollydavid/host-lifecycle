@@ -729,14 +729,15 @@ pub fn install(args: &[String]) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: host-lifecycle goal <set|show|propose|park|unpark|abandon|repair|complete> ...");
+    eprintln!("usage: host-lifecycle goal <set|show|propose|park|unpark|abandon|accept|repair|complete> ...");
     eprintln!("  goal set <plan/NNNN-slug> [<dir>]         — declare the active goal (writes the receipt, the Status line, the sidecar)");
     eprintln!("  goal show [<dir>]                          — the orientation emission");
     eprintln!("  goal propose <plan/NNNN-slug> [<dir>]      — print the set command for the operator; writes nothing");
     eprintln!("  goal park --reason <r> [<dir>]             — re-queue (receipt + Status line)");
     eprintln!("  goal unpark [<dir>]                        — resume");
     eprintln!("  goal abandon --reason <r> [<dir>]          — exit honestly (receipt + OWED row in PLAN.md)");
-    eprintln!("  goal repair [<dir>]                        — reconcile the sidecar to the tracked record");
+    eprintln!("  goal accept <plan/NNNN-slug> [<dir>]       — the operator's semantic acceptance on the closure record
+  goal repair [<dir>]                        — reconcile the sidecar to the tracked record");
     eprintln!("  goal complete [<plan/NNNN-slug>] [<dir>]   — the composed closure gate");
     process::exit(2)
 }
@@ -787,6 +788,10 @@ pub fn goal(args: &[String]) {
         "unpark" => unpark(&root),
         "abandon" => abandon(&root, reason.as_deref()),
         "repair" => repair(&root),
+        "accept" => {
+            let Some(target) = target_arg.cloned() else { usage() };
+            accept(&root, &target);
+        }
         "complete" => {
             let target = match target_arg.cloned() {
                 Some(t) => t,
@@ -962,6 +967,31 @@ fn abandon(root: &Path, reason: Option<&str>) {
             process::exit(1);
         }
     }
+}
+
+/// `goal accept <plan/NNNN>` — the operator's semantic acceptance, landed on
+/// the closure receipt (the first convening's ruling): the mechanical gate is
+/// the tool's, the acceptance is the operator's, and the record shows both.
+fn accept(root: &Path, target: &str) {
+    let receipts = read_goal_receipts(root);
+    let closed = receipts.iter().any(|r| {
+        r.phase == "goal" && r.component.as_deref() == Some("complete") && r.target.as_deref() == Some(target)
+    });
+    if !closed {
+        eprintln!("host-lifecycle: goal: HAZARD   nothing-to-accept — no closure receipt names {target}");
+        eprintln!("           remedy: close it first: host-lifecycle goal complete {target} .");
+        process::exit(1);
+    }
+    if receipts.iter().any(|r| r.phase == "goal" && r.component.as_deref() == Some("accept") && r.target.as_deref() == Some(target)) {
+        println!("goal accept: {target} (already accepted)");
+        return;
+    }
+    let receipt = goal_receipt("accept", target, "done", &[]);
+    if let Err(e) = append_receipt(root, &receipt) {
+        eprintln!("host-lifecycle: goal: cannot append receipt: {e}");
+        process::exit(2);
+    }
+    println!("goal accept: {target} (the semantic acceptance rides the closure record)");
 }
 
 fn repair(root: &Path) {
