@@ -6140,8 +6140,7 @@ fn software_teardown(root: &Path, recipe: &[Software], force: bool) {
 /// returns 0 silently when the repo carries no stamp or ledger. A nested invocation
 /// (a `verify` that itself ran `software --check`) skips the verify re-check, so a
 /// verify command cannot recurse infinitely.
-fn upgrade_claim_problems(root: &Path) -> usize {
-    let Ok(stamp) = fs::read_to_string(root.join(STAMP)) else { return 0 };
+fn upgrade_claim_problems(root: &Path) -> usize {    let Ok(stamp) = fs::read_to_string(root.join(STAMP)) else { return 0 };
     let Some(template) = find_template_dir(root) else { return 0 };
     let Ok(text) = fs::read_to_string(template.join("UPGRADING.md")) else { return 0 };
     let entries = parse_upgrading(&text);
@@ -6155,6 +6154,7 @@ fn upgrade_claim_problems(root: &Path) -> usize {
     let base = baseline.as_deref();
     let is_applied = |id: &str| entry_applied(id, &ledger_ids, base, &applied);
     let nested = std::env::var_os("HOST_LIFECYCLE_IN_CHECK").is_some();
+    let provenance = applied_provenance(root);
     let mut bad = 0usize;
     for e in &entries {
         if !is_applied(&e.revision) {
@@ -6166,9 +6166,18 @@ fn upgrade_claim_problems(root: &Path) -> usize {
                 bad += 1;
             }
         }
-        if !e.verify.is_empty() && !nested && !run_verify(root, &verify_command_after_rename(root, &e.verify)) {
-            println!("HAZARD   upgrade {} claimed applied but its verify no longer holds: {}", short_id(&e.revision), e.verify);
-            bad += 1;
+        if !e.verify.is_empty() && !nested {
+            // host-lifecycle#33: a recorded inapplicability is a disclosed fact,
+            // not a failing claim — the entry's verify has no satisfying state on
+            // this host, and the record carries the reason. A permanent HAZARD
+            // would train everyone to read past red, which is the failure the
+            // gate exists to prevent.
+            if let Some((_, Some(reason))) = provenance.iter().find(|(id, _)| id == &e.revision) {
+                println!("note     upgrade {} not applicable here: {}", short_id(&e.revision), reason);
+            } else if !run_verify(root, &verify_command_after_rename(root, &e.verify)) {
+                println!("HAZARD   upgrade {} claimed applied but its verify no longer holds: {}", short_id(&e.revision), e.verify);
+                bad += 1;
+            }
         }
     }
     let pending = entries.iter().filter(|e| !is_applied(&e.revision)).count();
@@ -8229,6 +8238,7 @@ fn upgrade(args: &[String]) {
     let mut advance = false;
     let mut record: Option<&str> = None;
     let mut unverified: Option<&str> = None;
+    let mut inapplicable: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -8246,6 +8256,14 @@ fn upgrade(args: &[String]) {
                 unverified = args.get(i + 1).map(String::as_str);
                 if unverified.is_none() {
                     eprintln!("host-lifecycle: --unverified needs a call/NNNN citation");
+                    process::exit(2);
+                }
+                i += 1;
+            }
+            "--inapplicable" => {
+                inapplicable = args.get(i + 1).map(String::as_str);
+                if inapplicable.is_none() {
+                    eprintln!("host-lifecycle: --inapplicable needs a reason");
                     process::exit(2);
                 }
                 i += 1;
@@ -8378,7 +8396,21 @@ fn upgrade(args: &[String]) {
                 process::exit(1);
             }
         }
-        let via = if !entry.verify.is_empty() {
+        let via = if let Some(reason) = inapplicable {
+            // host-lifecycle#33: the verify cannot apply here, and the claim says
+            // so with its reason. Recorded the way --unverified records the
+            // no-verify case, so the recheck reads a disclosed fact instead of
+            // re-running a condition that has no satisfying state on this host.
+            if !unverified.is_none() {
+                eprintln!("host-lifecycle: refuse — --inapplicable and --unverified are different dispositions; name one");
+                process::exit(2);
+            }
+            if reason.trim().is_empty() {
+                eprintln!("host-lifecycle: refuse — an inapplicability claim needs a non-empty reason");
+                process::exit(2);
+            }
+            format!("inapplicable {}", reason.trim())
+        } else if !entry.verify.is_empty() {
             // The same translation the claim recheck applies: record time and recheck
             // time judge one condition, so an entry whose verify names the moved file
             // cannot record-and-fail, or hold at recheck while never having recorded
@@ -10245,6 +10277,33 @@ fn read_applied_ids(root: &Path) -> Vec<String> {
         }
     }
     ids
+}
+
+/// Each applied line's id with its recorded inapplicability reason, if it carries
+/// one (host-lifecycle#33). The line `applied = <id> recorded=<date>
+/// via=inapplicable <reason…>` reads as a disclosed fact at recheck time; any
+/// other via reads as no reason. Both provenance files scan, so a legacy stamp
+/// and a migrated receipts file reconcile the same way.
+fn applied_provenance(root: &Path) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for f in [STAMP, RECEIPTS] {
+        for line in fs::read_to_string(root.join(f)).unwrap_or_default().lines() {
+            let Some(rest) = line.trim_start().strip_prefix("applied") else { continue };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else { continue };
+            let mut toks = rest.split_whitespace();
+            let Some(id) = toks.next() else { continue };
+            let reason = toks
+                .find(|t| t.starts_with("via="))
+                .map(|t| &t[4..])
+                .filter(|v| *v == "inapplicable")
+                .map(|_| rest.split("via=inapplicable").nth(1).unwrap_or("").trim().to_string())
+                .filter(|r| !r.is_empty());
+            if !out.iter().any(|(seen, _)| seen == id) {
+                out.push((id.to_string(), reason));
+            }
+        }
+    }
+    out
 }
 
 /// The file the applied-set lives in: `.host` while a legacy `applied =` line is still in
@@ -14863,6 +14922,39 @@ mod book_tests {
         assert!(!entry_applied("b6232a5", &ledger, None, &applied));
         // an orphaned/unknown id (not in ledger) never panics, never silently applied
         assert!(!entry_applied("8c28e33", &ledger, Some("c771d60"), &applied));
+    }
+
+    #[test]
+    // host-lifecycle#33: a recorded inapplicability turns the recheck's failing
+    // verify into a named disclosure, and the reason round-trips the applied line.
+    #[test]
+    fn inapplicable_claim_reads_as_a_disclosure_not_a_hazard() {
+        let base = std::env::temp_dir().join(format!("hl-inap-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("host-template")).unwrap();
+        fs::write(
+            base.join("host-template/UPGRADING.md"),
+            "[upgrade \"testid\"]\ntitle = t\nverify = test -f /nonexistent-host-lifecycle-33\n",
+        )
+        .unwrap();
+        fs::write(base.join(STAMP), "template = \"u\"\nrevision = \"r\"\n").unwrap();
+        // recorded via=inapplicable with its reason: the check discloses, no HAZARD
+        fs::write(
+            base.join(RECEIPTS),
+            "applied = testid recorded=2026-10-28 via=inapplicable no Actions runner on a gitweb grain\n",
+        )
+        .unwrap();
+        let prov = applied_provenance(&base);
+        assert_eq!(
+            prov,
+            vec![("testid".to_string(), Some("no Actions runner on a gitweb grain".to_string()))],
+            "the reason round-trips the applied line"
+        );
+        assert_eq!(upgrade_claim_problems(&base), 0, "a recorded inapplicability is a disclosure");
+        // the same entry recorded via=verify still hazards: the verify genuinely fails
+        fs::write(base.join(RECEIPTS), "applied = testid recorded=2026-10-28 via=verify\n").unwrap();
+        assert_eq!(upgrade_claim_problems(&base), 1, "a failing verify with no claim still hazards");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
