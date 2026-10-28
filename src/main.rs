@@ -7053,7 +7053,9 @@ fn provenance_problems_owed(root: &Path, s: &Software, owed: &mut Vec<String>) -
     if s.deps_bundle.is_some() {
         let worktree = worktree_dir(root, &s.name, &s.branch);
         for (file, text) in read_workflow_files(&worktree) {
-            if text.contains("CARGO_HOME") {
+            // Assignment-shaped only (`CARGO_HOME=` in a run block, `CARGO_HOME:`
+    // in an env map): the word in a comment names the rule, not an override.
+            if text.contains("CARGO_HOME=") || text.contains("CARGO_HOME:") {
                 println!("HAZARD   {}/.github/workflows/{file} overrides CARGO_HOME — the link driver changes with it; build with the recorded environment", s.name);
                 bad += 1;
             }
