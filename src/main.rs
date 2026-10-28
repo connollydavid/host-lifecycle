@@ -6996,7 +6996,100 @@ fn provenance_problems_owed(root: &Path, s: &Software, owed: &mut Vec<String>) -
             }
         }
     }
+    // host-lifecycle#30: the published bytes are the record's to match. A lane
+    // building from the registry instead of the recorded bundle produces a
+    // different binary than the anchored one, and nothing read it back — so the
+    // release lane records a `publish` receipt carrying the asset's own digest,
+    // and this gate reconciles the two offline.
+    for b in s.builds_view() {
+        let Some((_, want)) = b.artifact else { continue };
+        let tag = match b.platform {
+            Some(p) => format!("{} [{}]", s.name, p),
+            None => s.name.clone(),
+        };
+        let pin = git_out(&worktree_dir(root, &s.name, &s.branch), &["rev-parse", "HEAD"])
+            .map(|x| x.trim().to_string());
+        let receipt = read_all_receipts(root)
+            .into_iter()
+            .rev()
+            .find(|r| r.phase == "publish" && r.component.as_deref() == Some(s.name.as_str()));
+        let Some(r) = receipt else {
+            println!(
+                "note     {tag} no publish receipt yet — the release lane owes: host-lifecycle receipt --record publish --component {} --disposition done --evidence v<tag>@<asset-sha256> --revision <pin>",
+                s.name
+            );
+            continue;
+        };
+        let at_pin = r.revision.as_deref().is_some_and(|rev| pin.as_deref() == Some(rev));
+        if !at_pin {
+            println!(
+                "HAZARD   {tag} publish receipt is stale (recorded at {}, pin is {}); remedy: re-record after the release",
+                short(r.revision.as_deref().unwrap_or("?")),
+                short(pin.as_deref().unwrap_or("?")),
+            );
+            bad += 1;
+            continue;
+        }
+        let got = r.evidence.as_deref().and_then(|e| e.rsplit_once('@')).map(|(_, sha)| sha.to_string());
+        match got {
+            Some(got) if got == want.as_str() => {
+                println!("ok       {tag} published asset reproduces the anchored record @ {}", short(want));
+            }
+            got => {
+                println!(
+                    "HAZARD   {tag} published asset ({}) does not reproduce the anchored record @ {} — a lane built different bytes",
+                    got.as_deref().unwrap_or("unreadable evidence"),
+                    short(want),
+                );
+                bad += 1;
+            }
+        }
+    }
+    // host-lifecycle#30, the static half: a lane that publishes an asset must
+    // stage the recorded bundle, and no lane overrides CARGO_HOME (the base
+    // image's cargo config names the musl linker, so the override changes the
+    // link driver and with it the bytes). Read per file, so the finding names
+    // the lane.
+    if s.deps_bundle.is_some() {
+        let worktree = worktree_dir(root, &s.name, &s.branch);
+        for (file, text) in read_workflow_files(&worktree) {
+            if text.contains("CARGO_HOME") {
+                println!("HAZARD   {}/.github/workflows/{file} overrides CARGO_HOME — the link driver changes with it; build with the recorded environment", s.name);
+                bad += 1;
+            }
+            let publishes = text.contains("gh release") || text.contains("gh release create");
+            let stages = text.contains("vendor.tar.gz")
+                || text.contains("vendor-config.toml")
+                || text.contains("deps-bundle");
+            if publishes && !stages {
+                println!("HAZARD   {}/.github/workflows/{file} publishes an asset without staging the recorded deps-bundle — a registry build ships different bytes", s.name);
+                bad += 1;
+            }
+        }
+    }
     bad
+}
+
+/// Every workflow file's (name, text) under the worktree's `.github/workflows/`,
+/// sorted by name — the per-file read `software --check`'s lane scan reports by
+/// (host-lifecycle#30); `read_workflows` stays the concatenated form for the
+/// spec-lane keyword checks.
+fn read_workflow_files(worktree: &Path) -> Vec<(String, String)> {
+    let dir = worktree.join(".github/workflows");
+    let Ok(rd) = fs::read_dir(&dir) else { return Vec::new() };
+    let mut out: Vec<(String, String)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if matches!(p.extension().and_then(|x| x.to_str()), Some("yml") | Some("yaml")) {
+                fs::read_to_string(&p).ok().map(|t| (file_name_str(&p), t))
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// The verification lanes are mandatory **when a spec of their kind exists**: a
@@ -10655,6 +10748,7 @@ fn receipt(args: &[String]) {
 fn receipt_record(args: &[String]) {
     let (mut phase, mut component, mut disposition, mut evidence, mut reason) = (None, None, None, None, None);
     let mut authorization: Option<String> = None;
+    let mut revision: Option<String> = None;
     let mut dir = String::from(".");
     let mut i = 0;
     while i < args.len() {
@@ -10664,6 +10758,10 @@ fn receipt_record(args: &[String]) {
             "--evidence" => { evidence = args.get(i + 1).cloned(); i += 2; }
             "--reason" => { reason = args.get(i + 1).cloned(); i += 2; }
             "--authorization" => { authorization = args.get(i + 1).cloned(); i += 2; }
+            // A publish receipt names the revision it judged (host-lifecycle#30):
+            // the component pin the asset was built from, so the offline gate can
+            // require the digest at the pin the way the ci judge does.
+            "--revision" => { revision = args.get(i + 1).cloned(); i += 2; }
             // A flag this parser does not know is refused, never skipped. Skipping it
             // wrote a real receipt from a run meant to be a rehearsal: `--dry-run` is
             // not a flag here, it was silently dropped, and the command recorded. An
@@ -10727,7 +10825,7 @@ fn receipt_record(args: &[String]) {
         authorization,
         tool: Some(format!("host-lifecycle@{}", env!("CARGO_PKG_VERSION"))),
         recorded: Some(today()),
-        revision: None,
+        revision,
         conclusion: None,
         target: None,
     };
@@ -11366,6 +11464,12 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
     println!(
         "    host-lifecycle receipt --record release --component {component} --disposition done --evidence v{new}@{hash} --authorization {}",
         authorization_text(&authorization)
+    );
+    // host-lifecycle#30: the published asset's own digest, recorded once the
+    // tag's release job uploads it, is what makes the published bytes a gated
+    // fact — software --check reconciles it against the anchored record above.
+    println!(
+        "    then, when the release job publishes the asset: host-lifecycle receipt --record publish --component {component} --disposition done --evidence v{new}@<asset-sha256> --revision <the pushed commit SHA>"
     );
     // An issue is the one authorization form naming something outside the corpus, so
     // the tool says which check it did not perform rather than letting a resolved
@@ -14924,7 +15028,6 @@ mod book_tests {
         assert!(!entry_applied("8c28e33", &ledger, Some("c771d60"), &applied));
     }
 
-    #[test]
     // host-lifecycle#33: a recorded inapplicability turns the recheck's failing
     // verify into a named disclosure, and the reason round-trips the applied line.
     #[test]
@@ -14954,6 +15057,56 @@ mod book_tests {
         // the same entry recorded via=verify still hazards: the verify genuinely fails
         fs::write(base.join(RECEIPTS), "applied = testid recorded=2026-10-28 via=verify\n").unwrap();
         assert_eq!(upgrade_claim_problems(&base), 1, "a failing verify with no claim still hazards");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // host-lifecycle#30: the publish receipt's digest reconciles against the
+    // anchored record (a mismatch is a fault, an absence is a note), and the
+    // static lane scan names a workflow that overrides CARGO_HOME or publishes
+    // an asset without staging the recorded bundle.
+    #[test]
+    fn publish_receipt_and_lane_scan_catch_divergent_bytes() {
+        let base = std::env::temp_dir().join(format!("hl-pub-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software").join("comp").join("main");
+        fs::create_dir_all(wt.join(".github/workflows")).unwrap();
+        let git = |dir: &Path, args: &[&str]| process::Command::new("git")
+            .arg("-C").arg(dir).args(args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(git(&base, &["init", "-q"]) && git(&wt, &["init", "-q"]));
+        assert!(git(&wt, &["config", "user.email", "t@t"]) && git(&wt, &["config", "user.name", "t"]));
+        let want = "aa".repeat(32);
+        let other = "bb".repeat(32);
+        let locksha = "cc".repeat(32);
+        fs::write(wt.join("deps-bundle.lock"), format!("https://x/v.tar.gz {locksha}\n")).unwrap();
+        fs::write(wt.join(".github/workflows/release.yml"), "jobs:\n  r:\n    run: gh release create v1\n").unwrap();
+        fs::write(wt.join(".github/workflows/local.yml"), "env:\n  CARGO_HOME: /x\n").unwrap();
+        assert!(git(&wt, &["add", "-A"]) && git(&wt, &["commit", "-qm", "x"]));
+        let head = git_out(&wt, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        let mk = || Software {
+            name: "comp".into(), url: "u".into(), pin: head.clone(), branch: "main".into(),
+            worktrees: vec![], lines: vec![], build: None,
+            toolchain: Some("img".into()), deploy: None,
+            artifact: Some(("target/x/release/comp".into(), want.clone())),
+            repro_exempt: None, hooks: None,
+            deps_bundle: Some(("https://x/v.tar.gz".into(), locksha.clone())),
+            regen: None, builds: vec![],
+        };
+        let write_receipt = |ev: Option<&str>| {
+            let text = match ev {
+                Some(ev) => format!("[receipt \"publish\" \"comp\"]\ndisposition = done\nevidence = {ev}\nrevision = {head}\n"),
+                None => String::new(),
+            };
+            fs::write(base.join(RECEIPTS), text).unwrap();
+        };
+        let mut owed = Vec::new();
+        let s = mk();
+        write_receipt(Some(&format!("v1.0.0@{want}")));
+        assert_eq!(provenance_problems_owed(&base, &s, &mut owed), 2, "matching digest; the two lane defects stand");
+        write_receipt(Some(&format!("v1.0.0@{other}")));
+        assert_eq!(provenance_problems_owed(&base, &s, &mut owed), 3, "a mismatching asset digest is a fault");
+        write_receipt(None);
+        assert_eq!(provenance_problems_owed(&base, &s, &mut owed), 2, "no publish receipt is a note, not a fault");
         let _ = fs::remove_dir_all(&base);
     }
 
