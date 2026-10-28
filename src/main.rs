@@ -8078,17 +8078,13 @@ struct Upgrade {
 /// answers "since the revision I adopted, what must I do?" by git ancestry, so a
 /// doc diff is no longer the only signal for the structural migrations a revision
 /// span introduced.
-/// Resolve a `--record` argument to a full ledger id: a 1-based ledger ordinal, an
-/// exact id, or an unambiguous ≥4-char prefix. Frees a low-reliability agent from
-/// retyping a hex SHA exactly, and rejects unknown/ambiguous input rather than
-/// recording a lie.
+/// Resolve a `--record` argument to a full ledger id: an exact id, an unambiguous
+/// ≥4-char prefix, or — when the argument reads as neither — a 1-based ledger
+/// ordinal. Frees a low-reliability agent from retyping a hex SHA exactly, and
+/// rejects unknown/ambiguous input rather than recording a lie. The id readings
+/// come first: a purely numeric stanza id (the template's short-SHA convention)
+/// must not be eaten by the ordinal parse (host-lifecycle#34).
 fn resolve_ledger_id(input: &str, ledger_ids: &[String]) -> Result<String, String> {
-    if let Ok(n) = input.parse::<usize>() {
-        return (n >= 1)
-            .then(|| ledger_ids.get(n - 1).cloned())
-            .flatten()
-            .ok_or_else(|| format!("ordinal out of range (1..={})", ledger_ids.len()));
-    }
     if ledger_ids.iter().any(|x| x == input) {
         return Ok(input.to_string());
     }
@@ -8099,6 +8095,12 @@ fn resolve_ledger_id(input: &str, ledger_ids: &[String]) -> Result<String, Strin
             n if n > 1 => return Err(format!("ambiguous prefix (matches {n} entries)")),
             _ => {}
         }
+    }
+    if let Ok(n) = input.parse::<usize>() {
+        return (n >= 1)
+            .then(|| ledger_ids.get(n - 1).cloned())
+            .flatten()
+            .ok_or_else(|| format!("ordinal out of range (1..={})", ledger_ids.len()));
     }
     Err("unknown ledger id".to_string())
 }
@@ -14741,6 +14743,17 @@ mod book_tests {
         assert!(resolve_ledger_id("zzzz", &ids).is_err()); // unknown
         let ambig: Vec<String> = ["abcd111", "abcd222"].iter().map(|s| s.to_string()).collect();
         assert!(resolve_ledger_id("abcd", &ambig).is_err()); // ambiguous prefix → refuse, not guess
+        // A purely numeric stanza id resolves as the id, never as an ordinal (host-lifecycle#34):
+        // the template's short-SHA convention is unrecordable when the ordinal parse eats it.
+        let numeric: Vec<String> = ["1202877", "fbdb176"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(resolve_ledger_id("1202877", &numeric).unwrap(), "1202877");
+        assert_eq!(resolve_ledger_id("1202", &numeric).unwrap(), "1202877"); // unique numeric prefix
+        assert_eq!(resolve_ledger_id("2", &numeric).unwrap(), "fbdb176"); // short numeric, no id match → ordinal
+        // An exact id wins over the same-numbered ordinal.
+        let collide: Vec<String> = ["7", "fbdb176"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(resolve_ledger_id("7", &collide).unwrap(), "7");
+        // A numeric non-id within no id's prefix still reports the ordinal range, not "unknown".
+        assert!(resolve_ledger_id("9999", &numeric).is_err());
     }
 
     #[test]
