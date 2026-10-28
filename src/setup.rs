@@ -466,6 +466,7 @@ mod tests {
             repro_exempt: None,
             hooks: Some("hooks-script".into()),
             deps_bundle: None,
+            regen: None,
             builds: vec![],
         }]
     }
@@ -629,6 +630,7 @@ mod tests {
             repro_exempt: None,
             hooks: None,
             deps_bundle: None,
+            regen: None,
             builds: vec![],
         }];
         // Two causes, two gaps, no cascade: the worktree is unmaterialized, and the
@@ -679,6 +681,7 @@ mod tests {
             repro_exempt: None,
             hooks: None,
             deps_bundle: None,
+            regen: None,
             builds: vec![],
         }];
         let reqs = setup_requirements(&base, &recipe);

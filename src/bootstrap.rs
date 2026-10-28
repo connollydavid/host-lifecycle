@@ -519,6 +519,7 @@ mod tests {
             repro_exempt: None,
             hooks: None,
             deps_bundle: None,
+            regen: None,
             builds: vec![],
         }
     }
