@@ -301,7 +301,10 @@ pub fn setup_requirements(root: &Path, recipe: &[Software]) -> Vec<Requirement> 
             continue;
         };
         let bin_name = Path::new(&art_path).file_name().unwrap_or_default().to_string_lossy().to_string();
-        let built = worktree_dir(root, &s.name, &s.branch).join(&art_path);
+        // The same bases the installer resolves: worktree first, then the host
+        // root (host-lifecycle#32). Unresolved means nothing is built, which is
+        // exactly the state HookBinaryCurrent reports as not current.
+        let built = crate::gate_asset(root, s, &art_path).0;
 
         let mut surfaces: Vec<(RequirementKind, String, Option<PathBuf>)> =
             vec![(RequirementKind::HostHookInstalled, s.name.clone(), git_hooks_dir(root))];
@@ -326,7 +329,7 @@ pub fn setup_requirements(root: &Path, recipe: &[Software]) -> Vec<Requirement> 
             reqs.push(need(
                 RequirementKind::HookBinaryCurrent,
                 target,
-                hook_binary_current(&hooks, &bin_name, &built),
+                built.as_deref().is_none_or(|b| hook_binary_current(&hooks, &bin_name, b)),
             ));
         }
     }

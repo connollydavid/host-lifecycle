@@ -206,7 +206,9 @@ fn artifact_owed(root: &Path, recipe: &[Software]) -> Vec<(String, String, PathB
             if b.attest_host.is_some_and(|h| h != std::env::consts::OS) {
                 continue;
             }
-            if !worktree.join(path).is_file() {
+            // Present in the worktree or at the host root (the adopter's
+            // root-resolved gate, host-lifecycle#32); absent from both is the gap.
+            if !worktree.join(path).is_file() && !root.join(path).is_file() {
                 // A recipe with no `build` line cannot say how to produce it, which
                 // is worth reporting rather than skipping.
                 let how = b.build.unwrap_or("no `build =` recorded: the recipe cannot say how to produce it");

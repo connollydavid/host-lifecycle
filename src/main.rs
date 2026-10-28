@@ -4588,6 +4588,24 @@ fn hook_targets(root: &Path, recipe: &[Software]) -> Vec<PathBuf> {
     out
 }
 
+/// Resolve a gate asset (the declared `hooks` script, or the gate binary) for a
+/// component: the component worktree first (the component-vendored shape), then
+/// the host root (a gate in the root itself, or a host-root-relative path into a
+/// referenced `tools/` submodule, the "reference, don't vendor" adopter shape,
+/// host-lifecycle#32). The second return value says the worktree resolved, and
+/// only a worktree-resolved gate has a recorded pin to hold against.
+fn gate_asset(root: &Path, s: &Software, rel: &str) -> (Option<PathBuf>, bool) {
+    let in_worktree = worktree_dir(root, &s.name, &s.branch).join(rel);
+    if in_worktree.is_file() {
+        return (Some(in_worktree), true);
+    }
+    let at_root = root.join(rel);
+    if at_root.is_file() {
+        return (Some(at_root), false);
+    }
+    (None, false)
+}
+
 /// The install loop, factored out to return `(installed, failed)` counts instead
 /// of exiting — keeps it testable. `installed` counts gated targets, so one
 /// component installing into the host repo and two worktrees counts three.
@@ -4608,35 +4626,39 @@ fn install_hooks(root: &Path, recipe: &[Software]) -> (usize, usize) {
     for s in recipe {
         let Some(hooks_rel) = &s.hooks else { continue };
         let worktree = worktree_dir(root, &s.name, &s.branch);
-        let script = worktree.join(hooks_rel);
-        if !script.is_file() {
-            println!("MISSING  {}/{hooks_rel} (run --materialize)", s.name);
+        let (script, in_worktree) = gate_asset(root, s, hooks_rel);
+        let Some(script) = script else {
+            println!("MISSING  {name}/{hooks_rel} (in the worktree or at the host root)", name = s.name);
             failed += 1;
             continue;
-        }
+        };
         // The worktree must be at its recorded pin so the installed binary is
         // built from the audited source. The binary's exact bytes need not match
         // the recorded canonical hash — that hash is the pinned container's
         // output; a local toolchain legitimately differs. The hash match is
-        // reported as an informational note, not a gate.
-        let head = git_out(&worktree, &["rev-parse", "HEAD"]);
-        if head.is_none() || head != git_out(&worktree, &["rev-parse", &s.pin]) {
-            println!("WORKTREE {} not at its pin (run --materialize)", s.name);
-            failed += 1;
-            continue;
+        // reported as an informational note, not a gate. The pin gate holds only
+        // when the gate lives in the worktree: a root-resolved gate (the adopter
+        // shape) has no component worktree that stands for it (host-lifecycle#32).
+        if in_worktree {
+            let head = git_out(&worktree, &["rev-parse", "HEAD"]);
+            if head.is_none() || head != git_out(&worktree, &["rev-parse", &s.pin]) {
+                println!("WORKTREE {} not at its pin (run --materialize)", s.name);
+                failed += 1;
+                continue;
+            }
         }
         let Some((art_path, want)) = &s.artifact else {
             println!("SKIP     {} (hooks set but no artifact to install)", s.name);
             failed += 1;
             continue;
         };
-        let bin = worktree.join(art_path);
-        if !bin.is_file() {
-            println!("MISSING  {}/{art_path} — build the component first ({})", s.name,
-                s.build.as_deref().unwrap_or("cargo build --release --locked"));
+        let (bin, _) = gate_asset(root, s, art_path);
+        let Some(bin) = bin else {
+            println!("MISSING  {name}/{art_path} — build the gate first ({how})", name = s.name,
+                how = s.build.as_deref().unwrap_or("cargo build --release --locked"));
             failed += 1;
             continue;
-        }
+        };
         let provenance = if sha256_file(&bin).as_deref() == Some(want.as_str()) {
             "verified against the canonical hash"
         } else {
@@ -12928,6 +12950,38 @@ mod software_tests {
         assert!(fingerprint.contains("[envhash \"hook_binary\"]"));
         assert!(!base.join(LIFECYCLE_RECEIPTS).exists(), "install-hooks appends no provenance");
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // host-lifecycle#32: an adopter's gate can live outside the component worktree —
+    // at the host root, or host-root-relative into a referenced tools/ submodule —
+    // and the install resolves it there, holding no worktree pin (the submodule
+    // pointer is the record; there is no component worktree that stands for it).
+    #[test]
+    fn install_hooks_resolves_the_gate_outside_the_worktree() {
+        let base = std::env::temp_dir().join(format!("hl-hooks-root-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("tools/gate/bin")).unwrap();
+        let git = |dir: &Path, args: &[&str]| process::Command::new("git")
+            .arg("-C").arg(dir).args(args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(git(&base, &["init", "-q"]), "git init host");
+        fs::write(base.join("tools/gate/hook.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+        fs::write(base.join("tools/gate/bin/host-lint"), "BINARY").unwrap();
+
+        let s = Software {
+            name: "app".into(), url: "u".into(), pin: "p".into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None,
+            artifact: Some(("tools/gate/bin/host-lint".into(), "deadbeef".into())),
+            repro_exempt: None, hooks: Some("tools/gate/hook.sh".into()), deps_bundle: None, builds: vec![],
+        };
+        // No component worktree exists at all: the gate resolves at the host root
+        // and installs into the host repo's hooks dir.
+        assert_eq!(install_hooks(&base, &[s]), (1, 0));
+        let hooks = base.join(".git/hooks");
+        for f in ["pre-commit", "commit-msg", "host-lint"] {
+            assert!(hooks.join(f).is_file(), "the root gate installs: {f} missing");
+        }
         let _ = fs::remove_dir_all(&base);
     }
 
