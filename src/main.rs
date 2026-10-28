@@ -9104,7 +9104,7 @@ fn book(args: &[String]) {
     }
     let sections = plan_book(&root);
     if check {
-        book_check(&sections);
+        book_check(&root, &sections);
     } else {
         let home = home_page(&root, &stamp_title(&root), &sections);
         write_book(&root, &home, &sections, dry);
@@ -9241,6 +9241,20 @@ fn plan_plan(root: &Path) -> Section {
         };
         pages.push(Page { dest, label, depth: 1, body });
 
+        // Milestone documents (host#25): every tracked .md in the milestone's own
+        // tree renders beside the README at its mirrored path, so a milestone's
+        // on-disk record and its published pages are one set. `spec/` keeps its
+        // own rendering (the spec pages below); the README is the landing above.
+        for (f, rel) in milestone_md_files(&m) {
+            let stem = f.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            pages.push(Page {
+                dest: format!("plan/{dname}/{rel}"),
+                label: label_for(&f, &stem),
+                depth: 2,
+                body: PageBody::Copy(f),
+            });
+        }
+
         let spec_dir = m.join("spec");
         let specs = spec_files(&spec_dir);
         if !specs.is_empty() {
@@ -9361,9 +9375,15 @@ fn plan_memory(root: &Path) -> Section {
     Section { title: "Memory".to_string(), room: "memory", required: !pages.is_empty(), pages }
 }
 
-/// `--check`: every room must render at least one page with content. Exit 1 naming
-/// each empty room; the gate a hand-rolled generator never had (issue #6, S5).
-fn book_check(sections: &[Section]) {
+/// `--check`: every room must render at least one page with content, and the
+/// published set must reconcile with the tracked set (host#25): every tracked
+/// markdown document renders somewhere, so a green gate cannot coexist with
+/// documents the site never ships. The tracked set is `git ls-files -- '*.md'`,
+/// which keeps gitignored build output, materialized worktrees, and submodule
+/// interiors out of the reconciliation by construction. Exit 1 naming each empty
+/// room and each unrendered document; the gate a hand-rolled generator never had
+/// (issue #6, S5).
+fn book_check(root: &Path, sections: &[Section]) {
     let mut missing = 0usize;
     for s in sections {
         if s.pages.iter().any(page_has_content) {
@@ -9380,6 +9400,56 @@ fn book_check(sections: &[Section]) {
         process::exit(1);
     }
     println!("-- every room with source renders at least one page");
+    let home = home_page(root, &stamp_title(root), sections);
+    let unrendered = unrendered_documents(root, &home, sections);
+    if !unrendered.is_empty() {
+        for doc in &unrendered {
+            println!("UNRENDERED {doc} — tracked markdown no page publishes");
+        }
+        eprintln!("-- {} tracked markdown document(s) unrendered; the generator must place them", unrendered.len());
+        process::exit(1);
+    }
+    println!("-- every tracked markdown document renders");
+}
+
+/// The tracked markdown documents no planned page publishes: the reconciliation
+/// half of `book --check` (host#25). The published set is the home page's source,
+/// every planned page's copied source, and every page's destination (a segregated
+/// record's body moves inline, but its destination still ships). The tracked set
+/// comes from git, so a file git does not track is not the publisher's to ship;
+/// and a path under a dot-directory is harness state (`.claude`, `.opencode`,
+/// `.zcode`), not site content, so the reconciliation skips it by rule rather
+/// than by a per-repo exclusion file.
+fn unrendered_documents(root: &Path, home: &Page, sections: &[Section]) -> Vec<String> {
+    let mut published: std::collections::HashSet<PathBuf> = sections
+        .iter()
+        .flat_map(|s| s.pages.iter())
+        .flat_map(|p| {
+            let mut v = Vec::with_capacity(2);
+            if let PageBody::Copy(src) = &p.body {
+                v.push(src.clone());
+            }
+            // The dest is repo-relative; the tracked line resolves against the
+            // root, so join before the set membership test compares.
+            v.push(root.join(&p.dest));
+            v
+        })
+        .collect();
+    if let PageBody::Copy(src) = &home.body {
+        published.insert(src.clone());
+    }
+    let Some(listing) = git_out(root, &["ls-files", "--", "*.md"]) else {
+        eprintln!("host-lifecycle: book --check needs `git ls-files` to read the tracked set");
+        process::exit(2);
+    };
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.split('/').any(|seg| seg.starts_with('.')))
+        .filter(|line| !published.contains(&root.join(line)))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Does a page carry real content? Inline bodies are checked directly; a copied
@@ -9633,9 +9703,39 @@ fn list_md(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Every `.md` in a milestone's own tree at its forward-slashed path relative to
+/// the milestone dir, except the README (the milestone's landing) and the
+/// `spec/` subtree (which renders as spec pages). Sorted by path.
+fn milestone_md_files(m: &Path) -> Vec<(PathBuf, String)> {
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    let mut stack = vec![(m.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            let name = file_name_str(&p);
+            let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            if p.is_dir() {
+                if name != "spec" {
+                    stack.push((p, r));
+                }
+                continue;
+            }
+            // The milestone's own README is its landing (placed separately); a
+            // README deeper in the tree is an ordinary document.
+            if p.extension().and_then(|e| e.to_str()) == Some("md")
+                && (name != "README.md" || !rel.is_empty())
+            {
+                out.push((p, r));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Numbered milestone directories under `plan/`, sorted.
-fn milestone_dirs(plan: &Path) -> Vec<PathBuf> {
-    let rd = match fs::read_dir(plan) {
+fn milestone_dirs(plan: &Path) -> Vec<PathBuf> {    let rd = match fs::read_dir(plan) {
         Ok(rd) => rd,
         Err(_) => return Vec::new(),
     };
@@ -15047,6 +15147,12 @@ mod book_tests {
         assert!(refr.pages.iter().any(|p| p.dest == "CLAUDE.md" && p.depth == 0));
         assert!(refr.pages.iter().any(|p| p.dest == "BOOTSTRAP.md"));
 
+        // host#25: a tracked .md beside a milestone README renders beside it.
+        mk("plan/0001-foundation/RESULTS.md", "# Results\n");
+        let sections = plan_book(&base);
+        let plan = sections.iter().find(|s| s.room == "plan").unwrap();
+        assert!(plan.pages.iter().any(|p| p.dest == "plan/0001-foundation/RESULTS.md"), "sibling document rendered");
+
         // SUMMARY: the home page is a prefix chapter ahead of every room (no room is
         // the landing), then the parts in lifecycle order.
         let home = home_page(&base, "proj", &sections);
@@ -15074,6 +15180,33 @@ mod book_tests {
         assert!(!mem.required, "absent Memory source → not gated");
         assert!(!mem.pages.iter().any(page_has_content));
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // host#25: the reconciliation names every tracked markdown document no page
+    // publishes, and stays silent once the generator places it.
+    #[test]
+    fn book_check_reconciles_every_tracked_markdown_document() {
+        let base = std::env::temp_dir().join(format!("hl-book-recon-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("plan/0001-x")).unwrap();
+        let git = |args: &[&str]| process::Command::new("git")
+            .arg("-C").arg(&base).args(args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(git(&["init", "-q"]), "git init the fixture host");
+        fs::write(base.join("PLAN.md"), "# Plan\n").unwrap();
+        fs::write(base.join("plan/0001-x/README.md"), "# x\n").unwrap();
+        fs::write(base.join("plan/0001-x/RESULTS.md"), "# Results\n").unwrap();
+        fs::create_dir_all(base.join("docs")).unwrap();
+        fs::write(base.join("docs/notes.md"), "# notes\n").unwrap();
+        assert!(git(&["add", "-A"]), "stage the tracked set");
+
+        let sections = plan_book(&base);
+        // the sibling renders beside the README
+        let plan = sections.iter().find(|s| s.room == "plan").unwrap();
+        assert!(plan.pages.iter().any(|p| p.dest == "plan/0001-x/RESULTS.md"), "sibling document rendered");
+
+        let unrendered = unrendered_documents(&base, &home_page(&base, "proj", &sections), &sections);
+        assert_eq!(unrendered, vec!["docs/notes.md".to_string()], "the unplaced doc is named; the placed set and the dot-dir harness state are silent");
         let _ = fs::remove_dir_all(&base);
     }
 
