@@ -1,13 +1,13 @@
 [package]
 name = "host-lifecycle"
-version = "0.62.0"
+version = "0.62.1"
 edition = "2021"
 description = "Token-free lifecycle tool for an agentic project — scaffolds milestones, decisions, and personas, and validates the tree."
 license = "Unlicense"
 
 [dependencies]
 host-grammar = { git = "https://github.com/connollydavid/host-grammar", rev = "435960cac32f6ecfd40d4da8b92ec49583414bf0" }
-host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "4976100f252f7216ed6ee3da5418ffdd094caf95" }
+host-lint = { git = "https://github.com/connollydavid/host-lint", rev = "db4a0d2026596ac21c3e089bf11d3738fb2d3b78" }
 # The MCP stdio surface (plan/0065, call/0042): hand-rolled JSON-RPC on tokio + serde_json.
 # tokio is required (operator directive); features are held to a current-thread stdio server
 # (no net, no multi-thread) to keep the vendored reproducible-build set as small as the surface allows.

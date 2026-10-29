@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "host-lifecycle"
-version = "0.62.0"
+version = "0.62.1"
 dependencies = [
  "host-grammar",
  "host-lint",
@@ -44,8 +44,8 @@ dependencies = [
 
 [[package]]
 name = "host-lint"
-version = "0.24.0"
-source = "git+https://github.com/connollydavid/host-lint?rev=4976100f252f7216ed6ee3da5418ffdd094caf95#4976100f252f7216ed6ee3da5418ffdd094caf95"
+version = "0.24.1"
+source = "git+https://github.com/connollydavid/host-lint?rev=db4a0d2026596ac21c3e089bf11d3738fb2d3b78#db4a0d2026596ac21c3e089bf11d3738fb2d3b78"
 dependencies = [
  "host-grammar",
  "serde_json",
