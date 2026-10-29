@@ -833,14 +833,21 @@ fn unresolved_closure(root: &Path, receipts: &[Receipt]) -> Option<(String, &'st
         .find(|r| r.phase == "goal" && matches!(r.component.as_deref(), Some("complete") | Some("abandon")));
     let r = last?;
     let target = r.target.clone()?;
-    let wanted = match r.component.as_deref() {
-        Some("complete") => " — complete 2",
-        _ => " — abandoned 2",
+    // The landing check knows both marker forms (host-lifecycle#37): the legacy
+    // em-dash (records written before v0.62.2) and the semicolon (the current
+    // writer), the same dual form strip_goal_suffix strips. One form only and the
+    // repair writes what the check cannot see, so the closure never converges.
+    let wanted: &[&str] = match r.component.as_deref() {
+        Some("complete") => &[" — complete 2", "; complete 2"],
+        _ => &[" — abandoned 2", "; abandoned 2"],
     };
     let readme = std::fs::read_to_string(readme_path(root, &target)).ok()?;
     let status_landed = readme
         .lines()
-        .any(|l| l.trim_start().starts_with("**Status:") && l.contains(wanted));
+        .any(|l| {
+            l.trim_start().starts_with("**Status:")
+                && wanted.iter().any(|w| l.contains(w))
+        });
     if status_landed {
         None
     } else {
@@ -1175,6 +1182,29 @@ mod tests {
         );
         let cleared = set_status_suffix(&once, None);
         assert_eq!(cleared, readme);
+    }
+
+    // host-lifecycle#37: the closure-pair check recognizes both marker forms, the
+    // legacy em-dash (records before v0.62.2) and the semicolon (the current
+    // writer), or a completed closure reads unresolved and repair never converges.
+    #[test]
+    fn unresolved_closure_accepts_both_marker_forms() {
+        let root = fixture("closure-markers");
+        let readme_path = root.join("plan/0100-fixture").join("README.md");
+        let base = std::fs::read_to_string(&readme_path).unwrap();
+        let receipts = parse_receipts(
+            "[receipt \"goal\" \"complete\"]\n    disposition = done\n    target = plan/0100-fixture\n",
+        );
+        // The pristine fixture carries no closure marker: unresolved.
+        assert!(unresolved_closure(&root, &receipts).is_some());
+        for marker in [" — complete 2026-10-29", "; complete 2026-10-29"] {
+            let landed = base.replace("**Status: cut**", &format!("**Status: cut**{marker}"));
+            std::fs::write(&readme_path, &landed).unwrap();
+            assert!(
+                unresolved_closure(&root, &receipts).is_none(),
+                "a landed complete in the {marker:?} form is not unresolved"
+            );
+        }
     }
 
     #[test]
