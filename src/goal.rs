@@ -842,12 +842,20 @@ fn unresolved_closure(root: &Path, receipts: &[Receipt]) -> Option<(String, &'st
         _ => &[" — abandoned 2", "; abandoned 2"],
     };
     let readme = std::fs::read_to_string(readme_path(root, &target)).ok()?;
-    let status_landed = readme
-        .lines()
-        .any(|l| {
-            l.trim_start().starts_with("**Status:")
-                && wanted.iter().any(|w| l.contains(w))
-        });
+    // The scan covers the whole status paragraph (first **Status: line through the
+    // first blank line), the same region set_status_suffix writes into: the writer
+    // appends at the paragraph's end, so on a wrapped status the marker lands on a
+    // continuation line the first-line-only scan never read (host-lifecycle#37).
+    let lines: Vec<&str> = readme.lines().collect();
+    let status_landed = match lines.iter().position(|l| l.trim_start().starts_with("**Status:")) {
+        Some(start) => {
+            let end = start + lines[start..].iter().take_while(|l| !l.trim().is_empty()).count();
+            lines[start..end]
+                .iter()
+                .any(|l| wanted.iter().any(|w| l.contains(w)))
+        }
+        None => false,
+    };
     if status_landed {
         None
     } else {
@@ -1205,6 +1213,25 @@ mod tests {
                 "a landed complete in the {marker:?} form is not unresolved"
             );
         }
+    }
+
+    // host-lifecycle#37, the wrapped half: the writer appends at the status
+    // paragraph's end, so on a wrapped status the marker lands on a continuation
+    // line, and the check must read the whole paragraph, not its first line.
+    #[test]
+    fn unresolved_closure_scans_the_whole_status_paragraph() {
+        let root = fixture("closure-wrap");
+        let readme_path = root.join("plan/0100-fixture").join("README.md");
+        let base = std::fs::read_to_string(&readme_path).unwrap();
+        let receipts = parse_receipts(
+            "[receipt \"goal\" \"complete\"]\n    disposition = done\n    target = plan/0100-fixture\n",
+        );
+        let wrapped = base.replace(
+            "**Status: cut**",
+            "**Status: cut** (operator ruling\ncontinued on this line); complete 2026-10-29",
+        );
+        std::fs::write(&readme_path, wrapped).unwrap();
+        assert!(unresolved_closure(&root, &receipts).is_none());
     }
 
     #[test]
