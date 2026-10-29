@@ -127,8 +127,13 @@ fn write_goal_surface(root: &Path, receipts: &[Receipt]) {
 
 /// Maintain the milestone README's Status line: strip any goal suffix the tool
 /// previously appended, then append the new one (None leaves the line bare).
-/// The operator's own status prose is never touched: only the ` — ` marker
-/// suffixes this subsystem owns are rewritten.
+/// The operator's own status prose is never touched: only the `; ` marker
+/// suffixes this subsystem owns are rewritten, and the legacy ` — ` form written
+/// by binaries before the marker change strips too. The suffix lands at the end
+/// of the status PARAGRAPH, never mid-sentence on the first line, so a wrapped
+/// status takes the append at its close (host-lifecycle#36: the em-dash marker
+/// was a decoration the strict corpus flags, and the append spliced wrapped
+/// statuses mid-paragraph).
 const SUFFIX_TOKENS: [&str; 4] = [
     "active goal since ",
     "parked (",
@@ -137,11 +142,16 @@ const SUFFIX_TOKENS: [&str; 4] = [
 ];
 
 fn strip_goal_suffix(status: &str) -> String {
-    let mut cut = None;
-    for (idx, _) in status.match_indices(" — ") {
-        let rest = &status[idx + 5..];
-        if SUFFIX_TOKENS.iter().any(|t| rest.starts_with(t)) {
-            cut = Some(idx);
+    let mut cut: Option<usize> = None;
+    for marker in [" — ", "; "] {
+        for (idx, _) in status.match_indices(marker) {
+            let rest = &status[idx + marker.len()..];
+            if SUFFIX_TOKENS.iter().any(|t| rest.starts_with(t)) {
+                cut = match cut {
+                    Some(best) if best > idx => Some(best),
+                    _ => Some(idx),
+                };
+            }
         }
     }
     match cut {
@@ -151,33 +161,36 @@ fn strip_goal_suffix(status: &str) -> String {
 }
 
 fn set_status_suffix(readme: &str, suffix: Option<&str>) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let mut replaced = false;
-    for line in readme.lines() {
-        if line.trim_start().starts_with("**Status:") {
-            let base = strip_goal_suffix(line);
-            out.push(match suffix {
-                Some(s) => format!("{base} — {s}"),
-                None => base,
-            });
-            replaced = true;
-        } else {
-            out.push(line.to_string());
-        }
-    }
-    if !replaced {
+    let lines: Vec<String> = readme.lines().map(str::to_string).collect();
+    let Some(start) = lines.iter().position(|l| l.trim_start().starts_with("**Status:")) else {
         // Insert a Status line under the title heading so the declaration is
         // always machine-findable; the suffix alone carries the goal state.
-        if let Some(first) = readme.lines().next() {
+        let mut out = lines.clone();
+        if !lines.is_empty() {
             out.insert(
                 1,
                 match suffix {
-                    Some(s) => format!("**Status:** — {s}"),
+                    Some(s) => format!("**Status:**; {s}"),
                     None => "**Status:**".to_string(),
                 },
             );
-            let _ = first;
         }
+        let mut text = out.join("\n");
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        return text;
+    };
+    // The status paragraph runs from the **Status: line to the first blank line;
+    // stale suffixes strip from both ends (the legacy first-line form and the
+    // current paragraph-end form) before the new one appends.
+    let end = start + lines[start..].iter().take_while(|l| !l.trim().is_empty()).count();
+    let last = end - 1;
+    let mut out = lines.clone();
+    out[start] = strip_goal_suffix(&lines[start]);
+    out[last] = strip_goal_suffix(&lines[last]);
+    if let Some(s) = suffix {
+        out[last] = format!("{}; {s}", out[last].trim_end());
     }
     let mut text = out.join("\n");
     if !text.ends_with('\n') {
@@ -435,7 +448,7 @@ fn position_line(root: &Path, target: &str) -> String {
 
 fn frontier_line(standing: &MilestoneStanding) -> String {
     if standing.frontier.is_empty() {
-        "FRONTIER: (none — every task discharged, or blocked on an undischarged dep)".to_string()
+        "FRONTIER: (none; every task discharged, or blocked on an undischarged dep)".to_string()
     } else {
         format!(
             "FRONTIER: ready (deps satisfied, may run in parallel): {}",
@@ -1127,11 +1140,41 @@ mod tests {
     fn status_suffix_round_trips() {
         let base = "**Status: cut and in build** (operator ruling)";
         let once = set_status_suffix(base, Some("active goal since 2026-10-19"));
-        assert_eq!(once, format!("{base} — active goal since 2026-10-19\n"));
+        assert_eq!(once, format!("{base}; active goal since 2026-10-19\n"));
         let twice = set_status_suffix(&once, Some("parked (waiting) since 2026-10-20"));
-        assert_eq!(twice, format!("{base} — parked (waiting) since 2026-10-20\n"));
+        assert_eq!(twice, format!("{base}; parked (waiting) since 2026-10-20\n"));
         let cleared = set_status_suffix(&twice, None);
         assert_eq!(cleared, format!("{base}\n"));
+    }
+
+    // host-lifecycle#36: binaries before the marker change appended the suffix
+    // with an em-dash; the strip removes that legacy form so a released record
+    // migrates cleanly on the next transition.
+    #[test]
+    fn status_suffix_strips_the_legacy_em_dash_form() {
+        let base = "**Status: cut and in build** (operator ruling)";
+        let legacy = format!("{base} — active goal since 2026-10-19");
+        assert_eq!(set_status_suffix(&legacy, None), format!("{base}\n"));
+        let migrated = set_status_suffix(&legacy, Some("complete 2026-10-29"));
+        assert_eq!(migrated, format!("{base}; complete 2026-10-29\n"));
+    }
+
+    // host-lifecycle#36: the suffix appends at the END of the status paragraph,
+    // so a wrapped status never takes the append mid-sentence.
+    #[test]
+    fn status_suffix_lands_at_the_paragraph_end() {
+        let readme = "**Status: cut and in build** (operator ruling\ncontinued on this line).\n\nThe modality itself is prose.\n";
+        let once = set_status_suffix(readme, Some("active goal since 2026-10-29"));
+        assert!(
+            once.contains("continued on this line).; active goal since 2026-10-29\n"),
+            "the suffix rides the paragraph's last line: {once}"
+        );
+        assert!(
+            !once.lines().next().unwrap().contains("active goal since"),
+            "the first line stays untouched: {once}"
+        );
+        let cleared = set_status_suffix(&once, None);
+        assert_eq!(cleared, readme);
     }
 
     #[test]
