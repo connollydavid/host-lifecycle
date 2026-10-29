@@ -9355,17 +9355,29 @@ fn flat_room(root: &Path, dir_name: &str, title: &str, room: &'static str) -> Se
     Section { title: title.to_string(), room, required: !pages.is_empty(), pages }
 }
 
-/// The Plan room (What/When): a landing page (root `PLAN.md` if present, else a
-/// generated index), then each milestone, then its specs rendered as code pages.
+/// The Plan room (What/When): a landing page (root `PLAN.md` if present, else
+/// `plan/PLAN.md` in the template shape, else a generated index), then each
+/// milestone, then its specs rendered as code pages.
 fn plan_plan(root: &Path) -> Section {
     let mut pages = Vec::new();
     let plan_md = root.join("PLAN.md");
-    if plan_md.is_file() {
+    let room_plan_md = root.join("plan").join("PLAN.md");
+    // The template keeps its index inside the room (plan/PLAN.md); that file is
+    // tracked, so the reconciliation gate (host#25) reads it as published only
+    // if it is the landing rather than an orphan document.
+    let landing = if plan_md.is_file() {
+        Some(plan_md)
+    } else if room_plan_md.is_file() {
+        Some(room_plan_md)
+    } else {
+        None
+    };
+    if let Some(landing_src) = landing {
         pages.push(Page {
             dest: "PLAN.md".to_string(),
-            label: label_for(&plan_md, "Plan"),
+            label: label_for(&landing_src, "Plan"),
             depth: 0,
-            body: PageBody::Copy(plan_md),
+            body: PageBody::Copy(landing_src),
         });
     } else {
         pages.push(Page {
@@ -15501,6 +15513,33 @@ mod book_tests {
 
         let unrendered = unrendered_documents(&base, &home_page(&base, "proj", &sections), &sections);
         assert_eq!(unrendered, vec!["docs/notes.md".to_string()], "the unplaced doc is named; the placed set and the dot-dir harness state are silent");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // plan/0105 (the template shape): with no root PLAN.md, the tracked
+    // plan/PLAN.md is the room's landing, so it publishes instead of reading
+    // UNRENDERED under the every-tracked-document gate.
+    #[test]
+    fn template_plan_md_is_the_landing() {
+        let base = std::env::temp_dir().join(format!("hl-book-template-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("plan/0001-x")).unwrap();
+        let git = |args: &[&str]| process::Command::new("git")
+            .arg("-C").arg(&base).args(args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(git(&["init", "-q"]), "git init the fixture host");
+        fs::write(base.join("plan/PLAN.md"), "# Plan: what & when\n").unwrap();
+        fs::write(base.join("plan/0001-x/README.md"), "# x\n").unwrap();
+        assert!(git(&["add", "-A"]), "stage the tracked set");
+
+        let sections = plan_book(&base);
+        let plan = sections.iter().find(|s| s.room == "plan").unwrap();
+        let landing = plan.pages.iter().find(|p| p.dest == "PLAN.md").expect("landing page");
+        assert!(
+            matches!(&landing.body, PageBody::Copy(src) if src.ends_with("plan/PLAN.md")),
+            "the landing copies the room's own index"
+        );
+        let unrendered = unrendered_documents(&base, &home_page(&base, "proj", &sections), &sections);
+        assert!(unrendered.is_empty(), "the room index publishes: {unrendered:?}");
         let _ = fs::remove_dir_all(&base);
     }
 

@@ -25,15 +25,6 @@ dependencies = [
 
 [[package]]
 name = "host-grammar"
-version = "0.7.0"
-source = "git+https://github.com/connollydavid/host-grammar?rev=6cd41c37f06a62652d9fb767cae675225cea5d01#6cd41c37f06a62652d9fb767cae675225cea5d01"
-dependencies = [
- "pulldown-cmark",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "host-grammar"
 version = "0.7.1"
 source = "git+https://github.com/connollydavid/host-grammar?rev=435960cac32f6ecfd40d4da8b92ec49583414bf0#435960cac32f6ecfd40d4da8b92ec49583414bf0"
 dependencies = [
@@ -43,9 +34,9 @@ dependencies = [
 
 [[package]]
 name = "host-lifecycle"
-version = "0.61.8"
+version = "0.62.0"
 dependencies = [
- "host-grammar 0.7.1",
+ "host-grammar",
  "host-lint",
  "serde_json",
  "tokio",
@@ -53,10 +44,10 @@ dependencies = [
 
 [[package]]
 name = "host-lint"
-version = "0.23.0"
-source = "git+https://github.com/connollydavid/host-lint?rev=90a0d71e2ebfab1ce36589e6046156647e45b249#90a0d71e2ebfab1ce36589e6046156647e45b249"
+version = "0.24.0"
+source = "git+https://github.com/connollydavid/host-lint?rev=4976100f252f7216ed6ee3da5418ffdd094caf95#4976100f252f7216ed6ee3da5418ffdd094caf95"
 dependencies = [
- "host-grammar 0.7.0",
+ "host-grammar",
  "serde_json",
 ]
 

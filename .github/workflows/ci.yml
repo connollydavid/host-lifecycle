@@ -44,8 +44,8 @@ jobs:
         if: matrix.name == 'host-lifecycle-linux-amd64'
         run: |
           curl -fsSL --retry 3 --retry-delay 2 -o vendor.tar.gz \
-            https://github.com/connollydavid/host-lifecycle/releases/download/vendor-v17/vendor.tar.gz
-          echo "a8c9f430c7994402949b45dbd58e9c73d3300c17b81e68c460572f4da8221f9e  vendor.tar.gz" | sha256sum -c -
+            https://github.com/connollydavid/host-lifecycle/releases/download/vendor-v18/vendor.tar.gz
+          echo "c829b71741471d36910eb81cfc5a0b835527e1c228bfb972b58a7469ce89b75f  vendor.tar.gz" | sha256sum -c -
           tar xzf vendor.tar.gz
           mkdir -p .cargo
           mv vendor-config.toml .cargo/config.toml
