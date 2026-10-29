@@ -44,15 +44,15 @@ jobs:
         if: matrix.name == 'host-lifecycle-linux-amd64'
         run: |
           curl -fsSL --retry 3 --retry-delay 2 -o vendor.tar.gz \
-            https://github.com/connollydavid/host-lifecycle/releases/download/vendor-v16/vendor.tar.gz
-          echo "f84ead6367a604a2dd66c3c8351e8c828e7e50d80a3443fa389ec2a617f4cf9d  vendor.tar.gz" | sha256sum -c -
+            https://github.com/connollydavid/host-lifecycle/releases/download/vendor-v17/vendor.tar.gz
+          echo "a8c9f430c7994402949b45dbd58e9c73d3300c17b81e68c460572f4da8221f9e  vendor.tar.gz" | sha256sum -c -
           tar xzf vendor.tar.gz
           mkdir -p .cargo
           mv vendor-config.toml .cargo/config.toml
           docker run --rm --network none \
             -v "$PWD":/src -w /src \
             docker.io/clux/muslrust:1.95.0-stable@sha256:15a72a4abf1c593b0bea63a4a8f20e95c1e5a0696d7051eca87b9b850b2d7e43 \
-            bash -c 'RUSTUP_TOOLCHAIN=stable CARGO_INCREMENTAL=0 cargo build --release --locked --offline --target x86_64-unknown-linux-musl'
+            bash -c 'RUSTUP_TOOLCHAIN=stable CARGO_INCREMENTAL=0 CARGO_ENCODED_RUSTFLAGS=-Clink-arg=-Wl,--build-id=none cargo build --release --locked --offline --target x86_64-unknown-linux-musl'
       - name: Install musl toolchain
         if: contains(matrix.target, 'musl') && matrix.name != 'host-lifecycle-linux-amd64'
         run: |

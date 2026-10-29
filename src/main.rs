@@ -8267,6 +8267,25 @@ fn verify_command_after_rename(root: &Path, cmd: &str) -> String {
     out
 }
 
+/// The CI clippy bar, run in the canonical worktree (host-lifecycle#35):
+/// `cargo clippy --all-targets -- -D warnings`, the same command the test job
+/// enforces, so a tag can no longer be cut on a tree whose own CI will fail.
+/// Absent clippy-cargo reports green only when cargo itself ran (a missing
+/// toolchain must block, not pass).
+fn run_clippy_bar(work: &Path) -> bool {
+    match process::Command::new("cargo")
+        .args(["clippy", "--all-targets", "--", "-D", "warnings"])
+        .current_dir(work)
+        .status()
+    {
+        Ok(st) => st.success(),
+        Err(e) => {
+            eprintln!("host-lifecycle: cannot run the clippy bar (`cargo` did not start: {e})");
+            false
+        }
+    }
+}
+
 /// Run a declared `regen = <command>` in the canonical worktree (host-lifecycle#31):
 /// the version bump's derived artifacts, regenerated so the release commit carries
 /// them. The command is trusted the way a ledger `verify` is; failure blocks the
@@ -11261,6 +11280,20 @@ fn run_release(root: &Path, component: &str, change_class: Option<&str>, preview
         println!("  verify: green");
     }
 
+    // Step 1a (host-lifecycle#35) — the CI clippy bar, run locally. A worktree
+    // whose tests compile with warnings can pass every local gate and cut a tag
+    // whose CI fails at `clippy -D warnings` (v0.61.5: the tag's test job went
+    // red and the release job skipped, so the version published no assets).
+    // Rust components only; a worktree with no Cargo.toml skips.
+    if work.join("Cargo.toml").is_file() {
+        println!("release {component}: running the clippy bar …");
+        if !run_clippy_bar(&work) {
+            eprintln!("host-lifecycle: clippy is RED — release blocked. Fix the warnings, then re-run.");
+            process::exit(1);
+        }
+        println!("  clippy: green");
+    }
+
     // Step 1b (plan/0069) — discharge the released component's obligations offline. A
     // release must not ship its own component red on a local lane: run the obligations
     // check (no --tests, no --rederive) for each .allium the component carries, and
@@ -13214,6 +13247,20 @@ mod software_tests {
         // absent by default: the bump-only behavior
         let t = parse_software("[software \"hl\"]\nurl = u\npin = p\n");
         assert_eq!(t[0].regen, None);
+    }
+
+    // The clippy bar runs the CI command in the worktree (host-lifecycle#35):
+    // a missing cargo blocks, and a warn-Denied tree blocks.
+    #[test]
+    fn clippy_bar_blocks_on_a_missing_toolchain() {
+        // An empty dir has no Cargo.toml; the caller skips those, and here we
+        // only assert the helper reports the failure of a cargo that cannot
+        // run against a non-package directory.
+        let base = std::env::temp_dir().join(format!("hl-clippy-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        assert!(!run_clippy_bar(&base), "a non-package worktree cannot pass the bar");
+        let _ = fs::remove_dir_all(&base);
     }
 
     // run_regen runs the declared command in the worktree and reports failure
