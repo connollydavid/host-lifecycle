@@ -429,21 +429,39 @@ fn seed_lexicon(root: &Path, dry: bool) {
 /// `upgrade` phase reads `UPGRADING.md` from it, so an adoption that skips it makes
 /// the very next phase fail with no ledger to read.
 fn print_scaffold_checklist(revision: &str) {
-    println!("\nnext steps (scaffold writes rooms + the stamp only):");
-    println!("  1. register the methodology template as a submodule at the adopted");
-    println!("     revision — `upgrade` reads its `UPGRADING.md` ledger:");
-    println!("       git submodule add {TEMPLATE_URL} host-template");
-    println!("       (cd host-template && git checkout {revision})");
-    println!("  2. wire the verification tools as submodules, each pinned to the commit");
-    println!("     the template references at this revision:");
+    print!("{}", scaffold_checklist_text(revision));
+}
+
+/// The post-`scaffold` checklist as text (plan/0108: the recipe teaching rides the
+/// tool, so the text is asserted in tests): the Where room carries the gate
+/// providers, template-distributed tools stay referenced, and the pin-equality
+/// rule is stated in the text itself.
+fn scaffold_checklist_text(revision: &str) -> String {
+    let mut out = String::new();
+    out.push_str("\nnext steps (scaffold writes rooms + the stamp only):\n");
+    out.push_str("  1. register the methodology template as a submodule at the adopted\n");
+    out.push_str("     revision; `upgrade` reads its `UPGRADING.md` ledger:\n");
+    out.push_str(&format!("       git submodule add {TEMPLATE_URL} host-template\n"));
+    out.push_str(&format!("       (cd host-template && git checkout {revision})\n"));
+    out.push_str("  2. wire the verification tools as submodules, each pinned to the commit\n");
+    out.push_str("     the template references at this revision:\n");
     for (name, url) in TOOL_SUBMODULES {
-        println!("       git submodule add {url} tools/{name}");
+        out.push_str(&format!("       git submodule add {url} tools/{name}\n"));
     }
-    println!("  3. embed the software in the Where slot (.host-software), record a");
-    println!("     `hooks` and `artifact` for the gating tool, and run:");
-    println!("       host-lifecycle software --materialize .");
-    println!("  4. build the gating tool, then install its commit hooks + binary:");
-    println!("       host-lifecycle software --install-hooks .");
+    out.push_str("  3. embed the software this host gates and receipts in the Where slot\n");
+    out.push_str("     (.host-software, one [software \"<name>\"] stanza each with url, pin,\n");
+    out.push_str("     worktrees), and run:\n");
+    out.push_str("       host-lifecycle software --materialize .\n");
+    out.push_str("     The Where room carries the components this host gates and receipt\n");
+    out.push_str("     lanes for (typically the two host binaries). Tools the template\n");
+    out.push_str("     distributes (allium, specula) stay referenced via the template's own\n");
+    out.push_str("     tools/ submodules: the recorded-state gate holds a template\n");
+    out.push_str("     -distributed tool at exactly the commit the template pins, so a\n");
+    out.push_str("     clone-at-HEAD stanza for one of those fails pin equality.\n");
+    out.push_str("  4. build the gating tool, then install its commit hooks + binary:\n");
+    out.push_str("       host-lifecycle software --install-hooks .\n");
+    out.push_str("  5. emit the harness doors:  host-lifecycle install .\n");
+    out
 }
 
 /// Resolve the project name from an explicit value or the `HOST_NAME` environment variable
@@ -8861,9 +8879,10 @@ fn submodule_pin_problem(template: &Path, subpath: &str, tool: &str, want: &str)
     match template_submodule_pin(template, subpath) {
         Some(sub) if !sha_eq(&sub, want) => {
             println!(
-                "HAZARD   host-template {subpath} submodule pins {tool} {} but .host-software gates on {} (call/0038: bump the submodule on release)",
+                "HAZARD   host-template {subpath} submodule pins {tool} {} but .host-software gates on {} (call/0038: a template-distributed tool gates at exactly the template's submodule commit — pin {}'s checked-out SHA in .host-software, or drop the stanza and reference the tool via the template)",
                 short(&sub),
-                short(want)
+                short(want),
+                subpath
             );
             1
         }

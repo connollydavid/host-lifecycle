@@ -19,10 +19,13 @@ const SIDECAR: &str = ".host-goal";
 const LEDGER: &str = ".host-lifecycle-receipts";
 
 /// The goal state as a fold of the receipt log (append-only, last transition wins).
+/// `CompletePending` is the plan/0108 ruling: the mechanical gates close the work,
+/// the operator's semantic acceptance (`goal accept`) closes the goal.
 #[derive(Debug, PartialEq, Clone)]
 enum GoalState {
     Active(String),
     Parked(String, String),
+    CompletePending(String),
     None,
 }
 
@@ -36,7 +39,9 @@ fn goal_state(receipts: &[Receipt]) -> GoalState {
                 state = GoalState::Parked(target, r.reason.clone().unwrap_or_default())
             }
             Some("unpark") if !target.is_empty() => state = GoalState::Active(target),
-            Some("abandon") | Some("complete") => state = GoalState::None,
+            Some("complete") if !target.is_empty() => state = GoalState::CompletePending(target),
+            Some("accept") if !target.is_empty() => state = GoalState::None,
+            Some("abandon") => state = GoalState::None,
             _ => {}
         }
     }
@@ -117,6 +122,11 @@ fn write_goal_surface(root: &Path, receipts: &[Receipt]) {
         GoalState::Parked(t, reason) => {
             format!("# The active goal\n\n{t} is parked: {reason}.\n\nResume with: host-lifecycle goal unpark .\n")
         }
+        GoalState::CompletePending(t) => {
+            format!(
+                "# The active goal\n\n{t} is complete; the operator's semantic acceptance is owed.\n\nClose with: host-lifecycle goal accept .\n"
+            )
+        }
         GoalState::None => "# The active goal\n\nNo goal is set. Cut a milestone, then propose it.\n".to_string(),
     };
     if let Err(e) = std::fs::write(root.join("GOAL.md"), body) {
@@ -134,10 +144,11 @@ fn write_goal_surface(root: &Path, receipts: &[Receipt]) {
 /// status takes the append at its close (host-lifecycle#36: the em-dash marker
 /// was a decoration the strict corpus flags, and the append spliced wrapped
 /// statuses mid-paragraph).
-const SUFFIX_TOKENS: [&str; 4] = [
+const SUFFIX_TOKENS: [&str; 5] = [
     "active goal since ",
     "parked (",
     "complete 2",
+    "accepted 2",
     "abandoned 2",
 ];
 
@@ -204,14 +215,45 @@ fn readme_path(root: &Path, target: &str) -> PathBuf {
 }
 
 fn valid_target(root: &Path, target: &str) -> bool {
-    match target.strip_prefix("plan/") {
-        Some(rest) => {
-            !rest.is_empty()
-                && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
-                && root.join(target).is_dir()
-        }
-        None => false,
+    target_defect(root, target).is_none()
+}
+
+/// What disqualifies a goal target, for the refusal to name (plan/0108): beyond
+/// the plan/NNNN shape, the README must carry the task structure the tasks
+/// parser reads. plan/0106 caught a floor model fabricating a plan directory and
+/// re-aiming the goal at it; bare existence accepted the fabrication.
+fn target_defect(root: &Path, target: &str) -> Option<&'static str> {
+    let rest = target.strip_prefix("plan/")?;
+    if rest.is_empty() || !rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return Some("the name is not plan/NNNN");
     }
+    let dir = root.join(target);
+    if !dir.is_dir() {
+        return Some("the directory does not exist under this tree");
+    }
+    let readme = std::fs::read_to_string(dir.join("README.md")).ok()?;
+    if plan_shaped(&readme) {
+        None
+    } else {
+        Some("its README.md carries no task structure (an anchored `### ` heading with a `- verify:` line)")
+    }
+}
+
+/// The minimal plan shape: one `### ` task heading followed by a `- verify:`
+/// bullet, the pair parse_tasks reads.
+fn plan_shaped(readme: &str) -> bool {
+    let mut in_task = false;
+    for line in readme.lines() {
+        let t = line.trim_start();
+        if t.starts_with("### ") {
+            in_task = true;
+        } else if in_task && t.starts_with("- verify:") {
+            return true;
+        } else if t.starts_with("## ") {
+            in_task = false;
+        }
+    }
+    false
 }
 
 /// The first sentence of the milestone's Why section: the purpose line, human
@@ -423,6 +465,18 @@ fn emission(root: &Path) -> Result<String, String> {
                 format!("work {}", standing.as_ref().unwrap().frontier[0])
             };
             out.push(format!("NEXT: {next}"));
+        }
+        GoalState::CompletePending(target) => {
+            out.push(purpose_line(root, target)?);
+            out.push(format!("GOAL: {target}"));
+            out.push(position_line(root, target));
+            out.push(
+                "NEEDS YOU: the operator's semantic acceptance is owed (goal accept)".to_string(),
+            );
+            out.push(ci_line(root));
+            out.push("FRONTIER: (none; the work is closed, pending acceptance)".to_string());
+            out.push(tree_line(root));
+            out.push("NEXT: host-lifecycle goal accept .".to_string());
         }
     }
     Ok(out.join("\n") + "\n")
@@ -810,6 +864,11 @@ pub fn goal(args: &[String]) {
                 Some(t) => t,
                 None => match goal_state(&read_goal_receipts(&root)) {
                     GoalState::Active(t) | GoalState::Parked(t, _) => t,
+                    GoalState::CompletePending(t) => {
+                        eprintln!("host-lifecycle: goal: {t} is already complete; the operator's acceptance is owed");
+                        eprintln!("           remedy: host-lifecycle goal accept {t} .");
+                        process::exit(1);
+                    }
                     GoalState::None => {
                         eprintln!("host-lifecycle: goal: no active goal to complete");
                         usage();
@@ -882,8 +941,8 @@ fn show(root: &Path) {
 }
 
 fn set(root: &Path, target: &str) {
-    if !valid_target(root, target) {
-        eprintln!("host-lifecycle: goal: `{target}` is not a plan/NNNN directory under this tree");
+    if let Some(defect) = target_defect(root, target) {
+        eprintln!("host-lifecycle: goal: `{target}` refuses: {defect}");
         usage();
     }
     match goal_state(&read_goal_receipts(root)) {
@@ -891,6 +950,11 @@ fn set(root: &Path, target: &str) {
         GoalState::Active(t) => {
             eprintln!("host-lifecycle: goal: HAZARD   already-active — {t} is the active goal");
             eprintln!("           remedy: host-lifecycle goal park --reason <r> . (or abandon)");
+            process::exit(1);
+        }
+        GoalState::CompletePending(t) => {
+            eprintln!("host-lifecycle: goal: HAZARD   complete-pending-acceptance — {t} awaits the operator's acceptance");
+            eprintln!("           remedy: host-lifecycle goal accept {t} .");
             process::exit(1);
         }
         GoalState::Parked(t, _) => {
@@ -911,8 +975,8 @@ fn set(root: &Path, target: &str) {
 }
 
 fn propose(root: &Path, target: &str) {
-    if !valid_target(root, target) {
-        eprintln!("host-lifecycle: goal: `{target}` is not a plan/NNNN directory under this tree");
+    if let Some(defect) = target_defect(root, target) {
+        eprintln!("host-lifecycle: goal: `{target}` refuses: {defect}");
         usage();
     }
     println!("host-lifecycle goal set {target} .");
@@ -940,6 +1004,11 @@ fn park(root: &Path, reason: Option<&str>) {
             eprintln!("host-lifecycle: goal: no active goal to park");
             process::exit(1);
         }
+        GoalState::CompletePending(t) => {
+            eprintln!("host-lifecycle: goal: {t} is complete pending acceptance; nothing to park");
+            eprintln!("           remedy: host-lifecycle goal accept {t} .");
+            process::exit(1);
+        }
         GoalState::Parked(t, _) => {
             eprintln!("host-lifecycle: goal: {t} is already parked");
             process::exit(1);
@@ -949,6 +1018,10 @@ fn park(root: &Path, reason: Option<&str>) {
 
 fn unpark(root: &Path) {
     match goal_state(&read_goal_receipts(root)) {
+        GoalState::CompletePending(t) => {
+            eprintln!("host-lifecycle: goal: {t} is complete pending acceptance; run goal accept {t} .");
+            process::exit(1);
+        }
         GoalState::Parked(t, _) | GoalState::Active(t) => {
             let receipt = goal_receipt("unpark", &t, "done", &[]);
             if let Err(e) = append_receipt(root, &receipt) {
@@ -974,7 +1047,7 @@ fn abandon(root: &Path, reason: Option<&str>) {
         process::exit(2);
     }
     match goal_state(&read_goal_receipts(root)) {
-        GoalState::Active(t) | GoalState::Parked(t, _) => {
+        GoalState::Active(t) | GoalState::Parked(t, _) | GoalState::CompletePending(t) => {
             let receipt = goal_receipt("abandon", &t, "done", &[("reason", reason.to_string())]);
             if let Err(e) = append_receipt(root, &receipt) {
                 eprintln!("host-lifecycle: goal: cannot append receipt: {e}");
@@ -1019,7 +1092,11 @@ fn accept(root: &Path, target: &str) {
         eprintln!("host-lifecycle: goal: cannot append receipt: {e}");
         process::exit(2);
     }
-    println!("goal accept: {target} (the semantic acceptance rides the closure record)");
+    write_readme_status(root, target, Some(&format!("accepted {}", today())));
+    write_claim(root, None);
+    write_goal_surface(root, &read_goal_receipts(root));
+    println!("goal accept: {target} (the operator's semantic acceptance closes the goal)");
+    println!("changed: {LEDGER}, {target}/README.md, GOAL.md — commit and push the acceptance");
 }
 
 fn repair(root: &Path) {
@@ -1037,7 +1114,7 @@ fn repair(root: &Path) {
         return;
     }
     match goal_state(&receipts) {
-        GoalState::Active(t) | GoalState::Parked(t, _) => {
+        GoalState::Active(t) | GoalState::Parked(t, _) | GoalState::CompletePending(t) => {
             if !valid_target(root, &t) {
                 eprintln!("host-lifecycle: goal: HAZARD   moved — the tracked goal names {t}, which is not a directory here");
                 eprintln!("           remedy: if it was renamed, abandon and set anew (both leave receipts); if merged, abandon with the reason");
@@ -1094,10 +1171,11 @@ fn complete(root: &Path, target: &str) {
         eprintln!("host-lifecycle: goal: cannot append receipt: {e}");
         process::exit(2);
     }
-    write_readme_status(root, target, Some(&format!("complete {}", today())));
-    write_claim(root, None);
+    write_readme_status(root, target, Some(&format!("complete {}, acceptance owed", today())));
+    write_claim(root, Some(target));
     write_goal_surface(root, &read_goal_receipts(root));
-    println!("goal complete: {target} (closure receipt appended; Status line updated)");
+    println!("goal complete: {target} (closure receipt appended; the operator's acceptance is owed)");
+    println!("then: host-lifecycle goal accept {target} .");
     println!("changed: {LEDGER}, {target}/README.md — commit and push the closure, then run: host-lifecycle goal show .");
 }
 
@@ -1149,6 +1227,65 @@ mod tests {
             "[receipt \"goal\" \"set\"]\n    disposition = done\n    target = plan/0100-fixture\n\n[receipt \"goal\" \"abandon\"]\n    disposition = done\n    target = plan/0100-fixture\n",
         );
         assert_eq!(goal_state(&receipts), GoalState::None);
+    }
+
+    // plan/0108: the mechanical gates close the work; the operator's semantic
+    // acceptance closes the goal. A complete receipt alone leaves the goal in the
+    // pending state; the accept receipt is what clears it.
+    #[test]
+    fn complete_pends_and_accept_closes() {
+        let base = "[receipt \"goal\" \"set\"]\n    disposition = done\n    target = plan/0100-fixture\n";
+        let receipts = parse_receipts(&format!("{base}\n[receipt \"goal\" \"complete\"]\n    disposition = done\n    target = plan/0100-fixture\n"));
+        assert_eq!(
+            goal_state(&receipts),
+            GoalState::CompletePending("plan/0100-fixture".into()),
+            "complete alone pends the closure"
+        );
+        let receipts = parse_receipts(&format!(
+            "{base}\n[receipt \"goal\" \"complete\"]\n    disposition = done\n    target = plan/0100-fixture\n\n[receipt \"goal\" \"accept\"]\n    disposition = done\n    target = plan/0100-fixture\n"
+        ));
+        assert_eq!(goal_state(&receipts), GoalState::None, "accept closes the goal");
+    }
+
+    #[test]
+    fn the_pending_surface_names_the_acceptance() {
+        let root = fixture("pending-surface");
+        let base = "[receipt \"goal\" \"set\"]\n    disposition = done\n    target = plan/0100-fixture\n\n[receipt \"goal\" \"complete\"]\n    disposition = done\n    target = plan/0100-fixture\n";
+        let receipts = parse_receipts(base);
+        write_goal_surface(&root, &receipts);
+        let surface = std::fs::read_to_string(root.join("GOAL.md")).unwrap();
+        assert!(surface.contains("semantic acceptance is owed"), "the surface names the owed acceptance: {surface}");
+        assert!(surface.contains("goal accept"), "the surface names the closing command: {surface}");
+    }
+
+    // plan/0108, the fabrication guard: a plan directory whose README carries no
+    // task structure refuses, naming what is missing (plan/0106 caught a floor
+    // model fabricating plan dirs and re-aiming the goal at them).
+    #[test]
+    fn a_structureless_plan_dir_refuses() {
+        let root = fixture("fabricated");
+        let ghost = root.join("plan/0102-phantom");
+        std::fs::create_dir_all(&ghost).unwrap();
+        std::fs::write(ghost.join("README.md"), "# plan/0102: phantom\n\nLook, a plan.\n").unwrap();
+        assert_eq!(
+            target_defect(&root, "plan/0102-phantom"),
+            Some("its README.md carries no task structure (an anchored `### ` heading with a `- verify:` line)"),
+            "a structureless plan dir names its defect"
+        );
+        assert_eq!(target_defect(&root, "plan/0103-nowhere"), Some("the directory does not exist under this tree"));
+        assert_eq!(target_defect(&root, "plan/0100-fixture"), None, "the shaped fixture passes");
+    }
+
+    // The checklist teaches the recipe shape at the moment of need (plan/0108):
+    // the Where room carries the gate providers; template-distributed tools stay
+    // referenced, and the pin-equality rule is stated in the text itself.
+    #[test]
+    fn the_scaffold_checklist_teaches_the_recipe_shape() {
+        let out = crate::scaffold_checklist_text("3ded6efefbf59aa0b4c5518b5cec1ca38cf7b5ce");
+        assert!(out.contains("the software this host gates and receipts"), "the two-component shape is stated");
+        assert!(out.contains("tools/ submodules"), "the referenced-tools note is present");
+        assert!(out.contains("pin equality"), "the pin-equality rule is stated in the text");
+        assert!(out.contains("host-lifecycle install ."), "the doors step is on the checklist");
     }
 
     #[test]
