@@ -9285,6 +9285,7 @@ fn plan_book(root: &Path) -> Vec<Section> {
         plan_software(root),
         flat_room(root, "call", "Call: why", "call"),
         plan_reference(root),
+        plan_reference_archive(root),
         plan_memory(root),
     ])
 }
@@ -9494,6 +9495,62 @@ fn plan_software(root: &Path) -> Section {
 /// placed beside it for tools that look for the old name), then a `reference/`
 /// dir if present, then any loose root `.md` not already placed in another room
 /// — so no existing top-level doc is silently dropped from the published record.
+/// The evidence archive room (host-lifecycle#40): hosts keep reference
+/// material (datasheet notes, findings, captures) as tracked markdown nested
+/// under `refs/`. The flat reference room has no placement for it, so the
+/// every-tracked-document gate read the whole archive as UNRENDERED. This
+/// section recurses the room: a generated index, then every nested document
+/// as a page whose dest mirrors its repo-relative path, so citations resolve
+/// in the book exactly as they do in the repository. The room is optional and
+/// inert when the directory carries no markdown.
+fn plan_reference_archive(root: &Path) -> Section {
+    let mut docs: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![root.join("refs")];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                docs.push(p);
+            }
+        }
+    }
+    docs.sort();
+    if docs.is_empty() {
+        return Section {
+            title: "Reference: evidence".to_string(),
+            room: "refs",
+            required: false,
+            pages: Vec::new(),
+        };
+    }
+    let rel_of = |p: &Path| p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/");
+    let mut listing = String::from(
+        "# Evidence: index\n\nThe archive under `refs/`, as tracked. Every document\nrenders at its repository path.\n\n",
+    );
+    for d in &docs {
+        listing.push_str(&format!("- [{}]({})\n", label_for(d, "document"), rel_of(d)));
+    }
+    let mut pages = vec![Page {
+        dest: "refs-index.md".to_string(),
+        label: "Evidence: index".to_string(),
+        depth: 0,
+        body: PageBody::Inline(listing),
+    }];
+    for d in &docs {
+        let stem = d.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        pages.push(Page {
+            dest: rel_of(d),
+            label: label_for(d, &stem),
+            depth: 1,
+            body: PageBody::Copy(d.clone()),
+        });
+    }
+    Section { title: "Reference: evidence".to_string(), room: "refs", required: true, pages }
+}
+
 fn plan_reference(root: &Path) -> Section {
     let mut pages = Vec::new();
     let agents = root.join("AGENTS.md");
@@ -15457,9 +15514,13 @@ mod book_tests {
 
         let sections = plan_book(&base);
         let rooms: Vec<&str> = sections.iter().map(|s| s.room).collect();
-        assert_eq!(rooms, vec!["cast", "plan", "software", "call", "reference", "memory"]);
+        assert_eq!(rooms, vec!["cast", "plan", "software", "call", "reference", "refs", "memory"]);
         for s in &sections {
-            assert!(s.pages.iter().any(page_has_content), "{} room has a content page", s.room);
+            assert!(
+                !s.required || s.pages.iter().any(page_has_content),
+                "{} room has a content page",
+                s.room
+            );
         }
         // the spec body is rendered as a page (S3), not just a filename bullet
         let plan = sections.iter().find(|s| s.room == "plan").unwrap();
@@ -15492,9 +15553,10 @@ mod book_tests {
         assert!(home_at < cast_at, "home leads, not Cast");
         assert!(cast_at < where_at && where_at < call_at, "lifecycle order in SUMMARY");
 
-        // every room here has source, so each is required and must render content
+        // every room with source here is required and must render content (the
+        // refs room is legitimately absent from this fixture: no archive, no gate)
         for s in &sections {
-            assert!(s.required && s.pages.iter().any(page_has_content), "{} required + rendered", s.room);
+            assert!(!s.required || s.pages.iter().any(page_has_content), "{} required + rendered", s.room);
         }
 
         // remove the Memory source → the room is no longer required (tolerant gate):
@@ -15505,6 +15567,55 @@ mod book_tests {
         assert!(!mem.required, "absent Memory source → not gated");
         assert!(!mem.pages.iter().any(page_has_content));
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // host-lifecycle#40: a nested evidence archive under refs/ has a placement:
+    // every tracked document renders as a page whose dest mirrors its path, so
+    // the every-tracked-document gate stays silent instead of naming the whole
+    // archive UNRENDERED.
+    #[test]
+    fn reference_archive_places_the_nested_evidence_room() {
+        let base = std::env::temp_dir().join(format!("hl-book-refs-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("refs/datasheets/nested/deep")).unwrap();
+        let git = |args: &[&str]| process::Command::new("git")
+            .arg("-C").arg(&base).args(args).status().map(|s| s.success()).unwrap_or(false);
+        assert!(git(&["init", "-q"]), "git init the fixture host");
+        fs::write(base.join("refs/datasheets/nested/deep/part.md"), "# The part\n\nnote\n").unwrap();
+        fs::write(base.join("refs/README.md"), "# Archive\n\nindex\n").unwrap();
+        assert!(git(&["add", "-A"]), "stage the tracked set");
+
+        let sections = plan_book(&base);
+        let refs = sections.iter().find(|s| s.room == "refs").unwrap();
+        assert!(refs.required, "an archive with markdown gates as a room with source");
+        assert!(
+            refs.pages.iter().any(|p| p.dest == "refs/datasheets/nested/deep/part.md"),
+            "the nested document renders at its repo-relative path"
+        );
+        assert!(
+            refs.pages.iter().any(|p| p.dest == "refs/README.md"),
+            "the room README renders beside the generated index"
+        );
+        assert!(
+            refs.pages.iter().any(|p| p.dest == "refs-index.md" && matches!(p.body, PageBody::Inline(_))),
+            "the generated index carries the tree"
+        );
+        let home = home_page(&base, "proj", &sections);
+        let unrendered = unrendered_documents(&base, &home, &sections);
+        assert!(unrendered.is_empty(), "the archive reads placed, not UNRENDERED: {unrendered:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The room is optional: no refs/ markdown, no section content, no gate.
+    #[test]
+    fn reference_archive_is_inert_without_the_room() {
+        let base = std::env::temp_dir().join(format!("hl-book-norefs-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let sections = plan_book(&base);
+        let refs = sections.iter().find(|s| s.room == "refs").unwrap();
+        assert!(!refs.required && refs.pages.is_empty(), "no refs/ markdown, no gate");
         let _ = fs::remove_dir_all(&base);
     }
 
