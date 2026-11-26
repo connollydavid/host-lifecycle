@@ -7343,6 +7343,12 @@ fn spec_lane_problems(root: &Path, s: &Software) -> usize {
     bad
 }
 
+/// Directories that are never a component's own source surface: VCS metadata,
+/// build output, dependencies, and a vendored third-party tree. A vendored engine's
+/// specs are that engine's CI surface, not the embedding component's
+/// (host-lifecycle#47).
+const SOURCE_WALK_SKIP: &[&str] = &[".git", "target", "node_modules", "vendor"];
+
 /// Every regular file under `root`, walked symlink-safely and depth-bounded. A
 /// symlink is treated as a leaf and never followed, so a symlink cycle in
 /// gitignored scratch (a Wine prefix, `node_modules`, a venv) cannot make the walk
@@ -7378,10 +7384,10 @@ fn walk_files_safe(root: &Path, skip: &[&str]) -> Vec<PathBuf> {
 }
 
 /// Concatenate every `.obligations` manifest in the worktree (for tier-declaration
-/// substring checks). Skips `.git`, `target`, `node_modules`.
+/// substring checks). Skips `.git`, `target`, `node_modules`, and `vendor`.
 fn read_obligations_text(dir: &Path) -> String {
     let mut text = String::new();
-    for p in walk_files_safe(dir, &[".git", "target", "node_modules"]) {
+    for p in walk_files_safe(dir, SOURCE_WALK_SKIP) {
         if p.extension().and_then(|x| x.to_str()) == Some("obligations") {
             if let Ok(t) = fs::read_to_string(&p) {
                 text.push_str(&t);
@@ -7479,7 +7485,7 @@ fn find_specs(dir: &Path) -> (bool, bool, bool) {
     let mut allium = false;
     let mut tla = false;
     let mut obligations = false;
-    for p in walk_files_safe(dir, &[".git", "target", "node_modules"]) {
+    for p in walk_files_safe(dir, SOURCE_WALK_SKIP) {
         match p.extension().and_then(|x| x.to_str()) {
             Some("allium") => allium = true,
             Some("tla") => tla = true,
@@ -7527,10 +7533,10 @@ fn allium_plan(spec: &Path) -> Result<String, String> {
     }
 }
 
-/// The `.allium` spec paths under `dir` (symlink-safe; skips build/cache dirs), for the
-/// release gate (plan/0069) to find the released component's specs.
+/// The `.allium` spec paths under `dir` (symlink-safe; skips build/cache and vendored
+/// dirs), for the release gate (plan/0069) to find the released component's specs.
 fn find_allium_specs(dir: &Path) -> Vec<PathBuf> {
-    walk_files_safe(dir, &[".git", "target", "node_modules"])
+    walk_files_safe(dir, SOURCE_WALK_SKIP)
         .into_iter()
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("allium"))
         .collect()
@@ -13005,6 +13011,37 @@ mod software_tests {
         // wiring the Apalache lane clears the rest
         fs::write(wt.join(".github/workflows/apalache.yml"), "run: apalache-mc check Spec.tla\n").unwrap();
         assert_eq!(spec_lane_problems(&base, &mk()), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // host-lifecycle#47: a vendored third-party tree is not the component's own
+    // spec surface. Its `.tla`, `.allium`, and `.obligations` demand no lane from
+    // the embedding component, and the release discharge skips it too.
+    #[test]
+    fn vendored_specs_are_not_the_components_spec_surface() {
+        let base = std::env::temp_dir().join(format!("hl-vendor-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("software").join("comp").join("main");
+        let vend = wt.join("vendor/engine/spec");
+        fs::create_dir_all(&vend).unwrap();
+        fs::write(vend.join("Spec.tla"), "---- MODULE Spec ----\n").unwrap();
+        fs::write(vend.join("engine.allium"), "-- allium: 3\n").unwrap();
+        fs::write(
+            vend.join("engine.obligations"),
+            "Inv => apalache:Inv\nBound => tlaps:Bound\n",
+        )
+        .unwrap();
+        let mk = || Software {
+            name: "comp".into(), url: "u".into(), pin: "p".into(),
+            branch: "main".into(), worktrees: vec![], lines: vec![],
+            build: None, toolchain: None, deploy: None, artifact: None,
+            repro_exempt: None, hooks: None, deps_bundle: None, regen: None, builds: vec![],
+        };
+        assert_eq!(spec_lane_problems(&base, &mk()), 0, "vendored specs demand no lane");
+        assert!(find_allium_specs(&wt).is_empty(), "the release discharge skips vendor");
+        // The skip is specific: an own spec in the same worktree still hazards.
+        fs::write(wt.join("Spec.tla"), "---- MODULE Spec ----\n").unwrap();
+        assert_eq!(spec_lane_problems(&base, &mk()), 1);
         let _ = fs::remove_dir_all(&base);
     }
 
